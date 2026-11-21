@@ -1,6 +1,7 @@
 // Offline diagnostic derived from production at 1adf401; not linked into the library.
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "fullpacket_segment_diagnostics.h"
+#include <openuwb/support/timing.h>
 #include <array>
 #include <volk/volk.h>
 #include <chrono>
@@ -12,7 +13,7 @@ using namespace sic;
 namespace {
 using cf = std::complex<float>;
 using cd = std::complex<double>;
-using Clock = std::chrono::steady_clock;
+using Clock = openuwb::timing::Clock;
 constexpr double pi = 3.14159265358979323846;
 constexpr size_t phases = 32, half = 16, taps_count = 33, rot_block = 1024;
 // The continuous convolutional encoder feeds PHR19 then payload bits, but

@@ -1,5 +1,6 @@
 // Offline tap-count cost experiment; production algorithm unchanged.
 #include <gnuradio/uwb/uwb_discrete_cir_sic.h>
+#include <openuwb/support/timing.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -10,7 +11,7 @@
 using namespace openuwb;
 using cf=std::complex<float>;
 using cd=std::complex<double>;
-using Clock=std::chrono::steady_clock;
+using Clock = openuwb::timing::Clock;
 int main() {
  try {
   mod::HrpModConfig profile;

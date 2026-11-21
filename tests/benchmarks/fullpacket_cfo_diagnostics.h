@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <openuwb/support/timing.h>
 #include <cmath>
 #include <complex>
 #include <cstddef>
@@ -41,7 +42,7 @@ struct Scratch {
 };
 
 namespace detail {
-using Clock = std::chrono::steady_clock;
+using Clock = openuwb::timing::Clock;
 constexpr double pi = 3.14159265358979323846;
 constexpr size_t block_size = 1024;
 inline double elapsed(Clock::time_point start)

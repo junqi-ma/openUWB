@@ -31,6 +31,7 @@
 #include <gnuradio/uwb/uwb_rx_fused_cmf.h>
 #include <gnuradio/uwb/uwb_rx_sync_opt.h>
 #include <openuwb/support/simd_config.h>
+#include <openuwb/support/timing.h>
 
 #include <algorithm>
 #include <chrono>
@@ -51,7 +52,7 @@ using cf = std::complex<float>;
 
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock = openuwb::timing::Clock;
 
 double ns_since(Clock::time_point t0)
 {

@@ -9,6 +9,8 @@
 
 #include <openuwb/radio/fixed_tone_cancel_source.h>
 
+#include <openuwb/support/timing.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -23,12 +25,10 @@ namespace {
 constexpr size_t kMaxConsecutiveEmptySourceReads = 64;
 constexpr auto kWaitSlice = std::chrono::milliseconds(100);
 
-uint64_t elapsed_ns(std::chrono::steady_clock::time_point a,
-                    std::chrono::steady_clock::time_point b)
-{
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
-}
+// openuwb::timing::elapsed_ns is the single library-wide implementation now
+// (identical duration_cast<nanoseconds> truncation); re-exposed under the
+// historical spelling for the reader/fold/proj/cancel accumulators below.
+using openuwb::timing::elapsed_ns;
 
 void note_peak(std::atomic<uint64_t>& peak, uint64_t value)
 {

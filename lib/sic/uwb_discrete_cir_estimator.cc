@@ -33,6 +33,7 @@
  * coarse CIR use only visible samples.  No sidecar/truth parameter exists.
  */
 #include <openuwb/sic/discrete_cir_sic.h>
+#include <openuwb/support/timing.h>
 
 #include <volk/volk.h>
 #if defined(__x86_64__) || defined(_M_X64)
@@ -57,7 +58,7 @@ namespace {
 
 using cf = std::complex<float>;
 using cd = std::complex<double>;
-using Clock = std::chrono::steady_clock;
+using Clock = openuwb::timing::Clock;
 
 constexpr double kPi = 3.14159265358979323846;
 constexpr size_t kMinSps = 64;

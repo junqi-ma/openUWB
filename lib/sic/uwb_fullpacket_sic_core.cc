@@ -2,6 +2,7 @@
 #include <openuwb/sic/fullpacket_sic_core.h>
 #include <openuwb/phy/hrp/common/profile.h>
 #include <openuwb/sensing/radar_meta_core.h>
+#include <openuwb/support/timing.h>
 #include <array>
 #include <volk/volk.h>
 #include <chrono>
@@ -12,7 +13,7 @@ namespace openuwb { namespace sic {
 namespace {
 using cf = std::complex<float>;
 using cd = std::complex<double>;
-using Clock = std::chrono::steady_clock;
+using Clock = openuwb::timing::Clock;
 constexpr double pi = 3.14159265358979323846;
 constexpr size_t phases = 32, half = 16, taps_count = 33, rot_block = 1024;
 // The continuous convolutional encoder feeds PHR19 then payload bits, but

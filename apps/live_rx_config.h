@@ -22,10 +22,15 @@
 #include <gnuradio/uwb/uwb_defaults.h>
 #include <gnuradio/uwb/uwb_demod_grid.h>
 
+#include <openuwb/support/timing.h>
+
 namespace openuwb {
 namespace live {
 
-using Clock = std::chrono::steady_clock;
+// The tree-wide monotonic wall clock (openuwb::timing::Clock ==
+// std::chrono::steady_clock); the alias keeps the historical spelling used
+// across the live receiver app sources.
+using Clock = timing::Clock;
 constexpr double fs = 737.28e6;
 constexpr double work_fs = 998.4e6;
 constexpr std::size_t pre = 36864, window = 450000, block = 65536;

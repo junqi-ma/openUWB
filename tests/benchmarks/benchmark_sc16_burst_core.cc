@@ -57,6 +57,7 @@
  */
 
 #include <gnuradio/uwb/uwb_rational_resampler_core.h>
+#include <openuwb/support/timing.h>
 
 #include <algorithm>
 #include <chrono>
@@ -301,7 +302,7 @@ WindowResult run_window(Core& core,
                         size_t expect,
                         bool window_mode)
 {
-    using Clock = std::chrono::steady_clock;
+    using Clock = openuwb::timing::Clock;
     WindowResult w;
 
     if (window_mode) {
@@ -359,7 +360,7 @@ int benchmark_core(const Options& opt,
                    const std::vector<float>& taps,
                    size_t tap_fnv)
 {
-    using Clock = std::chrono::steady_clock;
+    using Clock = openuwb::timing::Clock;
     const float scale = (opt.scale_mode == "raw") ? 1.0f : (1.0f / 32768.0f);
 
     // ---- prepare (timed separately; never inside the measured region) ----

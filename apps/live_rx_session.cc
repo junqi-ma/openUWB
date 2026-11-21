@@ -59,12 +59,10 @@ static volatile std::sig_atomic_t interrupted = 0;
 static void on_signal(int) { interrupted = 1; }
 
 static double elapsed_us(Clock::time_point start, Clock::time_point end) {
-    return std::chrono::duration<double, std::micro>(end-start).count();
+    return openuwb::timing::elapsed_us_f(start, end);
 }
 static double thread_cpu_us() {
-    timespec t{};
-    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
-    return t.tv_sec*1e6 + t.tv_nsec/1e3;
+    return static_cast<double>(openuwb::timing::thread_cpu_ns()) / 1e3;
 }
 
 template<class T> std::vector<T> load(const std::string& path) {

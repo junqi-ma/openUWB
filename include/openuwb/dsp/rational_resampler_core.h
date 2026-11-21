@@ -77,6 +77,7 @@
 #include <volk/volk.h>
 
 #include <openuwb/support/simd.h>
+#include <openuwb/support/timing.h>
 #include <openuwb/support/simd_config.h>
 
 // The compile-time backend is chosen once by CMake (UWB_SIMD=...).  The
@@ -410,7 +411,7 @@ public:
     int64_t map_input_offset_to_output(int64_t p) const;
 
 private:
-    using Clock = std::chrono::steady_clock;
+    using Clock = openuwb::timing::Clock;
 
     enum class FirKind { Scalar, Volk, Avx2, Avx512 };
     enum class LoopKind { Legacy, Macroblock };

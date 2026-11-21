@@ -5,7 +5,7 @@ set(sources
     uwb_discrete_cir_reconstruct.cc
     uwb_preamble_sic_core.cc
     uwb_fullpacket_sic_core.cc)
-add_library(openuwb_sic STATIC ${sources})
+add_library(openuwb_sic ${UWB_LIBRARY_TYPE} ${sources})
 target_link_libraries(openuwb_sic PUBLIC openuwb_phy_hrp)
 set_target_properties(openuwb_sic PROPERTIES POSITION_INDEPENDENT_CODE ON)
 uwb_simd_apply(openuwb_sic)

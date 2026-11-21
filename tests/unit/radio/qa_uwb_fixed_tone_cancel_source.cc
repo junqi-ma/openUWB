@@ -311,7 +311,7 @@ BOOST_AUTO_TEST_CASE(test_stage_cancels_every_period_and_conserves_samples)
     opts.read_sizes = { 97, 256, 31, 512 }; // arbitrary chunking
     // The whole stream fits in the ring, so this case exercises the normal
     // path (overflow has its own case below).
-    auto stage = make_stage(std::make_unique<FakeToneSource>(opts), 256, 64);
+    auto stage = make_stage(std::make_unique<FakeToneSource>(opts), 256, 512);
     BOOST_REQUIRE(stage->start_stream());
 
     auto out = drain(*stage, 333);
@@ -384,7 +384,7 @@ BOOST_AUTO_TEST_CASE(test_stage_gap_is_forwarded_and_resets_the_epoch)
     // period boundary: 4000 logical samples -> 64 hidden samples.
     opts.gap_at = 4000;
     opts.gap_samples = 64;
-    auto stage = make_stage(std::make_unique<FakeToneSource>(opts), 256, 64);
+    auto stage = make_stage(std::make_unique<FakeToneSource>(opts), 256, 512);
     BOOST_REQUIRE(stage->start_stream());
     auto out = drain(*stage, 300);
     const auto& s = stage->stats();
@@ -561,7 +561,9 @@ PipelineRun run_pipeline(bool enable_tone, const std::string& tag)
     cfg.max_windows = 3;
     cfg.resampler_profile = "quality_minorder";
     cfg.iq_dump_dir = (std::filesystem::temp_directory_path() /
-                       ("uwb_fixed_tone_qa_" + tag)).string();
+                       ("uwb_fixed_tone_qa_" + tag + "_" +
+                        std::to_string(std::chrono::steady_clock::now()
+                                           .time_since_epoch().count()))).string();
     std::filesystem::remove_all(cfg.iq_dump_dir);
     cfg.iq_dump_tag = enable_tone ? "enabled" : "disabled";
     cfg.iq_dump_windows = 3;
@@ -572,8 +574,12 @@ PipelineRun run_pipeline(bool enable_tone, const std::string& tag)
     cfg.fixed_tone_cancel_training_s = double(kTraining) / kRate;
     cfg.fixed_tone_cancel_crossfade_samples = kCrossfade;
     // Large enough to hold this (unpaced) synthetic stream without drops.
+    // The 256-sample reads mean each queue slot carries 256 samples, so the
+    // effective ring capacity is queue_blocks * 256, not queue_blocks *
+    // block_samples.  The stream is ~3*2880+896 samples long; 64 slots give
+    // 16384 samples and absorb the unpaced producer burst deterministically.
     cfg.fixed_tone_cancel_block_samples = 1024;
-    cfg.fixed_tone_cancel_queue_blocks = 16;
+    cfg.fixed_tone_cancel_queue_blocks = 64;
 
     FakeOptions opts;
     opts.total = 3 * static_cast<int64_t>(kPeriodLength) + 640 + 256;

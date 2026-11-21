@@ -49,6 +49,7 @@ endfunction()
 # QA-only fake link, so the demo works without the radio runtime (M1-B §8).
 # Its Python driver and the independent verifier live in tests/integration/.
 ########################################################################
+if(UWB_ENABLE_TWR)
 add_executable(openuwb_twr_fake_demo twr_fake_demo.cc)
 target_include_directories(openuwb_twr_fake_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 target_link_libraries(openuwb_twr_fake_demo PRIVATE uwb_twr_core uwb_twr_fake_link)
@@ -73,22 +74,25 @@ target_compile_definitions(openuwb_twr_native_phy_demo PRIVATE
 # TODO(openuwb-compat-removal): legacy target/binary name used by tests/ scripts.
 add_executable(twr_native_phy_demo ALIAS openuwb_twr_native_phy_demo)
 openuwb_compat_symlink(openuwb_twr_native_phy_demo twr_native_phy_demo)
+endif()
 
 ########################################################################
 # Offline dump postprocess: per-window notch + 65/48 (no UHD, no work())
 ########################################################################
+if(UWB_ENABLE_RX_APPS)
 add_executable(uwb_offline_postprocess_dump uwb_offline_postprocess_dump.cc)
 target_link_libraries(uwb_offline_postprocess_dump
     uwb_native
     Threads::Threads
 )
 install(TARGETS uwb_offline_postprocess_dump DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 
 ########################################################################
 # Historical benchmark / diagnostic EXPERIMENT apps whose sources live in
 # tools/sic/.  The measurement rigs themselves moved to tests/benchmarks/.
 ########################################################################
-if(UWB_BUILD_EXPERIMENTS)
+if(UWB_BUILD_EXPERIMENTS AND UWB_ENABLE_BENCHMARKS)
     # Offline paired recovery experiment: desired complete packet + other-code
     # SYNC/SFD-only interference. Does not change the production pipeline.
     add_executable(experiment_preamble_recovery
@@ -120,6 +124,7 @@ endif()
 ########################################################################
 # UHD SC16 Direct RX and Multi-Core Stream Pipeline Runner
 ########################################################################
+if(UWB_ENABLE_RUNTIME)
 add_executable(openuwb_pipeline_runner uwb_uhd_sc16_pipeline_runner.cc)
 target_link_libraries(openuwb_pipeline_runner uwb_native Threads::Threads)
 uwb_simd_apply(openuwb_pipeline_runner)
@@ -131,12 +136,14 @@ endif()
 # TODO(openuwb-compat-removal): legacy target/binary name used by tools/ and QA.
 add_executable(uwb_uhd_sc16_pipeline_runner ALIAS openuwb_pipeline_runner)
 openuwb_compat_symlink(openuwb_pipeline_runner uwb_uhd_sc16_pipeline_runner)
+endif()
 
 ########################################################################
 # UHD SC16 direct capture + native-grid packet analysis.
 # Diagnostic counterpart of the GNU Radio capture flow: same UhdDeviceSc16Source
 # the pipeline uses, then the native detector cores over the captured buffer.
 ########################################################################
+if(UWB_ENABLE_RX_APPS)
 add_executable(openuwb_capture uwb_uhd_sc16_capture.cc)
 target_link_libraries(openuwb_capture uwb_native Threads::Threads)
 uwb_simd_apply(openuwb_capture)
@@ -193,12 +200,39 @@ if(Python3_Interpreter_FOUND)
                 $<TARGET_FILE:uwb_dw3000_live>)
     set_tests_properties(uwb_qa_dw3000_live_console PROPERTIES TIMEOUT 90 LABELS "core;rx_sic")
 endif()
+endif()
 
 ########################################################################
 # Install the native application entry points.
 ########################################################################
-install(TARGETS openuwb_pipeline_runner openuwb_capture openuwb_rx
-    DESTINATION ${CMAKE_INSTALL_BINDIR})
-openuwb_compat_install_symlink(openuwb_pipeline_runner uwb_uhd_sc16_pipeline_runner)
-openuwb_compat_install_symlink(openuwb_capture uwb_uhd_sc16_capture)
-openuwb_compat_install_symlink(openuwb_rx uwb_dw3000_live)
+set(_uwb_install_apps "")
+if(TARGET openuwb_pipeline_runner)
+    list(APPEND _uwb_install_apps openuwb_pipeline_runner)
+endif()
+if(TARGET openuwb_capture)
+    list(APPEND _uwb_install_apps openuwb_capture)
+endif()
+if(TARGET openuwb_rx)
+    list(APPEND _uwb_install_apps openuwb_rx)
+endif()
+if(_uwb_install_apps)
+    install(TARGETS ${_uwb_install_apps} DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+if(TARGET openuwb_pipeline_runner)
+    openuwb_compat_install_symlink(openuwb_pipeline_runner uwb_uhd_sc16_pipeline_runner)
+endif()
+if(TARGET openuwb_capture)
+    openuwb_compat_install_symlink(openuwb_capture uwb_uhd_sc16_capture)
+endif()
+if(TARGET openuwb_rx)
+    openuwb_compat_install_symlink(openuwb_rx uwb_dw3000_live)
+endif()
+
+# Stage 2: lightweight STL PCH for every application translation unit.
+foreach(_app IN ITEMS
+        openuwb_twr_fake_demo openuwb_twr_native_phy_demo
+        uwb_offline_postprocess_dump experiment_preamble_recovery
+        benchmark_chain_workers openuwb_pipeline_runner openuwb_capture
+        fixed_tone_cancel_replay uwb_dw3000_decode openuwb_rx)
+    uwb_apply_stl_pch(${_app})
+endforeach()

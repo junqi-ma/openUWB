@@ -1,31 +1,37 @@
-#include <gnuradio/uwb/uwb_demod_core.h>
 /* -*- c++ -*- */
 /*
  * Copyright 2026
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * QA for the HRP BPRF modulator against testdata/realtime_demod_golden.
+ * Pure TX QA for the HRP BPRF modulator against testdata/realtime_demod_golden.
+ * End-to-end TX->RX demodulate_one() loopback cases live in
+ * qa_uwb_hrp_mod_rx_loopback.cc so UWB_DEV_SCOPE=tx skips RX demod builds.
  */
+
+#include "hrp_mod_test_helpers.h"
 
 #include <boost/test/unit_test.hpp>
 
 #include <gnuradio/uwb/uwb_gr_complex.h>
-#include <gnuradio/uwb/uwb_demod_core.h>
 #include <gnuradio/uwb/uwb_hrp_mod_core.h>
 #include <gnuradio/uwb/uwb_phy_profile.h>
 #include <gnuradio/uwb/uwb_radar_sfd_core.h>
 
 #include <cmath>
 #include <cstdint>
-#include <fstream>
 #include <string>
 #include <vector>
 
 namespace {
 
-using openuwb::demod::Qm35825Profile;
-using openuwb::demod::core::demodulate_one;
+using openuwb::hrp_mod_test::golden_dir;
+using openuwb::hrp_mod_test::kTestdata;
+using openuwb::hrp_mod_test::l2_rel;
+using openuwb::hrp_mod_test::load_cf32;
+using openuwb::hrp_mod_test::load_i8;
+using openuwb::hrp_mod_test::load_template;
+using openuwb::hrp_mod_test::load_u8;
 using openuwb::mod::HrpModConfig;
 using openuwb::mod::HrpModScratch;
 using openuwb::mod::modulate_one;
@@ -33,220 +39,11 @@ using openuwb::mod::packet_samples_998p4;
 using openuwb::mod::PulseShape;
 using openuwb::mod::PulseSpec;
 
-#ifdef UWB_TESTDATA_DIR
-const char* kTestdata = UWB_TESTDATA_DIR;
-#else
-const char* kTestdata = "../../../testdata";
-#endif
-
-std::string golden_dir()
-{
-    return std::string(kTestdata) + "/realtime_demod_golden";
-}
-
-bool load_cf32(const std::string& path, std::vector<gr_complex>& out)
-{
-    std::ifstream f(path, std::ios::binary);
-    if (!f)
-        return false;
-    f.seekg(0, std::ios::end);
-    const auto bytes = static_cast<size_t>(f.tellg());
-    f.seekg(0);
-    if (bytes == 0 || bytes % sizeof(gr_complex) != 0)
-        return false;
-    out.resize(bytes / sizeof(gr_complex));
-    f.read(reinterpret_cast<char*>(out.data()),
-           static_cast<std::streamsize>(bytes));
-    return static_cast<bool>(f);
-}
-
-bool load_u8(const std::string& path, std::vector<uint8_t>& out)
-{
-    std::ifstream f(path, std::ios::binary);
-    if (!f)
-        return false;
-    f.seekg(0, std::ios::end);
-    const auto bytes = static_cast<size_t>(f.tellg());
-    f.seekg(0);
-    out.resize(bytes);
-    f.read(reinterpret_cast<char*>(out.data()),
-           static_cast<std::streamsize>(bytes));
-    return static_cast<bool>(f);
-}
-
-bool load_i8(const std::string& path, std::vector<int8_t>& out)
-{
-    std::ifstream f(path, std::ios::binary);
-    if (!f)
-        return false;
-    f.seekg(0, std::ios::end);
-    const auto bytes = static_cast<size_t>(f.tellg());
-    f.seekg(0);
-    out.resize(bytes);
-    f.read(reinterpret_cast<char*>(out.data()),
-           static_cast<std::streamsize>(bytes));
-    return static_cast<bool>(f);
-}
-
-bool load_f32(const std::string& path, std::vector<float>& out)
-{
-    std::ifstream f(path, std::ios::binary);
-    if (!f)
-        return false;
-    f.seekg(0, std::ios::end);
-    const auto bytes = static_cast<size_t>(f.tellg());
-    f.seekg(0);
-    if (bytes == 0 || bytes % sizeof(float) != 0)
-        return false;
-    out.resize(bytes / sizeof(float));
-    f.read(reinterpret_cast<char*>(out.data()),
-           static_cast<std::streamsize>(bytes));
-    return static_cast<bool>(f);
-}
-
-std::vector<gr_complex> load_template()
-{
-    std::vector<gr_complex> tmpl;
-    BOOST_REQUIRE(load_cf32(std::string(kTestdata) + "/reference_preamble.bin",
-                            tmpl));
-    return tmpl;
-}
-
-double l2_rel(const std::vector<gr_complex>& a, const gr_complex* b, size_t n)
-{
-    double num = 0.0, den = 0.0;
-    for (size_t i = 0; i < n; ++i) {
-        const double dr = static_cast<double>(a[i].real()) - b[i].real();
-        const double di = static_cast<double>(a[i].imag()) - b[i].imag();
-        num += dr * dr + di * di;
-        den += static_cast<double>(b[i].real()) * b[i].real() +
-               static_cast<double>(b[i].imag()) * b[i].imag();
-    }
-    return std::sqrt(num / (den + 1e-30));
-}
-
 } // namespace
 
 BOOST_AUTO_TEST_CASE(test_hrp_mod_packet_length_p1)
 {
     BOOST_CHECK_EQUAL(packet_samples_998p4(64, 8, 127), size_t(249280));
-}
-
-BOOST_AUTO_TEST_CASE(test_hrp_mod_gaussian_live_template_demod)
-{
-    auto bytes = openuwb::mod::make_random_psdu(8, 4242u, true);
-    HrpModConfig cfg;
-    cfg.sfd_mode = "4z2";
-    cfg.pulse.shape = PulseShape::Gaussian;
-    cfg.pulse.gaussian_sigma_ns = 2.5f;
-    HrpModScratch scratch;
-    const size_t want = packet_samples_998p4(64, 8, bytes.size(), false,
-                                             &cfg.pulse);
-    scratch.reserve(bytes.size(), want);
-    std::vector<gr_complex> tx(want);
-    size_t n = 0;
-    BOOST_REQUIRE(modulate_one(bytes.data(), bytes.size(), cfg, scratch,
-                               tx.data(), tx.size(), n));
-
-    std::vector<gr_complex> tmpl(tx.begin(), tx.begin() + 1016);
-    double e = 0.0;
-    for (const auto& z : tmpl)
-        e += static_cast<double>(z.real()) * z.real() +
-             static_cast<double>(z.imag()) * z.imag();
-    const float inv = (e > 0.0) ? static_cast<float>(1.0 / std::sqrt(e)) : 1.f;
-    for (auto& z : tmpl)
-        z *= inv;
-
-    const size_t t0 = 9984;
-    std::vector<gr_complex> iq(t0 + n + 8192, gr_complex(0.f, 0.f));
-    std::copy(tx.begin(), tx.end(), iq.begin() + static_cast<std::ptrdiff_t>(t0));
-    auto prof = Qm35825Profile::Default();
-    prof.sfd_mode = "4z2";
-    openuwb::demod::core::DemodScratch dscratch;
-    dscratch.reserve(iq.size());
-    const auto res = demodulate_one(iq.data(), iq.size(), prof, 1,
-                                    static_cast<int64_t>(t0), 0, tmpl, dscratch);
-    BOOST_REQUIRE_MESSAGE(res.status == openuwb::demod::DemodStatus::Success,
-                          "gaussian live-template demod status=" +
-                              std::to_string(static_cast<int>(res.status)));
-    BOOST_CHECK(res.payload.fcs_pass);
-    BOOST_REQUIRE_EQUAL(res.payload.bytes.size(), bytes.size());
-    BOOST_CHECK_EQUAL_COLLECTIONS(res.payload.bytes.begin(),
-                                  res.payload.bytes.end(),
-                                  bytes.begin(), bytes.end());
-}
-
-void run_external_live_template_demod(const std::string& rel_path,
-                                      size_t n_taps, size_t center,
-                                      size_t tail_extra, uint32_t seed)
-{
-    std::vector<float> taps;
-    BOOST_REQUIRE(load_f32(std::string(kTestdata) + rel_path, taps));
-    BOOST_REQUIRE_EQUAL(taps.size(), n_taps);
-
-    auto bytes = openuwb::mod::make_random_psdu(8, seed, true);
-    HrpModConfig cfg;
-    cfg.sfd_mode = "4z2";
-    cfg.pulse.shape = PulseShape::External;
-    cfg.pulse.external_n_taps = taps.size();
-    cfg.pulse.external_center = center;
-    cfg.external_taps = taps;
-    HrpModScratch scratch;
-    const size_t want = packet_samples_998p4(64, 8, bytes.size(), false,
-                                             &cfg.pulse);
-    BOOST_CHECK_EQUAL(want,
-                      packet_samples_998p4(64, 8, bytes.size()) + tail_extra);
-    scratch.reserve(bytes.size(), want);
-    std::vector<gr_complex> tx(want);
-    size_t n = 0;
-    BOOST_REQUIRE(modulate_one(bytes.data(), bytes.size(), cfg, scratch,
-                               tx.data(), tx.size(), n));
-
-    std::vector<gr_complex> tmpl(tx.begin(), tx.begin() + 1016);
-    double e = 0.0;
-    for (const auto& z : tmpl)
-        e += static_cast<double>(z.real()) * z.real() +
-             static_cast<double>(z.imag()) * z.imag();
-    const float inv = (e > 0.0) ? static_cast<float>(1.0 / std::sqrt(e)) : 1.f;
-    for (auto& z : tmpl)
-        z *= inv;
-
-    const size_t t0 = 9984;
-    std::vector<gr_complex> iq(t0 + n + 8192, gr_complex(0.f, 0.f));
-    std::copy(tx.begin(), tx.end(), iq.begin() + static_cast<std::ptrdiff_t>(t0));
-    auto prof = Qm35825Profile::Default();
-    prof.sfd_mode = "4z2";
-    openuwb::demod::core::DemodScratch dscratch;
-    dscratch.reserve(iq.size());
-    const auto res = demodulate_one(iq.data(), iq.size(), prof, 1,
-                                    static_cast<int64_t>(t0), 0, tmpl, dscratch);
-    BOOST_REQUIRE_MESSAGE(res.status == openuwb::demod::DemodStatus::Success,
-                          "external live-template demod status=" +
-                              std::to_string(static_cast<int>(res.status)));
-    BOOST_CHECK(res.payload.fcs_pass);
-    BOOST_REQUIRE_EQUAL(res.payload.bytes.size(), bytes.size());
-    BOOST_CHECK_EQUAL_COLLECTIONS(res.payload.bytes.begin(),
-                                  res.payload.bytes.end(),
-                                  bytes.begin(), bytes.end());
-}
-
-BOOST_AUTO_TEST_CASE(test_hrp_mod_external_live_template_demod)
-{
-    run_external_live_template_demod(
-        "/uwb_hrp_tx/pulse_minphase_rc100_215.f32", 257, 4, 255, 777u);
-}
-
-BOOST_AUTO_TEST_CASE(test_hrp_mod_minphase_live_template_demod)
-{
-    run_external_live_template_demod(
-        "/uwb_hrp_tx/pulse_minphase_rc160_240.f32", 1025, 4, 1023, 778u);
-}
-
-BOOST_AUTO_TEST_CASE(test_hrp_mod_external_default_live_template_demod)
-{
-    run_external_live_template_demod(
-        "/uwb_hrp_tx/pulse_trunc_linear_rc183_240.f32", 1025, 32, 1023,
-        779u);
 }
 
 BOOST_AUTO_TEST_CASE(test_hrp_mod_pulse_shape_spectrum)
@@ -360,13 +157,6 @@ BOOST_AUTO_TEST_CASE(test_hrp_mod_rs_matches_golden)
     BOOST_REQUIRE_EQUAL(scratch.rs_cw.size(), golden.size());
     BOOST_CHECK_EQUAL_COLLECTIONS(scratch.rs_cw.begin(), scratch.rs_cw.end(),
                                   golden.begin(), golden.end());
-
-    std::vector<int8_t> decoded;
-    BOOST_REQUIRE(openuwb::demod::core::detail::rs_decode_stream(
-        scratch.rs_cw, scratch.psdu_bits.size(), decoded));
-    BOOST_CHECK_EQUAL_COLLECTIONS(decoded.begin(), decoded.end(),
-                                  scratch.psdu_bits.begin(),
-                                  scratch.psdu_bits.end());
 }
 
 BOOST_AUTO_TEST_CASE(test_hrp_mod_iq_matches_matlab_window)
@@ -387,40 +177,6 @@ BOOST_AUTO_TEST_CASE(test_hrp_mod_iq_matches_matlab_window)
     BOOST_REQUIRE_EQUAL(n, size_t(249280));
     const double rel = l2_rel(tx, window.data() + 9984, n);
     BOOST_CHECK_LT(rel, 1e-6);
-}
-
-BOOST_AUTO_TEST_CASE(test_hrp_mod_demodulate_one_fcs)
-{
-    std::vector<uint8_t> bytes;
-    BOOST_REQUIRE(load_u8(golden_dir() + "/stage_payload_bytes.bin", bytes));
-
-    HrpModConfig cfg;
-    HrpModScratch scratch;
-    scratch.reserve(127, 249280);
-    std::vector<gr_complex> tx(249280);
-    size_t n = 0;
-    BOOST_REQUIRE(modulate_one(bytes.data(), bytes.size(), cfg, scratch,
-                               tx.data(), tx.size(), n));
-
-    const size_t t0 = 9984;
-    std::vector<gr_complex> iq(t0 + n + 4096, gr_complex(0.f, 0.f));
-    std::copy(tx.begin(), tx.end(), iq.begin() + static_cast<std::ptrdiff_t>(t0));
-
-    auto prof = Qm35825Profile::Default();
-    prof.sfd_mode = "ieee";
-    openuwb::demod::core::DemodScratch dscratch;
-    dscratch.reserve(iq.size());
-    const auto res = demodulate_one(iq.data(), iq.size(), prof, 1,
-                                    static_cast<int64_t>(t0), 0,
-                                    load_template(), dscratch);
-    BOOST_REQUIRE(res.status == openuwb::demod::DemodStatus::Success);
-    BOOST_REQUIRE(res.payload.ok);
-    BOOST_CHECK(res.payload.fcs_pass);
-    BOOST_REQUIRE_EQUAL(res.payload.bytes.size(), bytes.size());
-    BOOST_CHECK_EQUAL_COLLECTIONS(res.payload.bytes.begin(),
-                                  res.payload.bytes.end(),
-                                  bytes.begin(), bytes.end());
-    BOOST_CHECK_EQUAL(res.phr.psdu_length, 127u);
 }
 
 BOOST_AUTO_TEST_CASE(test_hrp_mod_rejects_sts_and_bad_len)
@@ -461,39 +217,6 @@ BOOST_AUTO_TEST_CASE(test_hrp_mod_psdu0_length_and_phr)
         tx.data(), tx.size(),
         static_cast<int64_t>(64 * 1016), 64, 0.3f, sr, ss));
     BOOST_CHECK(sr.status == openuwb::radar::SfdStatus::Ok);
-}
-
-BOOST_AUTO_TEST_CASE(test_hrp_mod_4z2_no_sts_demod_fcs)
-{
-    auto bytes = openuwb::mod::make_random_psdu(8, 20260904u, true);
-    BOOST_REQUIRE_EQUAL(bytes.size(), size_t(10));
-    HrpModConfig cfg;
-    cfg.sfd_mode = "4z2";
-    HrpModScratch scratch;
-    const size_t want = packet_samples_998p4(64, 8, bytes.size());
-    scratch.reserve(bytes.size(), want);
-    std::vector<gr_complex> tx(want);
-    size_t n = 0;
-    BOOST_REQUIRE(modulate_one(bytes.data(), bytes.size(), cfg, scratch,
-                               tx.data(), tx.size(), n));
-    const size_t t0 = 9984;
-    std::vector<gr_complex> iq(t0 + n + 8192, gr_complex(0.f, 0.f));
-    std::copy(tx.begin(), tx.end(), iq.begin() + static_cast<std::ptrdiff_t>(t0));
-    auto prof = Qm35825Profile::Default();
-    prof.sfd_mode = "4z2";
-    openuwb::demod::core::DemodScratch dscratch;
-    dscratch.reserve(iq.size());
-    const auto res = demodulate_one(iq.data(), iq.size(), prof, 1,
-                                    static_cast<int64_t>(t0), 0,
-                                    load_template(), dscratch);
-    BOOST_REQUIRE_MESSAGE(res.status == openuwb::demod::DemodStatus::Success,
-                          "4z2 demod status=" +
-                              std::to_string(static_cast<int>(res.status)));
-    BOOST_CHECK(res.payload.fcs_pass);
-    BOOST_REQUIRE_EQUAL(res.payload.bytes.size(), bytes.size());
-    BOOST_CHECK_EQUAL_COLLECTIONS(res.payload.bytes.begin(),
-                                  res.payload.bytes.end(),
-                                  bytes.begin(), bytes.end());
 }
 
 BOOST_AUTO_TEST_CASE(test_hrp_mod_4z2_sts_matches_radar_length_and_sfd)
@@ -589,47 +312,6 @@ BOOST_AUTO_TEST_CASE(test_hrp_mod_prefix_cache_preserves_p1)
                                tx.data(), tx.size(), n3));
     BOOST_REQUIRE_EQUAL(n3, size_t(249280));
     BOOST_CHECK_LT(l2_rel(tx, window.data() + 9984, n3), 1e-6);
-}
-
-BOOST_AUTO_TEST_CASE(test_hrp_mod_code10_ieee_fcs)
-{
-    auto bytes = openuwb::mod::make_random_psdu(8, 7u, true);
-    HrpModConfig cfg;
-    cfg.code_index = 10;
-    HrpModScratch scratch;
-    const size_t want = packet_samples_998p4(64, 8, bytes.size());
-    scratch.reserve(bytes.size(), want);
-    std::vector<gr_complex> tx(want);
-    size_t n = 0;
-    BOOST_REQUIRE(modulate_one(bytes.data(), bytes.size(), cfg, scratch,
-                               tx.data(), tx.size(), n));
-    auto prof = Qm35825Profile::Default();
-    prof.sfd_mode = "ieee";
-    prof.code_index = 10;
-    std::vector<gr_complex> tmpl;
-    BOOST_REQUIRE(load_cf32(std::string(kTestdata) +
-                                "/reference_preamble.bin",
-                            tmpl));
-    // code-10 needs its own SYNC template; first generated symbol, L2-norm.
-    tmpl.assign(tx.begin(), tx.begin() + 1016);
-    double e = 0.0;
-    for (const auto& z : tmpl)
-        e += static_cast<double>(z.real()) * z.real() +
-             static_cast<double>(z.imag()) * z.imag();
-    const float inv = (e > 0.0) ? static_cast<float>(1.0 / std::sqrt(e)) : 1.f;
-    for (auto& z : tmpl)
-        z *= inv;
-    const size_t t0 = 9984;
-    std::vector<gr_complex> iq(t0 + n + 8192, gr_complex(0.f, 0.f));
-    std::copy(tx.begin(), tx.end(), iq.begin() + static_cast<std::ptrdiff_t>(t0));
-    openuwb::demod::core::DemodScratch dscratch;
-    dscratch.reserve(iq.size());
-    const auto res = demodulate_one(iq.data(), iq.size(), prof, 1,
-                                    static_cast<int64_t>(t0), 0, tmpl, dscratch);
-    BOOST_REQUIRE_MESSAGE(res.status == openuwb::demod::DemodStatus::Success,
-                          "code10 demod status=" +
-                              std::to_string(static_cast<int>(res.status)));
-    BOOST_CHECK(res.payload.fcs_pass);
 }
 
 BOOST_AUTO_TEST_CASE(unit_real_impulses_match_complex_modulation)

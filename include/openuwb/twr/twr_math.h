@@ -899,79 +899,21 @@ inline Rat128 rat128_one()
 }
 
 // ---- shared refusal plumbing -------------------------------------------
-inline TofResult tof_fail(TofResult r, TofStatus s, const std::string& detail)
-{
-    r.ok = false;
-    r.status = s;
-    r.exchange_status = tof_status_to_exchange_status(s);
-    r.detail = detail;
-    return r;
-}
+TofResult tof_fail(TofResult r, TofStatus s, const std::string& detail);
 
 // One timeline, stated once.  Identity (name+rate+bits) and epoch are kept
 // distinct so the caller is told WHICH of the two failed.
-inline bool tof_domain_check(TofResult& r, const char* what, const ClockDomain& got,
-                             const ClockDomain& want)
-{
-    if (!got.is_valid()) {
-        r = tof_fail(r, TofStatus::InvalidClockDomain,
-                     std::string(what) + ": interval carries an invalid clock domain");
-        return false;
-    }
-    if (!clock_domain_same_identity(got, want)) {
-        r = tof_fail(r, TofStatus::ClockRatioDomainMismatch,
-                     std::string(what) + " is in " + got.to_string() +
-                         " but the clock ratio declares " + want.to_string());
-        return false;
-    }
-    if (!clock_domain_same_epoch(got, want)) {
-        r = tof_fail(r, TofStatus::ClockRatioEpochMismatch,
-                     std::string(what) + " is epoch " + std::to_string(got.epoch_id) +
-                         " but the clock ratio declares epoch " +
-                         std::to_string(want.epoch_id));
-        return false;
-    }
-    return true;
-}
+bool tof_domain_check(TofResult& r, const char* what, const ClockDomain& got,
+                             const ClockDomain& want);
 
 // k must be valid across the WHOLE A-domain interval the exchange runs on.
 // For a wrapped interval the two raw readings straddle the wrap, so the span
 // is [min, max]; requiring both ends inside the window is the safe reading.
-inline bool tof_window_check(TofResult& r, const char* what,
-                             const AdmittedRangingInterval& iv, const ClockRatio& k)
-{
-    if (!k.has_validity_window())
-        return true;
-    const int64_t a = iv.earlier().ticks();
-    const int64_t b = iv.later().ticks();
-    const int64_t lo = (a < b) ? a : b;
-    const int64_t hi = (a < b) ? b : a;
-    if (!k.covers_ticks(lo) || !k.covers_ticks(hi)) {
-        r = tof_fail(r, TofStatus::ClockRatioNotValidAtTime,
-                     std::string(what) + " spans A ticks [" + std::to_string(lo) + "," +
-                         std::to_string(hi) + "] which is outside the clock ratio's " +
-                         "validity window [" + std::to_string(k.valid_from_ticks()) + "," +
-                         std::to_string(k.valid_until_ticks()) + "]");
-        return false;
-    }
-    return true;
-}
+bool tof_window_check(TofResult& r, const char* what,
+                             const AdmittedRangingInterval& iv, const ClockRatio& k);
 
-inline bool tof_load_interval(TofResult& r, const char* what,
-                              const AdmittedRangingInterval& iv, Rat128& out)
-{
-    if (!iv.interval().is_valid()) {
-        r = tof_fail(r, TofStatus::InvalidInput,
-                     std::string(what) + ": admitted interval is not structurally valid");
-        return false;
-    }
-    if (!rat128_from_interval(iv.interval(), out)) {
-        r = tof_fail(r, TofStatus::Overflow,
-                     std::string(what) + ": exact_ratio() did not fit int64");
-        return false;
-    }
-    return true;
-}
+bool tof_load_interval(TofResult& r, const char* what,
+                              const AdmittedRangingInterval& iv, Rat128& out);
 
 } // namespace detail
 
@@ -988,70 +930,9 @@ inline bool tof_load_interval(TofResult& r, const char* what,
 //
 // This function does NOT admit anything.  The caller (the future FSM) runs
 // `admit_ranging_interval()` first; a bare `Timestamp` cannot even be passed.
-inline TofResult compute_ss_tof(const AdmittedRangingInterval& ra,
+TofResult compute_ss_tof(const AdmittedRangingInterval& ra,
                                 const AdmittedRangingInterval& db,
-                                const ClockRatio& k_ab)
-{
-    TofResult r;
-    r.protocol = Protocol::Ss;
-    r.computed_at = ComputedAt::InitiatorA; // REQ-PROTO-05: baseline at A
-    r.ratio = k_ab;
-    r.domain = k_ab.domain_a();
-
-    const TofStatus ks = k_ab.check();
-    if (ks != TofStatus::Ok)
-        return detail::tof_fail(r, ks, "clock ratio is unusable: " + k_ab.to_string());
-
-    if (!detail::tof_domain_check(r, "ra", ra.domain(), k_ab.domain_a()))
-        return r;
-    if (!detail::tof_domain_check(r, "db", db.domain(), k_ab.domain_b()))
-        return r;
-    // REQ-TIME-04: the ratio must be in force across the A-domain interval.
-    if (!detail::tof_window_check(r, "ra", ra, k_ab))
-        return r;
-
-    detail::Rat128 RA;
-    detail::Rat128 DB;
-    if (!detail::tof_load_interval(r, "ra", ra, RA))
-        return r;
-    if (!detail::tof_load_interval(r, "db", db, DB))
-        return r;
-
-    const detail::Rat128 k = detail::rat128_make(k_ab.k_num(), k_ab.k_den());
-    detail::Rat128 kdb;
-    detail::Rat128 half;
-    if (!detail::rat128_mul(k, DB, kdb))
-        return detail::tof_fail(r, TofStatus::Overflow, "k*DB left 128 bits");
-    // The formula itself lives in the ONE shared kernel (M1-B §3.3); this
-    // strict entry point keeps its own admission checks above and maps the
-    // kernel status back onto its own vocabulary below.
-    if (detail::ss_tof_kernel(RA, DB, k, half) != detail::KernelStatus::Ok)
-        return detail::tof_fail(r, TofStatus::Overflow, "SS exact kernel left 128 bits");
-    if (!detail::rat128_fits_int64(half))
-        return detail::tof_fail(r, TofStatus::Overflow,
-                                "ToF numerator/denominator do not fit int64 ticks");
-
-    r.ra_raw = detail::rat128_to_ticks(RA);
-    r.db_raw = detail::rat128_to_ticks(DB);
-    r.ra = r.ra_raw;                    // already A ticks
-    r.db = detail::rat128_to_ticks(kdb); // k*DB, converted to A ticks
-    r.tof = detail::rat128_to_ticks(half);
-    r.display_seconds = r.tof.to_seconds(r.domain.tick_rate_hz);
-
-    if (r.tof.num < 0) {
-        r.ok = false;
-        r.status = TofStatus::NegativeTof;
-        r.exchange_status = tof_status_to_exchange_status(TofStatus::NegativeTof);
-        r.detail = "SS ToF is negative (" + r.tof.to_string() +
-                   " A ticks): retained with its sign, never clamped to 0";
-        return r;
-    }
-    r.ok = true;
-    r.status = TofStatus::Ok;
-    r.exchange_status = ExchangeStatus::Ok;
-    r.detail = "SS ToF = (RA - k*DB)/2";
-    return r;
-}
+                                const ClockRatio& k_ab);
 
 // ===========================================================================
 // DS-TWR (REQ-PROTO-03)
@@ -1065,100 +946,11 @@ inline TofResult compute_ss_tof(const AdmittedRangingInterval& ra,
 // is applied; plugging the native B ticks straight into the quotient would mix
 // two devices' units (REQ-PROTO-03 forbids exactly that).  Asymmetric reply
 // delays (`DA != DB`) are legal and required to work.
-inline TofResult compute_ds_tof(const AdmittedRangingInterval& ra,
+TofResult compute_ds_tof(const AdmittedRangingInterval& ra,
                                 const AdmittedRangingInterval& rb,
                                 const AdmittedRangingInterval& da,
                                 const AdmittedRangingInterval& db,
-                                const ClockRatio& k_ab)
-{
-    TofResult r;
-    r.protocol = Protocol::Ds;
-    r.computed_at = ComputedAt::ResponderB; // REQ-PROTO-05: baseline at B
-    r.ratio = k_ab;
-    r.domain = k_ab.domain_a(); // the common unit is A ticks
-
-    const TofStatus ks = k_ab.check();
-    if (ks != TofStatus::Ok)
-        return detail::tof_fail(r, ks, "clock ratio is unusable: " + k_ab.to_string());
-
-    if (!detail::tof_domain_check(r, "ra", ra.domain(), k_ab.domain_a()))
-        return r;
-    if (!detail::tof_domain_check(r, "da", da.domain(), k_ab.domain_a()))
-        return r;
-    if (!detail::tof_domain_check(r, "rb", rb.domain(), k_ab.domain_b()))
-        return r;
-    if (!detail::tof_domain_check(r, "db", db.domain(), k_ab.domain_b()))
-        return r;
-    if (!detail::tof_window_check(r, "ra", ra, k_ab))
-        return r;
-    if (!detail::tof_window_check(r, "da", da, k_ab))
-        return r;
-
-    detail::Rat128 RA;
-    detail::Rat128 RB;
-    detail::Rat128 DA;
-    detail::Rat128 DB;
-    if (!detail::tof_load_interval(r, "ra", ra, RA))
-        return r;
-    if (!detail::tof_load_interval(r, "rb", rb, RB))
-        return r;
-    if (!detail::tof_load_interval(r, "da", da, DA))
-        return r;
-    if (!detail::tof_load_interval(r, "db", db, DB))
-        return r;
-
-    const detail::Rat128 k = detail::rat128_make(k_ab.k_num(), k_ab.k_den());
-    detail::Rat128 rba;
-    detail::Rat128 dba;
-    if (!detail::rat128_mul(k, RB, rba))
-        return detail::tof_fail(r, TofStatus::Overflow, "k*RB left 128 bits");
-    if (!detail::rat128_mul(k, DB, dba))
-        return detail::tof_fail(r, TofStatus::Overflow, "k*DB left 128 bits");
-
-    // The formula itself lives in the ONE shared kernel (M1-B §3.3); the
-    // strict entry point keeps its own admission checks above.
-    detail::Rat128 tof;
-    const detail::KernelStatus kst = detail::ds_tof_kernel(RA, RB, DA, DB, k, tof);
-    if (kst == detail::KernelStatus::ZeroDenominator) {
-        // Four non-negative intervals sum to something non-positive: only the
-        // all-zero case is reachable, and the quotient is undefined.
-        r.ok = false;
-        r.status = TofStatus::ZeroDenominator;
-        r.exchange_status = tof_status_to_exchange_status(TofStatus::ZeroDenominator);
-        r.detail = "DS denominator is not positive: RA+k*RB+DA+k*DB is non-positive";
-        return r;
-    }
-    if (kst != detail::KernelStatus::Ok)
-        return detail::tof_fail(r, TofStatus::Overflow, "DS exact kernel left 128 bits");
-    if (!detail::rat128_fits_int64(tof))
-        return detail::tof_fail(r, TofStatus::Overflow,
-                                "ToF numerator/denominator do not fit int64 ticks");
-
-    r.ra_raw = detail::rat128_to_ticks(RA);
-    r.rb_raw = detail::rat128_to_ticks(RB);
-    r.da_raw = detail::rat128_to_ticks(DA);
-    r.db_raw = detail::rat128_to_ticks(DB);
-    r.ra = r.ra_raw;                      // A ticks already
-    r.da = r.da_raw;                      // A ticks already
-    r.rb = detail::rat128_to_ticks(rba);  // converted to A ticks
-    r.db = detail::rat128_to_ticks(dba);  // converted to A ticks
-    r.tof = detail::rat128_to_ticks(tof);
-    r.display_seconds = r.tof.to_seconds(r.domain.tick_rate_hz);
-
-    if (r.tof.num < 0) {
-        r.ok = false;
-        r.status = TofStatus::NegativeTof;
-        r.exchange_status = tof_status_to_exchange_status(TofStatus::NegativeTof);
-        r.detail = "DS ToF is negative (" + r.tof.to_string() +
-                   " A ticks): retained with its sign, never clamped to 0";
-        return r;
-    }
-    r.ok = true;
-    r.status = TofStatus::Ok;
-    r.exchange_status = ExchangeStatus::Ok;
-    r.detail = "DS ToF = (RA*k*RB - DA*k*DB)/(RA+k*RB+DA+k*DB), all in A ticks";
-    return r;
-}
+                                const ClockRatio& k_ab);
 
 // ===========================================================================
 // Optional derived distance

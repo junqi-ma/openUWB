@@ -3,14 +3,17 @@
 # openuwb_twr_core is the public protocol core; the fake link is QA transport
 # and is NOT installed; the native-rate PHY loop reuses the header-only HRP
 # cores, so it links Volk/Threads and needs no GNU Radio runtime.
-add_library(openuwb_twr_core STATIC uwb_twr_core.cc)
+add_library(openuwb_twr_core ${UWB_LIBRARY_TYPE}
+    uwb_twr_core.cc
+    uwb_twr_config_frame.cc
+    uwb_twr_math_time.cc)
 target_link_libraries(openuwb_twr_core PUBLIC openuwb_phy_hrp)
 set_target_properties(openuwb_twr_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-add_library(openuwb_twr_fake_link STATIC uwb_twr_fake_link.cc)
+add_library(openuwb_twr_fake_link ${UWB_LIBRARY_TYPE} uwb_twr_fake_link.cc)
 target_link_libraries(openuwb_twr_fake_link PUBLIC openuwb_twr_core)
 
-add_library(openuwb_twr_phy STATIC uwb_twr_phy.cc uwb_twr_phy_impairment.cc)
+add_library(openuwb_twr_phy ${UWB_LIBRARY_TYPE} uwb_twr_phy.cc uwb_twr_phy_impairment.cc)
 target_link_libraries(openuwb_twr_phy PUBLIC
     openuwb_twr_core openuwb_dsp Volk::volk Threads::Threads)
 set_target_properties(openuwb_twr_phy PROPERTIES POSITION_INDEPENDENT_CODE ON)

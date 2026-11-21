@@ -13,7 +13,7 @@ if(UWB_SIMD_HAVE_AVX512)
         uwb_resampler_transposed_avx512.cc
         uwb_demod_sic_avx512.cc)
 endif()
-add_library(openuwb_dsp STATIC ${sources})
+add_library(openuwb_dsp ${UWB_LIBRARY_TYPE} ${sources})
 target_link_libraries(openuwb_dsp PUBLIC openuwb_support)
 set_target_properties(openuwb_dsp PROPERTIES POSITION_INDEPENDENT_CODE ON)
 uwb_simd_apply(openuwb_dsp)

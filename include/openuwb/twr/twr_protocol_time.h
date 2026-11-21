@@ -136,48 +136,8 @@ inline bool sequence_modulus_is_supported(uint16_t m)
 // A binding is usable when it names a real peer counter, states both
 // conventions, has a positive interval bound inside the domain's unambiguous
 // window, and uses a supported sequence modulus.
-inline bool wire_timestamp_binding_is_well_formed(const WireTimestampBinding& b,
-                                                   std::string& why)
-{
-    if (!b.peer_domain.is_valid()) {
-        why = "peer_domain is not a valid clock domain";
-        return false;
-    }
-    if (!timestamp_marker_is_known(b.peer_marker)) {
-        why = "peer_marker is not a known TimestampMarker";
-        return false;
-    }
-    if (b.session_generation == 0) {
-        why = "session_generation is 0 (unset)";
-        return false;
-    }
-    if (b.binding_generation == 0) {
-        why = "binding_generation is 0 (unset)";
-        return false;
-    }
-    if (b.unit_convention.empty()) {
-        why = "unit_convention is empty";
-        return false;
-    }
-    if (b.calibration_convention_id.empty()) {
-        why = "calibration_convention_id is empty";
-        return false;
-    }
-    if (b.max_interval_ticks == 0) {
-        why = "max_interval_ticks is 0";
-        return false;
-    }
-    if (!sequence_modulus_is_supported(b.sequence_modulus)) {
-        why = "sequence_modulus is not one of 4/16/64/256";
-        return false;
-    }
-    const uint64_t period = clock_domain_wrap_period(b.peer_domain);
-    if (period != 0u && b.max_interval_ticks > period / 2u) {
-        why = "max_interval_ticks exceeds the domain's unambiguous half period";
-        return false;
-    }
-    return true;
-}
+bool wire_timestamp_binding_is_well_formed(const WireTimestampBinding& b,
+                                                   std::string& why);
 
 // ===========================================================================
 // PeerTimestampClaim -- one field of one matched frame
@@ -234,27 +194,7 @@ struct PeerTimestampClaim {
 // The identity the core stores alongside a claim.  A stable FNV-1a over the
 // frame's declared content -- not over an encoder, so the codec cannot change
 // it -- used only to prove two claims came from the SAME message.
-inline uint64_t frame_message_identity(const Frame& f)
-{
-    uint64_t h = 1469598103934665603ull;
-    auto mix = [&h](uint64_t v) {
-        for (int i = 0; i < 8; ++i) {
-            h ^= (v >> (8 * i)) & 0xffu;
-            h *= 1099511628211ull;
-        }
-    };
-    mix(static_cast<uint64_t>(f.version));
-    mix(static_cast<uint64_t>(f.function_code));
-    mix(f.session_id);
-    mix(f.seq);
-    mix(f.pan_id);
-    mix(f.src_addr);
-    mix(f.dst_addr);
-    mix(f.flags);
-    for (size_t i = 0; i < f.timestamp_count(); ++i)
-        mix(f.timestamps[i]);
-    return h;
-}
+uint64_t frame_message_identity(const Frame& f);
 
 // Read a field out of an already-decoded frame into a claim.  Fails when the
 // frame does not carry the field -- a claim is never synthesised for a field
@@ -706,101 +646,22 @@ inline TofStatus protocol_kernel_to_tof_status(KernelStatus k)
     return TofStatus::InvalidResult;
 }
 
-inline ProtocolTofEstimate protocol_fail(ProtocolTofEstimate e, TofStatus s,
-                                         const std::string& why)
-{
-    e.completion = ProtocolCompletionStatus::Failed;
-    e.estimate_available = false;
-    e.math_status = s;
-    e.set_failure_reason(tof_status_to_exchange_status(s));
-    e.detail = why;
-    return e;
-}
+ProtocolTofEstimate protocol_fail(ProtocolTofEstimate e, TofStatus s,
+                                         const std::string& why);
 
 // The domain of each formula slot.  SS uses (A, B); DS uses (A, B, A, B).
-inline bool protocol_domain_ok(ProtocolTofEstimate& e, const char* what,
-                               const ProtocolInterval& iv, const ClockDomain& want)
-{
-    if (!iv.is_valid()) {
-        e = protocol_fail(e, TofStatus::InvalidInput,
-                          std::string(what) + ": protocol interval is not valid");
-        return false;
-    }
-    if (!protocol_interval_origin_is_known(iv.origin())) {
-        e = protocol_fail(e, TofStatus::InvalidInput,
-                          std::string(what) + ": protocol interval origin is out of domain");
-        return false;
-    }
-    if (!iv.domain().is_valid()) {
-        e = protocol_fail(e, TofStatus::InvalidClockDomain,
-                          std::string(what) + ": interval carries an invalid clock domain");
-        return false;
-    }
-    if (!clock_domain_same_identity(iv.domain(), want)) {
-        e = protocol_fail(e, TofStatus::ClockRatioDomainMismatch,
-                          std::string(what) + " is in " + iv.domain().to_string() +
-                              " but the clock ratio declares " + want.to_string());
-        return false;
-    }
-    if (!clock_domain_same_epoch(iv.domain(), want)) {
-        e = protocol_fail(e, TofStatus::ClockRatioEpochMismatch,
-                          std::string(what) + " is epoch " +
-                              std::to_string(iv.domain().epoch_id) +
-                              " but the clock ratio declares epoch " +
-                              std::to_string(want.epoch_id));
-        return false;
-    }
-    return true;
-}
+bool protocol_domain_ok(ProtocolTofEstimate& e, const char* what,
+                               const ProtocolInterval& iv, const ClockDomain& want);
 
-inline bool protocol_load_interval(ProtocolTofEstimate& e, const char* what,
-                                   const ProtocolInterval& iv, Rat128& out)
-{
-    if (!iv.is_valid()) {
-        e = protocol_fail(e, TofStatus::InvalidInput,
-                          std::string(what) + ": protocol interval is not valid");
-        return false;
-    }
-    int64_t num = 0;
-    int64_t den = 0;
-    if (!iv.exact_ratio(num, den)) {
-        e = protocol_fail(e, TofStatus::Overflow,
-                          std::string(what) + ": exact_ratio() did not fit int64");
-        return false;
-    }
-    out = rat128_make(static_cast<i128>(num), static_cast<i128>(den));
-    return true;
-}
+bool protocol_load_interval(ProtocolTofEstimate& e, const char* what,
+                                   const ProtocolInterval& iv, Rat128& out);
 
 // The A-domain validity window of the clock ratio applies to whatever A-domain
 // interval the exchange runs on, local or wire.  Both endpoints of the
 // interval are checked (min/max, so a wrapped interval that straddles the
 // rollover is handled the same way as the strict M1-A window check).
-inline bool protocol_window_ok(ProtocolTofEstimate& e, const char* what,
-                               const ProtocolInterval& iv, const ClockRatio& k)
-{
-    if (!k.has_validity_window())
-        return true;
-    if (!iv.is_valid()) {
-        e = protocol_fail(e, TofStatus::InvalidInput,
-                          std::string(what) + ": protocol interval is not valid");
-        return false;
-    }
-    const int64_t a = iv.earlier_tick();
-    const int64_t b = iv.later_tick();
-    const int64_t lo = (a < b) ? a : b;
-    const int64_t hi = (a < b) ? b : a;
-    if (!k.covers_ticks(lo) || !k.covers_ticks(hi)) {
-        e = protocol_fail(e, TofStatus::ClockRatioNotValidAtTime,
-                          std::string(what) + " spans ticks [" + std::to_string(lo) +
-                              "," + std::to_string(hi) +
-                              "], outside the clock ratio validity window [" +
-                              std::to_string(k.valid_from_ticks()) + "," +
-                              std::to_string(k.valid_until_ticks()) + "]");
-        return false;
-    }
-    return true;
-}
+bool protocol_window_ok(ProtocolTofEstimate& e, const char* what,
+                               const ProtocolInterval& iv, const ClockRatio& k);
 
 } // namespace detail
 
@@ -818,134 +679,15 @@ inline bool protocol_window_ok(ProtocolTofEstimate& e, const char* what,
 // All four slots must already be expressed in the unit the formula wants:
 // RA/DA in A ticks and RB/DB in B ticks (the kernel converts).  A local slot
 // is an admitted interval; a peer slot is a wire claim.
-inline ProtocolTofEstimate compute_protocol_ss_tof(const ProtocolInterval& ra,
+ProtocolTofEstimate compute_protocol_ss_tof(const ProtocolInterval& ra,
                                                    const ProtocolInterval& db,
-                                                   const ClockRatio& k_ab)
-{
-    ProtocolTofEstimate e;
-    e.protocol = Protocol::Ss;
-    e.computed_at = ComputedAt::InitiatorA;
-    e.ratio = k_ab;
-    e.domain = k_ab.domain_a();
+                                                   const ClockRatio& k_ab);
 
-    const TofStatus ks = k_ab.check();
-    if (ks != TofStatus::Ok)
-        return detail::protocol_fail(e, ks, "clock ratio is unusable: " + k_ab.to_string());
-
-    if (!detail::protocol_domain_ok(e, "ra", ra, k_ab.domain_a()))
-        return e;
-    if (!detail::protocol_domain_ok(e, "db", db, k_ab.domain_b()))
-        return e;
-    if (!detail::protocol_window_ok(e, "ra", ra, k_ab))
-        return e;
-
-    detail::Rat128 RA;
-    detail::Rat128 DB;
-    if (!detail::protocol_load_interval(e, "ra", ra, RA))
-        return e;
-    if (!detail::protocol_load_interval(e, "db", db, DB))
-        return e;
-
-    const detail::Rat128 k = detail::rat128_make(k_ab.k_num(), k_ab.k_den());
-    detail::Rat128 half;
-    const detail::KernelStatus st = detail::ss_tof_kernel(RA, DB, k, half);
-    if (st != detail::KernelStatus::Ok)
-        return detail::protocol_fail(e, detail::protocol_kernel_to_tof_status(st),
-                                     "SS exact kernel failed");
-    if (!detail::rat128_fits_int64(half))
-        return detail::protocol_fail(e, TofStatus::Overflow,
-                                     "ToF numerator/denominator do not fit int64 ticks");
-
-    e.tof = detail::rat128_to_ticks(half);
-    e.math_status = TofStatus::Ok;
-    e.local_evidence_complete = true;
-    e.peer_evidence_is_wire_claim = ra.is_peer_wire_claim() || db.is_peer_wire_claim();
-    e.estimate_available = true;
-    e.completion = (e.tof.num < 0) ? ProtocolCompletionStatus::Failed
-                                   : ProtocolCompletionStatus::Complete;
-    if (e.tof.num < 0) {
-        e.estimate_available = false;
-        e.math_status = TofStatus::NegativeTof;
-        e.set_failure_reason(tof_status_to_exchange_status(TofStatus::NegativeTof));
-        e.detail = "protocol SS ToF is negative (" + e.tof.to_string() +
-                   " A ticks): retained with its sign";
-    } else {
-        e.detail = "protocol SS ToF = (RA - k*DB)/2 over wire/local inputs";
-    }
-    return e;
-}
-
-inline ProtocolTofEstimate compute_protocol_ds_tof(const ProtocolInterval& ra,
+ProtocolTofEstimate compute_protocol_ds_tof(const ProtocolInterval& ra,
                                                    const ProtocolInterval& rb,
                                                    const ProtocolInterval& da,
                                                    const ProtocolInterval& db,
-                                                   const ClockRatio& k_ab)
-{
-    ProtocolTofEstimate e;
-    e.protocol = Protocol::Ds;
-    e.computed_at = ComputedAt::ResponderB;
-    e.ratio = k_ab;
-    e.domain = k_ab.domain_a(); // the common unit is A ticks
-
-    const TofStatus ks = k_ab.check();
-    if (ks != TofStatus::Ok)
-        return detail::protocol_fail(e, ks, "clock ratio is unusable: " + k_ab.to_string());
-
-    if (!detail::protocol_domain_ok(e, "ra", ra, k_ab.domain_a()))
-        return e;
-    if (!detail::protocol_domain_ok(e, "da", da, k_ab.domain_a()))
-        return e;
-    if (!detail::protocol_domain_ok(e, "rb", rb, k_ab.domain_b()))
-        return e;
-    if (!detail::protocol_domain_ok(e, "db", db, k_ab.domain_b()))
-        return e;
-    if (!detail::protocol_window_ok(e, "ra", ra, k_ab))
-        return e;
-    if (!detail::protocol_window_ok(e, "da", da, k_ab))
-        return e;
-
-    detail::Rat128 RA;
-    detail::Rat128 RB;
-    detail::Rat128 DA;
-    detail::Rat128 DB;
-    if (!detail::protocol_load_interval(e, "ra", ra, RA))
-        return e;
-    if (!detail::protocol_load_interval(e, "rb", rb, RB))
-        return e;
-    if (!detail::protocol_load_interval(e, "da", da, DA))
-        return e;
-    if (!detail::protocol_load_interval(e, "db", db, DB))
-        return e;
-
-    const detail::Rat128 k = detail::rat128_make(k_ab.k_num(), k_ab.k_den());
-    detail::Rat128 tof;
-    const detail::KernelStatus st = detail::ds_tof_kernel(RA, RB, DA, DB, k, tof);
-    if (st != detail::KernelStatus::Ok)
-        return detail::protocol_fail(e, detail::protocol_kernel_to_tof_status(st),
-                                     "DS exact kernel failed");
-    if (!detail::rat128_fits_int64(tof))
-        return detail::protocol_fail(e, TofStatus::Overflow,
-                                     "ToF numerator/denominator do not fit int64 ticks");
-
-    e.tof = detail::rat128_to_ticks(tof);
-    e.math_status = TofStatus::Ok;
-    e.local_evidence_complete = true;
-    e.peer_evidence_is_wire_claim = ra.is_peer_wire_claim() || rb.is_peer_wire_claim() ||
-                                    da.is_peer_wire_claim() || db.is_peer_wire_claim();
-    e.estimate_available = true;
-    e.completion = (e.tof.num < 0) ? ProtocolCompletionStatus::Failed
-                                   : ProtocolCompletionStatus::Complete;
-    if (e.tof.num < 0) {
-        e.estimate_available = false;
-        e.math_status = TofStatus::NegativeTof;
-        e.set_failure_reason(tof_status_to_exchange_status(TofStatus::NegativeTof));
-        e.detail = "protocol DS ToF is negative (" + e.tof.to_string() +
-                   " A ticks): retained with its sign";
-    } else {
-        e.detail = "protocol DS ToF = (RA*k*RB - DA*k*DB)/(RA+k*RB+DA+k*DB), all in A ticks";
-    }
-    return e;
-}
+                                                   const ClockRatio& k_ab);
 
 } // namespace twr
 } // namespace openuwb

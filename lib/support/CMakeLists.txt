@@ -1,5 +1,5 @@
 # support: the baseline-ISA foundation (SIMD runtime probe, kernel backend).
-add_library(openuwb_support STATIC
+add_library(openuwb_support ${UWB_LIBRARY_TYPE}
     uwb_simd_runtime.cc
     uwb_kernel_backend.cc
 )

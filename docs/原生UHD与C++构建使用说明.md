@@ -16,12 +16,21 @@ env -u LD_LIBRARY_PATH ctest --preset native-avx2 --output-on-failure
 | --- | --- |
 | `native-avx2` | Release + AVX2/FMA 基线，UHD 自动探测;日常开发与验收默认档 |
 | `dev-avx2` | Release + AVX2/FMA，实验目标关闭（`UWB_BUILD_EXPERIMENTS=OFF`），日常编译 + `ctest -L rx_sic` 闭环的变体 |
+| `dev-rx` | 仅 RX/SIC/radio/runtime 域（`UWB_DEV_SCOPE=rx`），独立 `build/dev-rx` |
+| `dev-tx` | 仅 TX/PHY 调制域（`UWB_DEV_SCOPE=tx`），含 HRP 调制 QA 与 benchmark |
+| `dev-twr` | 仅 TWR 域（`UWB_DEV_SCOPE=twr`），含两个 demo 与全部 TWR QA |
+| `dev-radar` | 仅 radar/sensing 域（`UWB_DEV_SCOPE=radar`），含 sensing/radio QA 与 pipeline runner |
 | `native-avx512` | Release + AVX-512 宽内核 TU（基线仍是 AVX2/FMA） |
 | `scalar-debug` | Debug + 关闭自写 SIMD 内核，用于单步与参考对照 |
 | `no-uhd` | Release 且不构建 UHD 后端；回放、库和全部非硬件测试仍可运行 |
 
+四个单域预设 `dev-rx` / `dev-tx` / `dev-twr` / `dev-radar` 默认设置
+`UWB_DEV_SHARED_LIBS=ON`，改库实现只重链 `.so`，不重链全部 QA 可执行文件；
+`dev-avx2` 如需共享库可自行追加 `-DUWB_DEV_SHARED_LIBS=ON`。交付预设
+（`native-avx2` / `native-avx512` / `no-uhd` / `scalar-debug`）保持静态库。
+
 所有预设现在使用 Ninja 生成器（Stage 1）。首次切换到 Ninja 后，请删除旧的
-Makefile build 目录（如 `build/native-avx2`）并重新配置。QA 目标默认启用
+Makefile build 目录（如 `build/native-avx2`）并重新配置。QA/lib/apps 目标默认启用
 预编译头（`UWB_ENABLE_PCH=ON`）；可用 ccache 时自动探测并加速
 （`UWB_USE_CCACHE=ON`）。
 
@@ -37,11 +46,92 @@ env -u LD_LIBRARY_PATH cmake -S . -B build/custom \
 | `ENABLE_UHD_BACKEND` | `AUTO` | `ON` 要求 UHD 开发包。仅回放可用 `OFF`。 |
 | `UWB_SIMD` | `AUTO` | 在 CMake 配置时选择 DSP 编译档位。也可指定 `AVX2`、`AVX512` 或 `SCALAR`。 |
 | `UWB_BUILD_EXPERIMENTS` | `ON` | 允许构建原生实验应用。生产部署可设 `OFF`。 |
-| `UWB_ENABLE_PCH` | `ON` | 为 QA 目标启用预编译头。关闭后回退到逐目标解析。 |
+| `UWB_DEV_SCOPE` | `all` | `all|rx|tx|twr|radar`。非 `all` 为单功能域开发构建，禁用安装规则与 install_consumer。 |
+| `UWB_ENABLE_TX/RX/SIC/RADAR/TWR` | `ON` | 高级微调开关；`UWB_DEV_SCOPE` 非 `all` 时按上表锁定。 |
+| `UWB_ENABLE_BENCHMARKS` | `ON` | 构建 benchmark/measurement 目标；单域模式默认关闭（TX 域仍保留 `benchmark_hrp_mod`）。 |
+| `UWB_ENABLE_PCH` | `ON` | 为 QA/lib/apps 目标启用预编译头。关闭后回退到逐目标解析。 |
 | `UWB_USE_CCACHE` | `ON` | 检测到 `ccache` 时作为编译器 launcher；未安装时静默跳过。 |
+| `UWB_LINKER` | `AUTO` | `AUTO|lld|mold|gold|ld`；AUTO 优先 mold/lld/gold，最后回退工具链默认。 |
+| `UWB_DEV_SHARED_LIBS` | `OFF` | 开发态把域库构建为共享库；配合 `CMAKE_LINK_DEPENDS_NO_SHARED`，改库实现只重链 `.so`，不重链 QA 可执行文件。 |
 
 C++17、CMake、VOLK、Threads 和 Boost.Test 是构建依赖。Python 解释器用于
 辅助工具和 Python 测试。
+
+### 按功能域裁剪
+
+`dev-rx/tx/twr/radar` 只配置对应域所需的库、应用和 QA，互不干扰：
+
+```sh
+env -u LD_LIBRARY_PATH cmake --preset dev-twr
+env -u LD_LIBRARY_PATH cmake --build --preset dev-twr -j
+env -u LD_LIBRARY_PATH ctest --test-dir build/dev-twr -j --output-on-failure
+```
+
+单域构建会打印 `UWB scope:` 行，并禁用 `install()` 与
+`uwb_qa_native_install_consumer`（残缺树不得安装覆盖完整安装）。
+频繁修改库实现时，可额外加 `-DUWB_DEV_SHARED_LIBS=ON`：
+
+```sh
+env -u LD_LIBRARY_PATH cmake -S . -B build/dev-rx-shared \
+  -DCMAKE_BUILD_TYPE=Release -DUWB_SIMD=AVX2 -DUWB_DEV_SCOPE=rx \
+  -DUWB_DEV_SHARED_LIBS=ON
+```
+
+QA 组：`-L rx_sic` 为日常快闭环（已排除 `heavy`），`-L heavy` 显式运行重型
+低 SNR 网格扫描，`-L twr/sensing/dsp_extra` 按域运行。
+
+### 宿主机缓存与快速链接器（可用户级安装）
+
+无 root 时可以把 `ccache` / `mold` / `lld` 解包到 `~/.local/opt`，并把入口脚本
+放到已在 `PATH` 中的 `~/.local/bin`。本机实际安装方式：
+
+```sh
+mkdir -p ~/.local/opt ~/.local/bin /tmp/uwb-pkgs && cd /tmp/uwb-pkgs
+
+# ccache：官方 linux-x86_64-musl-static 发布包，无需额外动态库
+curl -fL -o ccache.tar.gz \
+  https://github.com/ccache/ccache/releases/download/v4.14.3/ccache-4.14.3-linux-x86_64-musl-static.tar.gz
+mkdir -p ~/.local/opt/ccache-4.14.3
+tar -xzf ccache.tar.gz -C ~/.local/opt/ccache-4.14.3 --strip-components=1
+
+# mold + lld：从 Ubuntu 软件源下载 .deb 后只解包，不写系统目录
+apt-get download mold lld-14 libllvm14
+mkdir -p ~/.local/opt/mold ~/.local/opt/lld
+dpkg-deb -x mold_*.deb      ~/.local/opt/mold
+dpkg-deb -x lld-14_*.deb    ~/.local/opt/lld
+dpkg-deb -x libllvm14_*.deb ~/.local/opt/lld
+
+# 入口：ccache / ld.lld 用包装脚本，mold 用符号链接
+ln -sf ~/.local/opt/mold/usr/bin/mold ~/.local/bin/mold
+ln -sf ~/.local/opt/mold/usr/bin/mold ~/.local/bin/ld.mold
+```
+
+`ccache` 包装脚本只需 `exec ~/.local/opt/ccache-4.14.3/ccache "$@"`；
+`ld.lld` 包装脚本在 `exec` 前设置
+`LD_LIBRARY_PATH=~/.local/opt/lld/usr/lib/x86_64-linux-gnu`。Ubuntu 22.04 自带的
+ccache 4.5 对 PCH 支持有限，建议使用上面的 4.14.x 静态包。
+
+CMake 在检测到 `ccache + PCH + GCC` 时会自动追加 `-fpch-preprocess`，否则
+PCH 消费 TU 会被 ccache 标记为 `uncacheable`。建议的
+`~/.config/ccache/ccache.conf`：
+
+```ini
+max_size = 10.0G
+sloppiness = pch_defines,time_macros
+hash_dir = false
+base_dir = /path/to/openUWB
+```
+
+本机实测（i7-12700、20 threads、mold + ccache 4.14.3、`-j20`）：
+
+| 构建 | 墙钟 | 说明 |
+| --- | ---: | --- |
+| 冷缓存全量 | 43.5 s | 129/129 可缓存，0 命中 |
+| 同参数新 build 目录热缓存全量 | **2.36 s** | 129/129 direct hit |
+| 旧版无缓存基线 | 38.3 s | 未启用 ccache |
+
+`UWB_LINKER=AUTO` 现在会优先选择 `mold`，其次 `lld`、`gold`，最后回退工具链
+默认链接器。
 
 ### 增量编译与头文件拆分
 

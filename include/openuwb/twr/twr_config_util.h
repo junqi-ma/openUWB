@@ -379,34 +379,7 @@ inline const char* data_rate_to_string(DataRate v)
     }
     return "invalid";
 }
-inline bool data_rate_from_string(const std::string& s, DataRate& out)
-{
-    if (s == "850k") {
-        out = DataRate::R850k;
-        return true;
-    }
-    if (s == "6p8m") {
-        out = DataRate::R6p8M;
-        return true;
-    }
-    if (s == "27m") {
-        out = DataRate::R27M;
-        return true;
-    }
-    if (s == "7p8m") {
-        out = DataRate::R7p8M;
-        return true;
-    }
-    if (s == "27p2m") {
-        out = DataRate::R27p2M;
-        return true;
-    }
-    if (s == "6p8m_hprf") {
-        out = DataRate::R6p8M_hprf;
-        return true;
-    }
-    return false;
-}
+bool data_rate_from_string(const std::string& s, DataRate& out);
 
 // ---------------------------------------------------------------------------
 // PHR RATE -- a SEPARATE quantity from the payload data rate (M0.1 / R2)
@@ -606,46 +579,7 @@ inline bool preamble_length_from_symbols(uint16_t symbols, PreambleLength& out)
 // measured reason, and every one of them names a limit of THIS SOFTWARE
 // rather than of a chip: the Qorvo API accepts 64 through 2048, so "the
 // hardware cannot do 128" would be a false statement.
-inline std::string preamble_length_unsupported_reason(uint16_t symbols)
-{
-    const std::string n = std::to_string(symbols);
-    if (symbols == 32)
-        return "preamble length " + n +
-               " SYNC is refused: mod::encode_phr19 advertises preamble-duration index 1 (= 64) "
-               "for it, so the PHR does not self-describe a 32-symbol preamble";
-    if (symbols == 128 || symbols == 256 || symbols == 512)
-        return "preamble length " + n +
-               " SYNC is refused by the CURRENT DEMODULATOR, not by any hardware: "
-               "uwb_demod_core.h re-measures only the last max(cfo_min_fit_repetitions, 40) SYNCs "
-               "and synthesises the earlier peaks at phase 0, so the zero-phase points that leak "
-               "into the least-squares CFO fit number max(0, reps - 64) -- measured at 128 SYNC as "
-               "an injected 20 kHz offset coming back as 3791 Hz; and mod::encode_phr19 maps " + n +
-               " to preamble-duration index 1 (= 64), so the PHR does not self-describe it. "
-               "Qorvo's API accepts these lengths (DW3xxx lists 128/256/512 as non-standard "
-               "preamble lengths), so this is a limit of this software path, not a statement about "
-               "what a DW1000 or DW3000 can transmit";
-    if (symbols == 1024)
-        return "preamble length " + n +
-               " SYNC is PHR-legal (preamble-duration index 2) but refused by the current "
-               "demodulator for the same CFO-fit bias as 128/256/512; a software limit, not a "
-               "hardware one";
-    if (symbols == 2048)
-        return "preamble length " + n +
-               " SYNC exceeds the work-grid TX buffer this build sizes for one frame "
-               "(mod::kMaxHrpTxSamples); a length this large is a buffer and scheduling "
-               "decision, not a hardware capability statement";
-    if (symbols == 1 || symbols == 2)
-        return "preamble length " + n +
-               " SYNC leaves fewer than the 4 measured peaks uwb_demod_core.h stage_cfo needs";
-    if (symbols == 4 || symbols == 8)
-        return "preamble length " + n +
-               " SYNC is shorter than the 10 initial repetitions uwb_demod_core.h skips before "
-               "the CIR search";
-    return "preamble length " + n +
-           " is not a SYNC repetition count this build implements: the enumeration is 16 or 64, "
-           "bounded by this repository's demodulator/CFO path (see the PreambleLength comment). "
-           "That is a software limit; the Qorvo parts' own API accepts 64 through 2048";
-}
+std::string preamble_length_unsupported_reason(uint16_t symbols);
 
 enum class SfdMode : uint8_t {
     R4z1 = 0,
@@ -976,31 +910,8 @@ inline const char* first_path_algorithm_to_string(FirstPathAlgorithm v)
     }
     return "invalid";
 }
-inline bool first_path_algorithm_from_string(const std::string& s,
-    FirstPathAlgorithm& out)
-{
-    if (s == "leading_edge") {
-        out = FirstPathAlgorithm::LeadingEdge;
-        return true;
-    }
-    if (s == "peak") {
-        out = FirstPathAlgorithm::Peak;
-        return true;
-    }
-    if (s == "energy_centroid") {
-        out = FirstPathAlgorithm::EnergyCentroid;
-        return true;
-    }
-    if (s == "interpolated_peak") {
-        out = FirstPathAlgorithm::InterpolatedPeak;
-        return true;
-    }
-    if (s == "strongest_cluster") {
-        out = FirstPathAlgorithm::StrongestCluster;
-        return true;
-    }
-    return false;
-}
+bool first_path_algorithm_from_string(const std::string& s,
+    FirstPathAlgorithm& out);
 
 // Off / On / Required.  `Required` means a measurement without the
 // compensation is a failure, not a lower-quality success (REQ-TIME-05).
@@ -1055,34 +966,7 @@ enum class TimeReferenceEvent : uint8_t {
     RxEnable = 9,       // the timed RX stream command was armed
     HostMonotonic = 10 // std::chrono::steady_clock, never the RF plane
 };
-inline const char* time_reference_event_to_string(TimeReferenceEvent v)
-{
-    switch (v) {
-    case TimeReferenceEvent::PollTransmitRmarker:
-        return "poll_tx_rmarker";
-    case TimeReferenceEvent::PollReceiveRmarker:
-        return "poll_rx_rmarker";
-    case TimeReferenceEvent::ResponseTransmitRmarker:
-        return "response_tx_rmarker";
-    case TimeReferenceEvent::ResponseReceiveRmarker:
-        return "response_rx_rmarker";
-    case TimeReferenceEvent::FinalTransmitRmarker:
-        return "final_tx_rmarker";
-    case TimeReferenceEvent::FinalReceiveRmarker:
-        return "final_rx_rmarker";
-    case TimeReferenceEvent::ReportTransmitRmarker:
-        return "report_tx_rmarker";
-    case TimeReferenceEvent::ReportReceiveRmarker:
-        return "report_rx_rmarker";
-    case TimeReferenceEvent::FrameTail:
-        return "frame_tail";
-    case TimeReferenceEvent::RxEnable:
-        return "rx_enable";
-    case TimeReferenceEvent::HostMonotonic:
-        return "host_monotonic";
-    }
-    return "invalid";
-}
+const char* time_reference_event_to_string(TimeReferenceEvent v);
 inline bool time_reference_event_from_string(const std::string& s,
     TimeReferenceEvent& out)
 {

@@ -1078,7 +1078,15 @@ BOOST_AUTO_TEST_CASE(test_pipeline_multicore_stop_and_backpressure)
     BOOST_REQUIRE(pipeline.initialize());
     pipeline.start();
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    // Under a fully loaded 20-core CTest run a fixed 5 ms wait can expire
+    // before the producer offers its first window.  Wait for observable
+    // progress (bounded) instead of assuming a scheduling latency.
+    const auto ready_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (pipeline.ledger().offered_windows == 0 &&
+           std::chrono::steady_clock::now() < ready_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 
     const auto t_stop_start = std::chrono::steady_clock::now();
     pipeline.stop();

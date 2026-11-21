@@ -591,39 +591,7 @@ inline void set_error(std::string& error, FrameError* code, FrameError c, const 
 // Rejects a profile the codec cannot map without ambiguity.  Callers may also
 // call this before `create_session` (REQ-API-01: every entry point uses the
 // same validator and rejects before the radio starts).
-inline bool frame_profile_validate(const FrameProfile& p, std::string& error, FrameError* code = nullptr)
-{
-    if (p.version != kFrameVersion) {
-        set_error(error, code, FrameError::BadProfile, "profile version is not 0x01");
-        return false;
-    }
-    if (p.timestamp_bits == 0 || p.timestamp_bits > 64 || (p.timestamp_bits % 8u) != 0) {
-        set_error(error, code, FrameError::BadProfile,
-                  "timestamp_bits must be a multiple of 8 in [8, 64]");
-        return false;
-    }
-    // A NaN tick rate fails the `> 0.0` test, so no <cmath> is needed.
-    if (!(p.timestamp_unit_hz > 0.0) || p.timestamp_unit_hz > 1.0e15) {
-        set_error(error, code, FrameError::BadProfile,
-                  "timestamp_unit_hz must be finite and in (0, 1e15]");
-        return false;
-    }
-    if (p.max_psdu_bytes < kFrameHeaderBytes || p.max_psdu_bytes > kPhyMaxPsduBytes) {
-        set_error(error, code, FrameError::BadProfile,
-                  "max_psdu_bytes must be in [14, 127]");
-        return false;
-    }
-    if (!p.fcs_appended_by_modulation_layer) {
-        set_error(error, code, FrameError::BadProfile,
-                  "this codec never emits an FCS; it is appended by the HRP "
-                  "modulation layer (UwbHrpPacketSource append_fcs=true)");
-        return false;
-    }
-    if (code != nullptr)
-        *code = FrameError::None;
-    error.clear();
-    return true;
-}
+bool frame_profile_validate(const FrameProfile& p, std::string& error, FrameError* code = nullptr);
 
 // Frame sizes.  `frame_length_for` is the MAC payload size (no FCS):
 // 14 / 24 / 29 B for the default 40-bit profile.  `psdu_length_for` adds the
@@ -1264,146 +1232,21 @@ inline uint64_t get_uint_le(const uint8_t* p, size_t n)
 // success `written` is exactly that.  Allocation-free apart from assigning to
 // the caller's `error` string, so this is the form the FSM and the delayed-TX
 // path use.
-inline bool encode_into(const Frame& f,
+bool encode_into(const Frame& f,
                         const FrameProfile& p,
                         uint8_t* out,
                         size_t out_capacity,
                         size_t& written,
                         std::string& error,
-                        FrameError* code = nullptr)
-{
-    written = 0;
-
-    if (out == nullptr) {
-        set_error(error, code, FrameError::NullPointer, "null output buffer");
-        return false;
-    }
-    if (!frame_profile_validate(p, error, code))
-        return false;
-
-    // Version must match the profile; an unknown layout is never guessed at.
-    if (f.version != p.version) {
-        set_error(error, code, FrameError::BadVersion, "frame version != profile version");
-        return false;
-    }
-
-    const FrameLayout* layout = frame_layout(f.function_code);
-    if (layout == nullptr) {
-        // Report, or an out-of-range enum value.
-        if (f.function_code == FrameType::Report) {
-            set_error(error, code, FrameError::NotImplemented,
-                      "report frame type is reserved; phase 1 emits the "
-                      "three-message exchange only (REQ-PROTO-05)");
-        } else {
-            set_error(error, code, FrameError::BadFunctionCode,
-                      "unknown function code");
-        }
-        return false;
-    }
-
-    if (flags_has_reserved_bits(f.flags)) {
-        set_error(error, code, FrameError::ReservedFlags,
-                  "flags bits 2..15 are reserved and must be zero");
-        return false;
-    }
-    if (flags_sts_present(f.flags)) {
-        set_error(error, code, FrameError::StsUnsupported,
-                  "sts_present is set; STS is out of scope for phase 1");
-        return false;
-    }
-
-    const size_t tsb = timestamp_bytes(p);
-    const size_t n_ts = layout->timestamp_count;
-    // frame_length_for() is the ONE place a frame's length is computed; this
-    // function must not restate the arithmetic (R3: no second geometry).
-    const size_t need = frame_length_for(f.function_code, p);
-
-    // A value that does not fit the declared field is refused, never
-    // truncated: truncation would silently change a measurement instant.
-    const uint64_t tmax = timestamp_max_value(p);
-    for (size_t i = 0; i < n_ts; ++i) {
-        if (f.timestamps[i] > tmax) {
-            set_error(error, code, FrameError::TimestampOutOfRange,
-                      "timestamp does not fit the profile field width");
-            return false;
-        }
-    }
-    // An unused slot must be zero so a frame's bytes are a function of its
-    // declared content alone and a stale instant can never ride along.
-    for (size_t i = n_ts; i < kMaxTimestamps; ++i) {
-        if (f.timestamps[i] != 0) {
-            set_error(error, code, FrameError::ReservedTimestampNonZero,
-                      "unused timestamp slot is non-zero");
-            return false;
-        }
-    }
-
-    if (need > out_capacity) {
-        set_error(error, code, FrameError::BufferTooSmall,
-                  "caller buffer smaller than the frame");
-        return false;
-    }
-    if (need + kFrameFcsBytes > p.max_psdu_bytes) {
-        set_error(error, code, FrameError::PsduTooLarge,
-                  "frame plus FCS exceeds the profile max PSDU");
-        return false;
-    }
-
-    std::memset(out, 0, need);
-    out[kOffVersion] = f.version;
-    out[kOffFunctionCode] = static_cast<uint8_t>(f.function_code);
-    put_u16_le(out + kOffSessionId, f.session_id);
-    put_u16_le(out + kOffSeq, f.seq);
-    put_u16_le(out + kOffPanId, f.pan_id);
-    put_u16_le(out + kOffSrcAddr, f.src_addr);
-    put_u16_le(out + kOffDstAddr, f.dst_addr);
-    put_u16_le(out + kOffFlags, f.flags);
-    for (size_t i = 0; i < n_ts; ++i) {
-        put_uint_le(out + kOffTimestamps + i * tsb, f.timestamps[i], tsb);
-    }
-
-    written = need;
-    if (code != nullptr)
-        *code = FrameError::None;
-    error.clear();
-    return true;
-}
+                        FrameError* code = nullptr);
 
 // Convenience form for setup, logging and tests.  `out` is resized to the
 // exact MAC payload length; no FCS is appended (see the header comment).
-inline bool encode(const Frame& f,
+bool encode(const Frame& f,
                    const FrameProfile& p,
                    std::vector<uint8_t>& out,
                    std::string& error,
-                   FrameError* code = nullptr)
-{
-    out.clear();
-    std::string ignored;
-    if (!frame_profile_validate(p, ignored, code)) {
-        error = ignored;
-        return false;
-    }
-    const FrameType t = f.function_code;
-    if (!frame_type_is_implemented(t)) {
-        set_error(error, code,
-                  t == FrameType::Report ? FrameError::NotImplemented
-                                         : FrameError::BadFunctionCode,
-                  t == FrameType::Report
-                      ? "report frame type is reserved; phase 1 emits the "
-                        "three-message exchange only (REQ-PROTO-05)"
-                      : "unknown function code");
-        return false;
-    }
-    const size_t need = frame_length_for(t, p);
-    out.resize(need);
-    size_t written = 0;
-    if (!encode_into(f, p, out.data(), out.size(), written, error, code)) {
-        out.clear();
-        return false;
-    }
-    out.resize(written);
-    return true;
-}
+                   FrameError* code = nullptr);
 
 // ---------------------------------------------------------------------------
 // decode
@@ -1419,110 +1262,12 @@ inline bool encode(const Frame& f,
 // On failure `out` is left in a state no valid profile accepts (`version` 0),
 // so a caller that ignores the return value still cannot mistake a failed
 // decode for a frame that may advance the FSM (REQ-PROTO-01).
-inline bool decode(const uint8_t* data,
+bool decode(const uint8_t* data,
                    size_t n,
                    const FrameProfile& p,
                    Frame& out,
                    std::string& error,
-                   FrameError* code = nullptr)
-{
-    out = Frame();
-    out.version = 0; // invalid on purpose; see the comment above
-
-    if (data == nullptr && n != 0) {
-        set_error(error, code, FrameError::NullPointer, "null payload pointer");
-        return false;
-    }
-    if (!frame_profile_validate(p, error, code))
-        return false;
-
-    if (n < kFrameHeaderBytes) {
-        set_error(error, code, FrameError::Truncated, "shorter than the 14-byte header");
-        return false;
-    }
-
-    if (data[kOffVersion] != p.version) {
-        set_error(error, code, FrameError::BadVersion, "unknown frame version");
-        return false;
-    }
-
-    FrameType type = FrameType::Poll;
-    if (!frame_type_from_wire(data[kOffFunctionCode], type)) {
-        set_error(error, code, FrameError::BadFunctionCode, "unknown function code");
-        return false;
-    }
-    const FrameLayout* layout = frame_layout(type);
-    if (layout == nullptr) {
-        set_error(error, code, FrameError::NotImplemented,
-                  "report frame type is reserved; phase 1 decodes the "
-                  "three-message exchange only (REQ-PROTO-05)");
-        return false;
-    }
-
-    const uint16_t flags = get_u16_le(data + kOffFlags);
-    if (flags_has_reserved_bits(flags)) {
-        set_error(error, code, FrameError::ReservedFlags,
-                  "flags bits 2..15 are reserved and must be zero");
-        return false;
-    }
-    if (flags_sts_present(flags)) {
-        set_error(error, code, FrameError::StsUnsupported,
-                  "sts_present is set; STS is out of scope for phase 1");
-        return false;
-    }
-
-    const size_t tsb = timestamp_bytes(p);
-    // Same single place as encode_into(): a frame's length is computed once.
-    const size_t need = frame_length_for(type, p);
-    if (n < need) {
-        set_error(error, code, FrameError::Truncated,
-                  "timestamp block is shorter than the function code requires");
-        return false;
-    }
-    if (n > need) {
-        set_error(error, code, FrameError::LengthMismatch,
-                  "buffer is longer than the function code requires; a PSDU "
-                  "whose FCS was not stripped is the usual cause");
-        return false;
-    }
-    if (need + kFrameFcsBytes > p.max_psdu_bytes) {
-        set_error(error, code, FrameError::PsduTooLarge,
-                  "frame plus FCS exceeds the profile max PSDU");
-        return false;
-    }
-
-    Frame f;
-    f.version = data[kOffVersion];
-    f.function_code = type;
-    f.session_id = get_u16_le(data + kOffSessionId);
-    f.seq = get_u16_le(data + kOffSeq);
-    f.pan_id = get_u16_le(data + kOffPanId);
-    f.src_addr = get_u16_le(data + kOffSrcAddr);
-    f.dst_addr = get_u16_le(data + kOffDstAddr);
-    f.flags = flags;
-    for (size_t i = 0; i < kMaxTimestamps; ++i) {
-        f.timestamps[i] = 0;
-    }
-    for (size_t i = 0; i < layout->timestamp_count; ++i) {
-        const uint64_t v =
-            get_uint_le(data + kOffTimestamps + i * tsb, tsb);
-        if (!timestamp_fits(p, v)) {
-            // Unreachable for a whole-byte field, kept as a standing
-            // invariant check: a value that cannot be represented
-            // unambiguously in this profile must never leave the codec.
-            set_error(error, code, FrameError::TimestampOutOfRange,
-                      "decoded timestamp is not representable in this profile");
-            return false;
-        }
-        f.timestamps[i] = v;
-    }
-
-    out = f;
-    if (code != nullptr)
-        *code = FrameError::None;
-    error.clear();
-    return true;
-}
+                   FrameError* code = nullptr);
 
 inline bool decode(const std::vector<uint8_t>& mac_payload,
                    const FrameProfile& p,
@@ -1537,37 +1282,13 @@ inline bool decode(const std::vector<uint8_t>& mac_payload,
 // bytes the modulation layer appended.  The FCS itself is verified by the
 // demodulator (it is what produced the PDU), so this is a framing step only;
 // a PSDU too short to hold a header plus an FCS is rejected.
-inline bool mac_payload_from_psdu(const uint8_t* psdu,
+bool mac_payload_from_psdu(const uint8_t* psdu,
                                   size_t n,
                                   const FrameProfile& p,
                                   const uint8_t*& payload,
                                   size_t& payload_bytes,
                                   std::string& error,
-                                  FrameError* code = nullptr)
-{
-    payload = nullptr;
-    payload_bytes = 0;
-    if (psdu == nullptr && n != 0) {
-        set_error(error, code, FrameError::NullPointer, "null psdu pointer");
-        return false;
-    }
-    if (n < kFrameHeaderBytes + kFrameFcsBytes) {
-        set_error(error, code, FrameError::Truncated, "psdu shorter than header + FCS");
-        return false;
-    }
-    const size_t m = n - kFrameFcsBytes;
-    if (m + kFrameFcsBytes > p.max_psdu_bytes) {
-        set_error(error, code, FrameError::PsduTooLarge,
-                  "psdu exceeds the profile max PSDU");
-        return false;
-    }
-    payload = psdu;
-    payload_bytes = m;
-    if (code != nullptr)
-        *code = FrameError::None;
-    error.clear();
-    return true;
-}
+                                  FrameError* code = nullptr);
 
 // ---------------------------------------------------------------------------
 // Session / sequence helpers and frame matching
@@ -1707,35 +1428,7 @@ inline std::string bytes_to_hex(const std::vector<uint8_t>& v)
 
 // Parses lowercase or uppercase hex into bytes.  Returns false on an odd
 // length or a non-hex character; `out` is cleared in that case.
-inline bool hex_to_bytes(const std::string& hex, std::vector<uint8_t>& out)
-{
-    out.clear();
-    if (hex.size() % 2 != 0)
-        return false;
-    out.reserve(hex.size() / 2);
-    for (size_t i = 0; i < hex.size(); i += 2) {
-        int hi = -1;
-        int lo = -1;
-        for (int pass = 0; pass < 2; ++pass) {
-            const char c = hex[i + static_cast<size_t>(pass)];
-            int v = -1;
-            if (c >= '0' && c <= '9')
-                v = c - '0';
-            else if (c >= 'a' && c <= 'f')
-                v = c - 'a' + 10;
-            else if (c >= 'A' && c <= 'F')
-                v = c - 'A' + 10;
-            if (v < 0)
-                return false;
-            if (pass == 0)
-                hi = v;
-            else
-                lo = v;
-        }
-        out.push_back(static_cast<uint8_t>((hi << 4) | lo));
-    }
-    return true;
-}
+bool hex_to_bytes(const std::string& hex, std::vector<uint8_t>& out);
 
 } // namespace openuwb::twr
 

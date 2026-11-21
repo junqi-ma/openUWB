@@ -257,7 +257,7 @@ inline bool clock_domain_tick_is_ns_or_coarser(const ClockDomain& d);
 inline std::string clock_domain_to_string(const ClockDomain& d);
 inline std::string clock_domain_to_json_string(const ClockDomain& d);
 
-inline bool timestamp_normalize(int64_t ticks,
+bool timestamp_normalize(int64_t ticks,
                                 int32_t frac_num,
                                 uint32_t frac_den,
                                 int64_t& out_ticks,
@@ -265,7 +265,7 @@ inline bool timestamp_normalize(int64_t ticks,
                                 uint32_t& out_den);
 inline bool timestamp_marker_is_known(TimestampMarker m);
 inline bool timestamp_source_is_known(TimestampSource s);
-inline bool timestamp_make(int64_t ticks,
+bool timestamp_make(int64_t ticks,
                            int32_t frac_num,
                            uint32_t frac_den,
                            const ClockDomain& domain,
@@ -278,7 +278,7 @@ inline bool timestamp_fraction_is_normalized(const Timestamp& ts);
 inline bool timestamp_is_marker_mapped(const Timestamp& ts);
 inline bool timestamp_is_range_capable(const Timestamp& ts);
 inline bool timestamp_is_validated_measurement(const Timestamp& ts);
-inline const char* timestamp_rejection_reason(const Timestamp& ts);
+const char* timestamp_rejection_reason(const Timestamp& ts);
 inline std::string timestamp_to_json_string(const Timestamp& ts);
 inline std::string timestamp_to_decimal_string(const Timestamp& ts);
 
@@ -731,48 +731,9 @@ inline constexpr int kNsPerSecondPow2 = 9;
 // `num/den` (num >= 1, den >= 1).  Returns false only when the exact value does
 // not fit the bounded rational, which needs an absurd tick rate; the caller
 // must then treat every nanosecond projection as lossy.
-inline bool clock_domain_ns_per_tick_exact(double tick_rate_hz,
+bool clock_domain_ns_per_tick_exact(double tick_rate_hz,
                                            int64_t& out_num,
-                                           int64_t& out_den)
-{
-    out_num = 0;
-    out_den = 0;
-    if (!std::isfinite(tick_rate_hz) || tick_rate_hz <= 0.0)
-        return false;
-
-    // rate == mant * 2^exp exactly (frexp/ldexp are exact for binary FP).
-    int be = 0;
-    const double mant = std::ldexp(std::frexp(tick_rate_hz, &be), 53);
-    if (!(mant >= 4503599627370496.0 && mant < 9007199254740992.0))
-        return false; // not the expected normal form
-    uint64_t m = static_cast<uint64_t>(mant);
-    int e = be - 53; // rate == m * 2^e
-    while ((m & 1u) == 0u) { // absorb the powers of two into e; m ends up odd
-        m >>= 1;
-        ++e;
-    }
-
-    // ns_per_tick = 1e9 / (m * 2^e) = (2^9 * 1953125) / (m * 2^e)
-    const int k = detail::kNsPerSecondPow2 - e;
-    int64_t num = 0;
-    int64_t den = 0;
-    if (k >= 0) {
-        if (k > 42) // 1953125 * 2^43 > INT64_MAX
-            return false;
-        num = detail::kNsPerSecondOdd * (static_cast<int64_t>(1) << k);
-        den = static_cast<int64_t>(m);
-    } else {
-        const int s = -k;
-        if (s >= 62 || m > (static_cast<uint64_t>(INT64_MAX) >> s))
-            return false;
-        num = detail::kNsPerSecondOdd;
-        den = static_cast<int64_t>(m) << s;
-    }
-    const int64_t g = detail::ts_gcd(num, den);
-    out_num = num / g;
-    out_den = den / g;
-    return true;
-}
+                                           int64_t& out_den);
 
 namespace detail {
 
@@ -802,44 +763,12 @@ namespace detail {
 // negative/inconsistent input, or a quotient past int64).  `out_lossless` is
 // still written in the "cannot store" case, because losslessness is a property
 // of the VALUE and the rate, not of the destination type.
-inline bool ts_ticks_to_nanos_exact(double tick_rate_hz,
+bool ts_ticks_to_nanos_exact(double tick_rate_hz,
                                     int64_t ticks,
                                     int32_t frac_num,
                                     uint32_t frac_den,
                                     int64_t& out_ns,
-                                    bool& out_lossless)
-{
-    out_ns = 0;
-    out_lossless = false;
-    if (ticks < 0 || frac_num < 0 || (frac_den == 0u && frac_num != 0))
-        return false;
-
-    int64_t np = 0;
-    int64_t dp = 0;
-    if (!clock_domain_ns_per_tick_exact(tick_rate_hz, np, dp))
-        return false;
-
-    using u128 = unsigned __int128;
-    const u128 fden = (frac_den == 0u) ? u128{ 1 } : u128{ frac_den };
-    const u128 x = static_cast<u128>(static_cast<uint64_t>(ticks)) * fden +
-                   static_cast<u128>(static_cast<uint64_t>(frac_num));
-    const u128 den = fden * static_cast<u128>(static_cast<uint64_t>(dp));
-    // `x` and `den` are bounded by (2^63 * 2^15) and (2^63 * 2^15); the product
-    // `x*np` is the only term that can leave 128 bits, and it is guarded.
-    if (np != 0) {
-        const u128 umax = ~static_cast<u128>(0);
-        if (x != 0u && static_cast<u128>(static_cast<uint64_t>(np)) > umax / x)
-            return false;
-    }
-    const u128 numer = x * static_cast<u128>(static_cast<uint64_t>(np));
-    const u128 q = numer / den;
-    const u128 rem = numer % den;
-    out_lossless = (rem == 0u);
-    if (q > static_cast<u128>(std::numeric_limits<int64_t>::max()))
-        return false;
-    out_ns = static_cast<int64_t>(q);
-    return true;
-}
+                                    bool& out_lossless);
 
 // EXACT test: is `ticks + frac_num/frac_den` ticks an integer number of
 // nanoseconds at `rate_hz`?  Delegates to the single quotient/remainder above,
@@ -1047,24 +976,12 @@ struct Timestamp {
 // Normalize a (ticks, num, den) triple.  Rejects a non-positive or oversized
 // denominator; carries the integer part of num/den into `out_ticks` with floor
 // semantics; reduces by gcd.  Returns false on overflow.
-inline bool timestamp_normalize(int64_t ticks,
+bool timestamp_normalize(int64_t ticks,
                                 int32_t frac_num,
                                 uint32_t frac_den,
                                 int64_t& out_ticks,
                                 int32_t& out_num,
-                                uint32_t& out_den)
-{
-    if (frac_den == 0u) {
-        if (frac_num != 0)
-            return false; // an exact tick cannot carry a fraction
-        return detail::ts_normalize_rational(ticks, 0, 0, out_ticks, out_num, out_den);
-    }
-    if (frac_den > detail::kFractionDenominatorMax)
-        return false;
-    return detail::ts_normalize_rational(ticks, static_cast<int64_t>(frac_num),
-                                         static_cast<int64_t>(frac_den), out_ticks,
-                                         out_num, out_den);
-}
+                                uint32_t& out_den);
 
 // out = a + b, both exact rationals, normalized.  Used by calibration.
 inline bool timestamp_add_fractional(int64_t a_ticks,
@@ -1151,45 +1068,14 @@ inline bool timestamp_marker_from_string(const std::string& s, TimestampMarker& 
 // domain, an unknown marker/source, `TimestampSource::Unknown`, ticks outside
 // the counter's window, an unknown correction bit, and any fraction that
 // cannot be represented exactly.
-inline bool timestamp_make(int64_t ticks,
+bool timestamp_make(int64_t ticks,
                            int32_t frac_num,
                            uint32_t frac_den,
                            const ClockDomain& domain,
                            TimestampMarker marker,
                            TimestampSource source,
                            uint32_t corrections,
-                           Timestamp& out)
-{
-    if (!clock_domain_is_valid(domain))
-        return false;
-    if (!timestamp_marker_is_known(marker))
-        return false;
-    if (!timestamp_source_is_known(source) || source == TimestampSource::Unknown)
-        return false;
-    if (corrections > kCorrectionAll)
-        return false;
-
-    int64_t nt = 0;
-    int32_t nn = 0;
-    uint32_t nd = 0u;
-    if (!timestamp_normalize(ticks, frac_num, frac_den, nt, nn, nd))
-        return false;
-    if (!clock_domain_ticks_in_range(domain, nt))
-        return false;
-
-    Timestamp ts;
-    ts.ticks = nt;
-    ts.frac_num = nn;
-    ts.frac_den = nd;
-    ts.domain = domain;
-    ts.marker = marker;
-    ts.source = source;
-    ts.applied_corrections = corrections;
-    ts.calibration_id.clear();
-    ts.valid = true;
-    out = ts;
-    return true;
-}
+                           Timestamp& out);
 
 // True when the sub-tick fraction is either absent or a canonical reduced
 // rational strictly inside [0, 1) of one tick.
@@ -1264,47 +1150,7 @@ inline bool timestamp_is_validated_measurement(const Timestamp& ts)
 }
 
 // First failing check, as a stable machine-readable tag for QA / JSON / logs.
-inline const char* timestamp_rejection_reason(const Timestamp& ts)
-{
-    if (!ts.valid)
-        return "invalid_flag";
-    if (!clock_domain_is_valid(ts.domain))
-        return "invalid_clock_domain";
-    if (!timestamp_marker_is_known(ts.marker))
-        return "unknown_marker";
-    if (!timestamp_source_is_known(ts.source) || ts.source == TimestampSource::Unknown)
-        return "unknown_source";
-    if (!clock_domain_ticks_in_range(ts.domain, ts.ticks))
-        return "ticks_out_of_domain_range";
-    if (ts.applied_corrections > kCorrectionAll)
-        return "unknown_correction_bit";
-    if (ts.frac_num == 0) {
-        if (ts.frac_den != 0u)
-            return "fraction_not_normalized";
-    } else if (ts.frac_den == 0u) {
-        return "fraction_not_normalized";
-    } else if (ts.frac_den > detail::kFractionDenominatorMax) {
-        return "fraction_denominator_too_large";
-    } else if (ts.frac_num < 0 ||
-               static_cast<int64_t>(ts.frac_num) >= static_cast<int64_t>(ts.frac_den)) {
-        return "fraction_not_normalized";
-    } else if (detail::ts_gcd(static_cast<int64_t>(ts.frac_num),
-                              static_cast<int64_t>(ts.frac_den)) != 1) {
-        return "fraction_not_reduced";
-    }
-
-    if (!timestamp_corrections_satisfied(ts.marker, ts.applied_corrections))
-        return "corrections_not_applied";
-    if (ts.marker != TimestampMarker::RmarkerRx && ts.marker != TimestampMarker::RmarkerTx)
-        return "marker_not_protocol_rmarker";
-    if (!timestamp_source_is_measurement(ts.source))
-        return "source_not_a_measurement";
-    if (ts.calibration_id.empty())
-        return "calibration_missing";
-    if (ts.source != TimestampSource::HardwareMeasured)
-        return "source_not_hardware_measured";
-    return "accepted";
-}
+const char* timestamp_rejection_reason(const Timestamp& ts);
 
 // Two timestamps may be combined into one exchange only when they share a
 // single timeline (same counter, same width, same epoch).  This is the
@@ -1460,183 +1306,7 @@ inline bool time_interval_ns_projection_is_lossless(const TimeInterval& ti)
 //                                                       OrderReversed
 //   9. exact sub-tick combination                    -> FractionNotNormalized
 //  10. nanosecond projection overflow                -> DurationOutOfRange
-inline TimeInterval timestamp_interval(const Timestamp& later, const Timestamp& earlier)
-{
-    TimeInterval r;
-    r.later_marker = later.marker;
-    r.earlier_marker = earlier.marker;
-
-    // 1. structural validity, including fraction normalization
-    const bool frac_bad =
-        !timestamp_fraction_is_normalized(later) ||
-        !timestamp_fraction_is_normalized(earlier);
-    if (!timestamp_is_self_consistent(later) || !timestamp_is_self_consistent(earlier)) {
-        r.status = frac_bad ? TimeIntervalStatus::FractionNotNormalized
-                            : TimeIntervalStatus::InvalidTimestamp;
-        return r;
-    }
-
-    // 2-4. same counter?  name, tick rate and wrap width are the identity.
-    if (later.domain.name != earlier.domain.name) {
-        r.status = TimeIntervalStatus::DomainNameMismatch;
-        return r;
-    }
-    if (std::memcmp(&later.domain.tick_rate_hz, &earlier.domain.tick_rate_hz,
-                    sizeof(double)) != 0) {
-        r.status = TimeIntervalStatus::TickRateMismatch;
-        return r;
-    }
-    if (later.domain.timestamp_bits != earlier.domain.timestamp_bits) {
-        r.status = TimeIntervalStatus::WrapWidthMismatch;
-        return r;
-    }
-
-    // 5. same epoch?  a reboot / time reset makes older ticks meaningless.
-    if (!clock_domain_same_epoch(later.domain, earlier.domain)) {
-        r.status = TimeIntervalStatus::EpochMismatch;
-        return r;
-    }
-    r.domain = later.domain;
-
-    // 6. marker semantics: the two markers must denote a difference the
-    //    protocol actually defines.  A UhdRxFirstIqSample is never silently
-    //    equated with an RmarkerRx.
-    if (!timestamp_marker_interval_allowed(later.marker, earlier.marker)) {
-        r.status = TimeIntervalStatus::MarkerMismatch;
-        return r;
-    }
-
-    // 7. both timestamps must be faithful instances of their marker
-    //    (REQ-TIME-02): no interval across an unapplied mapping.
-    if (!timestamp_corrections_satisfied(later.marker, later.applied_corrections) ||
-        !timestamp_corrections_satisfied(earlier.marker, earlier.applied_corrections)) {
-        r.status = TimeIntervalStatus::CorrectionsNotApplied;
-        return r;
-    }
-
-    // 8. modular tick difference with wrap resolution / ambiguity refusal
-    const TickDelta d = raw_tick_delta(r.domain, later.ticks, earlier.ticks);
-    if (d.status != TimeIntervalStatus::Ok) {
-        r.status = d.status;
-        return r;
-    }
-    r.wrapped = d.wrapped;
-
-    // 9. exact sub-tick part: frac_later - frac_earlier, carried into the
-    //    whole-tick count with floor semantics.
-    int64_t whole = 0;
-    if (!detail::ts_sub_i64(static_cast<int64_t>(d.ticks), 0, whole)) {
-        r.status = TimeIntervalStatus::DurationOutOfRange;
-        return r;
-    }
-    if (whole > static_cast<int64_t>(std::numeric_limits<int64_t>::max())) {
-        r.status = TimeIntervalStatus::DurationOutOfRange;
-        return r;
-    }
-
-    if (later.frac_den != 0u || earlier.frac_den != 0u) {
-        int64_t num = 0;
-        int64_t den = 0;
-        if (later.frac_den == 0u) {
-            num = -static_cast<int64_t>(earlier.frac_num);
-            den = static_cast<int64_t>(earlier.frac_den);
-        } else if (earlier.frac_den == 0u) {
-            num = static_cast<int64_t>(later.frac_num);
-            den = static_cast<int64_t>(later.frac_den);
-        } else {
-            // den = db*de <= 32767^2 < 2^31 and |num| < 2^32, so both are
-            // exact in int64.
-            const int64_t a = static_cast<int64_t>(later.frac_num);
-            const int64_t b = static_cast<int64_t>(later.frac_den);
-            const int64_t c = static_cast<int64_t>(earlier.frac_num);
-            const int64_t e = static_cast<int64_t>(earlier.frac_den);
-            num = a * e - c * b;
-            den = b * e;
-        }
-        if (num < 0) {
-            if (!detail::ts_sub_i64(whole, 1, whole)) {
-                r.status = TimeIntervalStatus::DurationOutOfRange;
-                return r;
-            }
-            num += den;
-        }
-        if (num < 0 || den <= 0) {
-            r.status = TimeIntervalStatus::FractionNotNormalized;
-            return r;
-        }
-        const int64_t g = detail::ts_gcd(num, den);
-        num /= g;
-        den /= g;
-        if (den > static_cast<int64_t>(detail::kFractionDenominatorMax)) {
-            // Cannot store the exact value without losing it -> refuse.
-            r.status = TimeIntervalStatus::FractionNotNormalized;
-            return r;
-        }
-        if (num == 0) {
-            r.frac_num = 0;
-            r.frac_den = 0u;
-        } else {
-            r.frac_num = static_cast<int32_t>(num);
-            r.frac_den = static_cast<uint32_t>(den);
-        }
-        if (whole < 0) {
-            // A negative interval is never a valid TWR interval; REQ-PROTO-03
-            // forbids clamping it to zero and calling it a success.
-            r.status = TimeIntervalStatus::DurationOutOfRange;
-            r.frac_num = 0;
-            r.frac_den = 0u;
-            return r;
-        }
-    }
-
-    r.ticks = whole;
-
-    // 9b. N04: re-check the upper bound AFTER the sub-tick fraction has been
-    //     merged.  `raw_tick_delta()` gated only the integer difference, so a
-    //     positive fraction could push `whole + frac` strictly past P/2 while
-    //     the integer gate still saw P/2.  Exactly P/2 stays legal (the caller
-    //     supplied the sign, so the magnitude is unique there); only a value
-    //     that EXCEEDS the API's stated bound is refused.
-    const uint64_t wrap_period = clock_domain_wrap_period(r.domain);
-    if (wrap_period != 0u &&
-        detail::ts_interval_exceeds_half_period(r.ticks, r.frac_num, r.frac_den,
-                                                wrap_period / 2u)) {
-        r.status = TimeIntervalStatus::WrapAmbiguous;
-        r.ticks = 0;
-        r.frac_num = 0;
-        r.frac_den = 0u;
-        return r;
-    }
-
-    // 10. nanosecond projection.  REQ-API-02 wants SI time at the API
-    //     boundary; the tick-space fields above stay exact for sub-nanosecond
-    //     domains such as DW UUS.  The projection is TRUNCATED toward zero and
-    //     its exactness is decided by the SAME quotient/remainder that produces
-    //     the integer (N03), never by a rate threshold and never by a second
-    //     floating-point path that could disagree with the flag.
-    r.is_whole_ticks = (r.frac_den == 0u);
-    int64_t ns = 0;
-    bool lossless = false;
-    if (!detail::ts_ticks_to_nanos_exact(r.domain.tick_rate_hz, r.ticks, r.frac_num,
-                                         r.frac_den, ns, lossless)) {
-        // A rejected interval is EMPTY, not partially populated: no tick count
-        // and no "whole ticks" claim survive a failed projection, so a caller
-        // that ignores `status` sees a zeroed value rather than a tick count it
-        // might mistake for a measurement.
-        r.status = TimeIntervalStatus::DurationOutOfRange;
-        r.ticks = 0;
-        r.frac_num = 0;
-        r.frac_den = 0u;
-        r.is_whole_ticks = false;
-        r.duration_is_lossless_ns = false;
-        return r;
-    }
-    r.duration_is_lossless_ns = lossless;
-    r.duration = Duration::from_nanos(ns);
-
-    r.status = TimeIntervalStatus::Ok;
-    return r;
-}
+TimeInterval timestamp_interval(const Timestamp& later, const Timestamp& earlier);
 
 // Bool-returning convenience form for call sites that only want the Duration.
 //
@@ -1999,60 +1669,7 @@ struct ModularTickDistance {
     bool wrapped = false; // the integer tick difference itself crossed the wrap
 };
 
-inline ModularTickDistance modular_tick_distance(const Timestamp& a, const Timestamp& b)
-{
-    ModularTickDistance r;
-    if (!timestamp_is_self_consistent(a) || !timestamp_is_self_consistent(b))
-        return r;
-    if (!clock_domain_is_comparable(a.domain, b.domain))
-        return r;
-    const uint64_t p = clock_domain_wrap_period(a.domain);
-    if (p == 0u)
-        return r; // a monotonic counter has no modular distance
-
-    const uint64_t from = static_cast<uint64_t>(a.ticks);
-    const uint64_t to = static_cast<uint64_t>(b.ticks);
-    r.wrapped = to < from;
-    r.ticks = r.wrapped ? (to + p - from) : (to - from);
-
-    // Exact sub-tick part: b.frac - a.frac, as a common-denominator rational.
-    // den == 0 means 0/1.  den_a*den_b <= 32767^2 fits in uint32, and the
-    // numerator is bounded by the same, so int64 cannot overflow.
-    const uint32_t ad = a.frac_den == 0u ? 1u : a.frac_den;
-    const uint32_t bd = b.frac_den == 0u ? 1u : b.frac_den;
-    if (ad > kMaxFractionDifferenceDenominator / bd)
-        return r; // unreachable for legal Timestamps; refused, never rounded
-    const uint32_t den = ad * bd;
-    const int64_t an = static_cast<int64_t>(a.frac_num) * static_cast<int64_t>(bd);
-    const int64_t bn = static_cast<int64_t>(b.frac_num) * static_cast<int64_t>(ad);
-    int64_t num = bn - an; // in (-den, den)
-    if (num < 0) {
-        // A fraction below `a`'s makes the distance one whole tick SHORTER
-        // plus the wrapped-up remainder.  Skipping this borrow is the M0 bug
-        // that made 255.25 -> 0.75 look like a full tick instead of 1.5, and
-        // the two answers sit on opposite sides of a budget boundary.
-        // When the integer part is already 0, the downward borrow would go
-        // negative: a whole period elapsed minus (a.frac - b.frac), which is
-        // outside every budget by construction.
-        if (r.ticks == 0) {
-            r.ticks = static_cast<int64_t>(p) - 1;
-        } else {
-            --r.ticks;
-        }
-        num += den;
-    }
-    const int64_t g = detail::ts_gcd(num, den);
-    num /= g;
-    if (num == 0) {
-        r.frac_num = 0;
-        r.frac_den = 0u;
-    } else {
-        r.frac_num = static_cast<int32_t>(num);
-        r.frac_den = static_cast<uint32_t>(den / g);
-    }
-    r.ok = true;
-    return r;
-}
+ModularTickDistance modular_tick_distance(const Timestamp& a, const Timestamp& b);
 
 // The R5 ordering entry point.  `out` is ALWAYS written, including on failure,
 // so a caller that ignores the return value still cannot read an invented
@@ -2580,124 +2197,7 @@ struct JsonCursor {
 // or non-finite tick rate and a corrupt correction bitmask.  Structural
 // validity only: `timestamp_is_self_consistent()` remains the semantic gate
 // and stays the caller's decision.
-inline bool timestamp_from_json_string(const std::string& json, Timestamp& out)
-{
-    detail::JsonCursor c{json.c_str(), json.c_str() + json.size()};
-    Timestamp ts;
-    int64_t frac_num_tmp = 0;
-    int64_t frac_den_tmp = 0;
-    if (!c.eat('{'))
-        return false;
-
-    if (!c.key("ticks") || !c.integer(ts.ticks))
-        return false;
-    if (!c.eat(','))
-        return false;
-    if (!c.key("frac_num") || !c.integer(frac_num_tmp))
-        return false;
-    if (!c.eat(','))
-        return false;
-    if (!c.key("frac_den") || !c.integer(frac_den_tmp))
-        return false;
-    if (frac_num_tmp < 0 || frac_num_tmp > std::numeric_limits<int32_t>::max())
-        return false;
-    if (frac_den_tmp < 0 || frac_den_tmp > std::numeric_limits<uint32_t>::max())
-        return false;
-    ts.frac_num = static_cast<int32_t>(frac_num_tmp);
-    ts.frac_den = static_cast<uint32_t>(frac_den_tmp);
-    if (!c.eat(','))
-        return false;
-
-    if (!c.key("clock_domain"))
-        return false;
-    std::string domain_raw;
-    if (!c.raw_object(domain_raw))
-        return false;
-    {
-        detail::JsonCursor d{domain_raw.c_str(), domain_raw.c_str() + domain_raw.size()};
-        if (!d.eat('{'))
-            return false;
-        if (!d.key("name") || !d.string(ts.domain.name))
-            return false;
-        if (!d.eat(','))
-            return false;
-        if (!d.key("tick_rate_hz") || !d.real(ts.domain.tick_rate_hz))
-            return false;
-        if (!d.eat(','))
-            return false;
-        int64_t epoch = 0;
-        if (!d.key("epoch_id") || !d.integer(epoch))
-            return false;
-        if (epoch < 0)
-            return false;
-        ts.domain.epoch_id = static_cast<uint64_t>(epoch);
-        if (!d.eat(','))
-            return false;
-        int64_t bits = 0;
-        if (!d.key("timestamp_bits") || !d.integer(bits))
-            return false;
-        if (bits < 0 || bits > 63)
-            return false;
-        ts.domain.timestamp_bits = static_cast<uint32_t>(bits);
-        if (!d.eat('}'))
-            return false;
-    }
-    if (!c.eat(','))
-        return false;
-
-    {
-        std::string m;
-        if (!c.key("marker") || !c.string(m))
-            return false;
-        if (!timestamp_marker_from_string(m, ts.marker))
-            return false;
-    }
-    if (!c.eat(','))
-        return false;
-    {
-        std::string s;
-        if (!c.key("source") || !c.string(s))
-            return false;
-        if (!timestamp_from_string(s, ts.source))
-            return false;
-    }
-    if (!c.eat(','))
-        return false;
-    {
-        int64_t bits = 0;
-        if (!c.key("corrections") || !c.integer(bits))
-            return false;
-        if (bits < 0 || bits > static_cast<int64_t>(kCorrectionAll))
-            return false;
-        ts.applied_corrections = static_cast<uint32_t>(bits);
-    }
-    if (!c.eat(','))
-        return false;
-    {
-        std::string flags;
-        if (!c.key("corrections_flags") || !c.string(flags))
-            return false;
-        if (flags != timestamp_corrections_to_string(ts.applied_corrections))
-            return false;
-    }
-    if (!c.eat(','))
-        return false;
-    if (!c.key("calibration_id") || !c.string(ts.calibration_id))
-        return false;
-    if (!c.eat(','))
-        return false;
-    if (!c.key("valid") || !c.boolean(ts.valid))
-        return false;
-    if (!c.eat('}'))
-        return false;
-    if (c.p != c.end)
-        return false; // trailing garbage
-
-    if (!clock_domain_is_valid(ts.domain))
-        return false;
-    out = ts;
-    return true;
-}
+bool timestamp_from_json_string(const std::string& json, Timestamp& out);
 
 } // namespace twr
 } // namespace openuwb

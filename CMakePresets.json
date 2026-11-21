@@ -16,7 +16,8 @@
         "CMAKE_BUILD_TYPE": "Release",
         "UWB_SIMD": "AVX2",
         "ENABLE_UHD_BACKEND": "AUTO",
-        "UWB_BUILD_EXPERIMENTS": "ON"
+        "UWB_BUILD_EXPERIMENTS": "ON",
+        "UWB_DEV_SCOPE": "all"
       }
     },
     {
@@ -29,7 +30,8 @@
         "CMAKE_BUILD_TYPE": "Release",
         "UWB_SIMD": "AVX512",
         "ENABLE_UHD_BACKEND": "AUTO",
-        "UWB_BUILD_EXPERIMENTS": "ON"
+        "UWB_BUILD_EXPERIMENTS": "ON",
+        "UWB_DEV_SCOPE": "all"
       }
     },
     {
@@ -42,7 +44,8 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "UWB_SIMD": "SCALAR",
         "ENABLE_UHD_BACKEND": "AUTO",
-        "UWB_BUILD_EXPERIMENTS": "ON"
+        "UWB_BUILD_EXPERIMENTS": "ON",
+        "UWB_DEV_SCOPE": "all"
       }
     },
     {
@@ -55,7 +58,8 @@
         "CMAKE_BUILD_TYPE": "Release",
         "UWB_SIMD": "AUTO",
         "ENABLE_UHD_BACKEND": "OFF",
-        "UWB_BUILD_EXPERIMENTS": "ON"
+        "UWB_BUILD_EXPERIMENTS": "ON",
+        "UWB_DEV_SCOPE": "all"
       }
     },
     {
@@ -68,7 +72,68 @@
         "CMAKE_BUILD_TYPE": "Release",
         "UWB_SIMD": "AVX2",
         "ENABLE_UHD_BACKEND": "AUTO",
-        "UWB_BUILD_EXPERIMENTS": "OFF"
+        "UWB_BUILD_EXPERIMENTS": "OFF",
+        "UWB_DEV_SCOPE": "all"
+      }
+    },
+    {
+      "name": "dev-rx",
+      "displayName": "Dev RX only (scope=rx, shared libs)",
+      "description": "Single-domain RX/SIC shared-lib build: support+dsp+phy_hrp+sic+radio+runtime, RX apps, rx_sic/dsp_extra QA. Shared domain libraries are the default; install rules disabled.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "UWB_SIMD": "AVX2",
+        "ENABLE_UHD_BACKEND": "AUTO",
+        "UWB_BUILD_EXPERIMENTS": "OFF",
+        "UWB_DEV_SCOPE": "rx",
+        "UWB_DEV_SHARED_LIBS": "ON"
+      }
+    },
+    {
+      "name": "dev-tx",
+      "displayName": "Dev TX only (scope=tx, shared libs)",
+      "description": "Single-domain TX shared-lib build: support+dsp+phy_hrp modulator core, HRP modulator QA and benchmark. Shared domain libraries are the default; install rules disabled.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "UWB_SIMD": "AVX2",
+        "ENABLE_UHD_BACKEND": "AUTO",
+        "UWB_BUILD_EXPERIMENTS": "OFF",
+        "UWB_DEV_SCOPE": "tx",
+        "UWB_DEV_SHARED_LIBS": "ON"
+      }
+    },
+    {
+      "name": "dev-twr",
+      "displayName": "Dev TWR only (scope=twr, shared libs)",
+      "description": "Single-domain TWR shared-lib build: support+dsp+phy_hrp+twr_core/fake_link/phy, the two TWR demos and all TWR QA. Shared domain libraries are the default; install rules disabled.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "UWB_SIMD": "AVX2",
+        "ENABLE_UHD_BACKEND": "AUTO",
+        "UWB_BUILD_EXPERIMENTS": "OFF",
+        "UWB_DEV_SCOPE": "twr",
+        "UWB_DEV_SHARED_LIBS": "ON"
+      }
+    },
+    {
+      "name": "dev-radar",
+      "displayName": "Dev radar only (scope=radar, shared libs)",
+      "description": "Single-domain radar shared-lib build: support+dsp+phy_hrp+sensing+sic+radio+runtime, pipeline runner, sensing/radio QA. Shared domain libraries are the default; install rules disabled.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "UWB_SIMD": "AVX2",
+        "ENABLE_UHD_BACKEND": "AUTO",
+        "UWB_BUILD_EXPERIMENTS": "OFF",
+        "UWB_DEV_SCOPE": "radar",
+        "UWB_DEV_SHARED_LIBS": "ON"
       }
     }
   ],
@@ -92,6 +157,22 @@
     {
       "name": "dev-avx2",
       "configurePreset": "dev-avx2"
+    },
+    {
+      "name": "dev-rx",
+      "configurePreset": "dev-rx"
+    },
+    {
+      "name": "dev-tx",
+      "configurePreset": "dev-tx"
+    },
+    {
+      "name": "dev-twr",
+      "configurePreset": "dev-twr"
+    },
+    {
+      "name": "dev-radar",
+      "configurePreset": "dev-radar"
     }
   ],
   "testPresets": [
@@ -126,6 +207,34 @@
     {
       "name": "dev-avx2",
       "configurePreset": "dev-avx2",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "dev-rx",
+      "configurePreset": "dev-rx",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "dev-tx",
+      "configurePreset": "dev-tx",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "dev-twr",
+      "configurePreset": "dev-twr",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "dev-radar",
+      "configurePreset": "dev-radar",
       "output": {
         "outputOnFailure": true
       }

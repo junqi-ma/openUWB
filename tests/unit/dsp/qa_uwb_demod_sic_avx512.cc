@@ -107,6 +107,52 @@ void dot_8lag_scalar(const cf* rx, const float* taps_dup, size_t L, cf out[8])
     }
 }
 
+// Independent scalar reference for the fused subtract + energy kernels.  The
+// kernel contract (and compute_roi_energies) forms each square in float and
+// widens it to double before accumulating, so the reference does the same while
+// summing sequentially.  The 1e-12 comparison therefore only has to absorb the
+// double accumulation order, not a float-vs-double squaring difference.
+struct Sub3EnergyRef {
+    std::vector<cf> dst;
+    double e_a = 0.0;
+    double e_dst = 0.0;
+};
+
+Sub3EnergyRef sub3_energy_scalar_reference(const std::vector<cf>& a,
+                                           const std::vector<cf>& b, size_t n)
+{
+    Sub3EnergyRef ref;
+    ref.dst.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        const float ar = a[i].real();
+        const float ai = a[i].imag();
+        const float dr = ar - b[i].real();
+        const float di = ai - b[i].imag();
+        ref.dst[i] = cf(dr, di);
+        ref.e_a += static_cast<double>(ar * ar) + static_cast<double>(ai * ai);
+        ref.e_dst +=
+            static_cast<double>(dr * dr) + static_cast<double>(di * di);
+    }
+    return ref;
+}
+
+void check_sub3_energy_close(double got, double ref, const char* what, size_t n,
+                             const char* mode)
+{
+    if (n == 0) {
+        BOOST_CHECK_MESSAGE(got == 0.0,
+                            what << " n=0 mode=" << mode << " got=" << got);
+        return;
+    }
+    BOOST_REQUIRE_MESSAGE(ref != 0.0,
+                          what << " reference is zero for n=" << n);
+    const double rel = std::abs(got - ref) / std::abs(ref);
+    BOOST_CHECK_MESSAGE(rel < 1e-12,
+                        what << " n=" << n << " mode=" << mode
+                             << " rel=" << rel << " got=" << got
+                             << " ref=" << ref);
+}
+
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(uwb_demod_sic_avx512_suite)
@@ -402,8 +448,187 @@ BOOST_AUTO_TEST_CASE(element_wise_ops_propagate_non_finite_identically)
 }
 
 // ---------------------------------------------------------------------------
-// Batched SFD fold
+// Fused subtract + energy kernels (vector_sub3_energy_complex /
+// avx512::sub3_energy_cf32)
 // ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(sub3_energy_matches_double_reference_for_all_counts)
+{
+    const size_t counts[] = { 0, 1, 3, 4, 7, 8, 15, 16, 17, 1023, 4096, 10000 };
+    for (size_t n : counts) {
+        // +4 padding so the in-place and separate buffers never alias.
+        const std::vector<cf> a =
+            make_random(n + 4, 700u + static_cast<uint32_t>(n));
+        const std::vector<cf> b =
+            make_random(n + 4, 900u + static_cast<uint32_t>(n));
+        const Sub3EnergyRef ref = sub3_energy_scalar_reference(a, b, n);
+
+        for (int mode = 0; mode < 2; ++mode) {
+            const bool in_place = (mode == 0);
+            const char* mode_name = in_place ? "dst==a" : "dst!=a";
+            std::vector<cf> separate;
+            std::vector<cf> inplace;
+            cf* dst = nullptr;
+            const cf* src_a = nullptr;
+            if (in_place) {
+                inplace = a;
+                dst = inplace.data();
+                src_a = inplace.data();
+            } else {
+                inplace = a; // only used as the source
+                separate.assign(n + 4, cf(9.f, 9.f));
+                dst = separate.data();
+                src_a = inplace.data();
+            }
+
+            double e_a = -1.0;
+            double e_dst = -1.0;
+            rxopt::vector_sub3_energy_complex(dst, src_a, b.data(), n, e_a,
+                                              e_dst);
+
+            if (n > 0) {
+                BOOST_CHECK_MESSAGE(
+                    std::memcmp(dst, ref.dst.data(), n * sizeof(cf)) == 0,
+                    "dst bits differ at n=" << n << " mode=" << mode_name);
+            }
+            check_sub3_energy_close(e_a, ref.e_a, "e_a", n, mode_name);
+            check_sub3_energy_close(e_dst, ref.e_dst, "e_dst", n, mode_name);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(sub3_energy_backend_parity)
+{
+#if UWB_SIMD_HAVE_AVX512
+    const size_t counts[] = { 0, 1, 7, 8, 15, 16, 17, 1023, 4096, 10000 };
+    for (size_t n : counts) {
+        const std::vector<cf> a =
+            make_random(n + 4, 1700u + static_cast<uint32_t>(n));
+        const std::vector<cf> b =
+            make_random(n + 4, 1900u + static_cast<uint32_t>(n));
+
+        // In this build "scalar" still resolves the unconditional AVX2 helper
+        // for this op (group overrides only gate the wide TU), exactly like the
+        // existing element-wise parity tests.  "avx512" really selects the wide
+        // kernel.
+        auto run = [&](const char* backend, std::vector<cf>& dst, double& e_a,
+                       double& e_dst) {
+            ScopedBackend guard(simd::KernelGroup::Sync, backend);
+            BOOST_REQUIRE_EQUAL(std::string(simd::resolved_backend_name(
+                                    simd::KernelGroup::Sync)),
+                                std::string(backend));
+            dst = a;
+            e_a = -1.0;
+            e_dst = -1.0;
+            rxopt::vector_sub3_energy_complex(dst.data(), dst.data(),
+                                              b.data(), n, e_a, e_dst);
+        };
+
+        std::vector<cf> d_scalar, d_avx2, d_avx512;
+        double ea_scalar = 0.0, ed_scalar = 0.0;
+        double ea_avx2 = 0.0, ed_avx2 = 0.0;
+        double ea_avx512 = 0.0, ed_avx512 = 0.0;
+        run("scalar", d_scalar, ea_scalar, ed_scalar);
+        run("avx2", d_avx2, ea_avx2, ed_avx2);
+        run("avx512", d_avx512, ea_avx512, ed_avx512);
+
+        std::vector<cf> d_direct = a;
+        double ea_direct = -1.0;
+        double ed_direct = -1.0;
+        openuwb::core::simd::avx512::sub3_energy_cf32(
+            d_direct.data(), d_direct.data(), b.data(), n, &ea_direct,
+            &ed_direct);
+
+        if (n > 0) {
+            BOOST_CHECK_MESSAGE(
+                std::memcmp(d_avx512.data(), d_avx2.data(), n * sizeof(cf)) == 0,
+                "dst: AVX-512 vs AVX2 n=" << n);
+            BOOST_CHECK_MESSAGE(
+                std::memcmp(d_avx512.data(), d_scalar.data(), n * sizeof(cf)) ==
+                    0,
+                "dst: AVX-512 vs scalar-group n=" << n);
+            BOOST_CHECK_MESSAGE(
+                std::memcmp(d_direct.data(), d_avx512.data(), n * sizeof(cf)) ==
+                    0,
+                "dst: direct AVX-512 vs dispatcher n=" << n);
+        }
+        check_sub3_energy_close(ea_avx512, ea_avx2, "e_a avx512-vs-avx2", n,
+                                "forced");
+        check_sub3_energy_close(ed_avx512, ed_avx2, "e_dst avx512-vs-avx2", n,
+                                "forced");
+        check_sub3_energy_close(ea_direct, ea_avx512, "e_a direct-vs-dispatch", n,
+                                "forced");
+        check_sub3_energy_close(ed_direct, ed_avx512, "e_dst direct-vs-dispatch",
+                                n, "forced");
+    }
+#else
+    BOOST_CHECK(UWB_SIMD_HAVE_AVX512 == 0);
+#endif
+}
+
+BOOST_AUTO_TEST_CASE(sub3_energy_propagates_non_finite)
+{
+    for (size_t n : { size_t(8), size_t(17), size_t(10000) }) {
+        const std::vector<cf> base_a =
+            make_random(n + 4, 2500u + static_cast<uint32_t>(n));
+        const std::vector<cf> b =
+            make_random(n + 4, 2600u + static_cast<uint32_t>(n));
+        const size_t idx = n / 2;
+
+        // One NaN or one Inf in a must poison both energies.
+        for (int kind = 0; kind < 2; ++kind) {
+            std::vector<cf> a = base_a;
+            a[idx] = (kind == 0)
+                         ? cf(std::numeric_limits<float>::quiet_NaN(), 0.f)
+                         : cf(std::numeric_limits<float>::infinity(), 0.f);
+            std::vector<cf> dst = a;
+            double e_a = 0.0;
+            double e_dst = 0.0;
+            rxopt::vector_sub3_energy_complex(dst.data(), dst.data(), b.data(),
+                                              n, e_a, e_dst);
+            BOOST_CHECK_MESSAGE(
+                !std::isfinite(e_a),
+                "e_a stayed finite for kind=" << kind << " n=" << n);
+            BOOST_CHECK_MESSAGE(
+                !std::isfinite(e_dst),
+                "e_dst stayed finite for kind=" << kind << " n=" << n);
+
+#if UWB_SIMD_HAVE_AVX512
+            std::vector<cf> dst5 = a;
+            double ea5 = 0.0;
+            double ed5 = 0.0;
+            openuwb::core::simd::avx512::sub3_energy_cf32(
+                dst5.data(), dst5.data(), b.data(), n, &ea5, &ed5);
+            BOOST_CHECK_MESSAGE(
+                !std::isfinite(ea5),
+                "direct AVX-512 e_a stayed finite for kind=" << kind
+                                                             << " n=" << n);
+            BOOST_CHECK_MESSAGE(
+                !std::isfinite(ed5),
+                "direct AVX-512 e_dst stayed finite for kind=" << kind
+                                                               << " n=" << n);
+#endif
+        }
+
+        // A NaN only in b leaves e_a finite but must still fail isfinite(e_dst),
+        // which is the caller's overflow/reconstruction gate.
+        std::vector<cf> a = base_a;
+        std::vector<cf> b_nan = b;
+        b_nan[idx] = cf(std::numeric_limits<float>::quiet_NaN(), 0.f);
+        std::vector<cf> dst = a;
+        double e_a = 0.0;
+        double e_dst = 0.0;
+        rxopt::vector_sub3_energy_complex(dst.data(), dst.data(), b_nan.data(),
+                                          n, e_a, e_dst);
+        BOOST_CHECK_MESSAGE(std::isfinite(e_a),
+                            "e_a poisoned by a NaN that only exists in b, n="
+                                << n);
+        BOOST_CHECK_MESSAGE(!std::isfinite(e_dst),
+                            "e_dst did not see the NaN from b, n=" << n);
+    }
+}
+
+
 BOOST_AUTO_TEST_CASE(fold_sfd_window_matches_symbol_by_symbol_reference)
 {
     const size_t sym = 1016;

@@ -97,11 +97,13 @@ public:
 private:
     core::RationalResampler65_48Core rs_;
     const std::vector<std::complex<float>>& template_;
+    // Resampled work window.  It is ALSO the SIC in-place output buffer when
+    // SIC is enabled: on an L0/failure transaction it stays byte-identical, so
+    // it is always the buffer handed to demodulate_one (fail-open contract).
     std::vector<std::complex<float>> work_;
     demod::core::DemodScratch scratch_;
     PacketSicOptions sic_;
     sic::SicUnifiedScratch sic_scratch_;
-    std::vector<std::complex<float>> sic_out_;
     bool sic_prepared_ = false;
 };
 

@@ -245,13 +245,17 @@ struct SicUnifiedConfig {
     double gain_condition_max = 1e8;      ///< Maximum acceptable condition number
 
     // Discrete CIR / Ipatov Backend Specific Options (Fixed to 20-tap historical baseline)
-    int64_t lag_lo = -1;                  ///< Compact lag origin (-1)
+    int64_t lag_lo = -4;                  ///< Compact lag origin (-4; absorbs sparse timing group-delay)
     size_t tap_count = 20;                ///< 20-tap compact support
     double peak_floor = 0.15;
     size_t peak_min_spacing = 5;
     size_t active_radius = 1;
     double lambda = 1e-6;                 ///< Ridge regularization parameter
     bool sparse_pulse_reconstruct = true; ///< Fast single-pass AVX2 pulse accumulator (historical baseline)
+
+    // Robustness / validation options
+    bool allow_partial_window_clip = false; ///< Clip edge interferers to [0, n) instead of context_truncated
+    double validate_threshold = 0.25;       ///< Forwarded to PathFractional SicConfig::validate_threshold
 
     // Path Fractional Backend Specific Options
     size_t k_paths = 4;
@@ -351,6 +355,7 @@ struct SicUnifiedTimings {
     double recon_scale_us = 0.0;
     double recon_conv_us = 0.0;
     double recon_cfo_rot_us = 0.0;
+    double recon_zero_us = 0.0;           ///< Buffer zeroing / tile init time (child of reconstruct_us)
 };
 
 // ---------------------------------------------------------------------------
@@ -372,6 +377,10 @@ struct SicUnifiedResult {
 
     // Quantified Cancellation Metrics
     double suppression_db = 0.0;          ///< Measured residual suppression: 10 * log10(||y||^2 / ||out||^2) inside [sub_lo, sub_hi)
+    // True when suppression_db was measured by the fused subtraction pass
+    // (DiscreteCirApplyOptions::compute_roi_energy), so the caller must not
+    // re-read y/out afterwards -- required for in-place (out == y) cancellation.
+    bool suppression_energy_valid = false;
     double fit_residual = 0.0;            ///< Training residual ||y - i_hat||^2 / ||y||^2
     double waveform_scale = 0.0;          ///< Applied waveform scale relative to reference SYNC
 

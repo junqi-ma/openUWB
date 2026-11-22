@@ -6,7 +6,8 @@
  * Moved bodies: the PacketProcessor resample -> optional SIC -> demodulate
  * entry point (constructor and process()) and the PacketSlotPool stop/submit
  * hand-offs.  The zero-allocation hot loop is unchanged: process() only
- * touches work_/sic_out_/scratch_, which the constructor sizes once.
+ * touches work_/scratch_, which the constructor sizes once.  SIC subtracts
+ * IN PLACE inside work_ (no per-worker sic_out_ copy buffer).
  *
  * The header keeps PacketRequest/PacketProcessingResult/PacketSicOptions, the
  * PacketSlotPool worker loop template (it must be instantiated by the caller)
@@ -63,7 +64,6 @@ PacketProcessor::PacketProcessor(const std::vector<float>& taps,
                                       sic_scratch_, &err)) {
             throw std::runtime_error("SIC initialization failed: " + err);
         }
-        sic_out_.assign(work_.size(), std::complex<float>(0.f, 0.f));
         sic_prepared_ = true;
     }
 }
@@ -110,7 +110,11 @@ PacketProcessingResult PacketProcessor::process(
         }
         call_cfg.observed_end_sample = 0;
         sic::SicUnifiedResult sic_result;
-        sic_result.out = sic_out_.data();
+        // In-place cancellation: SIC writes its cleaned window straight into
+        // work_, so no per-worker ~4 MB sic_out_ copy buffer is needed and the
+        // demodulated buffer is always work_.data() (L0/failure leaves work_
+        // byte-untouched, committed L1/L2 holds y - i_hat).
+        sic_result.out = work_.data();
         // The live path consumes `out` only on committed L1/L2.  Skipping
         // the L0/failure full-window copy and the unused i_hat zero-fill
         // removes ~0.58 ms/candidate of pure memory traffic on the common
@@ -125,11 +129,8 @@ PacketProcessingResult PacketProcessor::process(
         out.sic_level = sic_result.level;
         out.sic_reason = sic_result.reason ? sic_result.reason : "";
         out.sic_suppression_db = sic_result.suppression_db;
-        if (out.sic_committed &&
-            (out.sic_level == sic::SicCancellationLevel::L1_Preamble ||
-             out.sic_level == sic::SicCancellationLevel::L2_FullPacket)) {
-            demod_in = sic_out_.data();
-        }
+        // demod_in stays work_.data(): SIC is in place, and a failed/L0
+        // transaction never modifies it (fail-open).
     }
 
     out.decoded = demod::core::demodulate_one(demod_in, made, profile,

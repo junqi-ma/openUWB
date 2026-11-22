@@ -263,6 +263,31 @@ struct DiscreteCirResult {
     double cfo_hz = 0.0;
     size_t tap_count = 0;
     double fit_residual = 0.0, gain_condition = 0.0;
+    // Fused ROI energies (valid only when DiscreteCirApplyOptions::compute_roi_energy
+    // was set and the transaction committed).  They are accumulated during the
+    // subtraction pass, before out is written, so they remain correct when
+    // out == y (in-place cancellation).
+    bool roi_energy_valid = false;
+    double roi_e_y = 0.0;
+    double roi_e_out = 0.0;
+};
+
+// Optional knobs for the *_ex entry points.  Defaults reproduce the historical
+// public behavior exactly.
+struct DiscreteCirApplyOptions {
+    // Caller guarantees the pulse event order/signs and (for the non-sparse
+    // paths) that y is finite, so the full rescan is skipped.  The prefix SYNC
+    // identity and all bounds are still validated.
+    bool transaction_prepared = false;
+    // Copy y -> out on failure when out != y.  Set false to let a caller that
+    // already owns the fail-closed copy avoid a duplicate full-window copy.
+    bool copy_out_on_fail = true;
+    // Clip [lo, hi) to [0, n) instead of failing context_truncated.  Only the
+    // portion inside the window is reconstructed/subtracted; taps that cross
+    // either edge are added/subtracted only where they land inside [0, n).
+    bool allow_partial_clip = false;
+    // Populate result.roi_e_y / roi_e_out during the fused subtraction.
+    bool compute_roi_energy = false;
 };
 
 UWB_API bool prepare_discrete_cir(const DiscreteCirConfig& cfg,
@@ -300,13 +325,16 @@ UWB_API bool apply_discrete_cir(const std::complex<float>* y,
 
 // Sparse-pulse apply.  `pulses` must be the unit-impulse packet produced by
 // mod::modulate_pulse_list from the same Ipatov profile.  The reconstruction
-// uses the approximate form
+// uses the exact discrete model
 //
-//   c_i = sign_i * exp(j*w*(q + m_i - anchor))
-//   y_hat[q + m_i + lag_lo + j] += c_i * taps[j]
+//   c_i              = sign_i * exp(j*w*(q + m_i - anchor))
+//   taps_eff[l-lag_lo] = taps[l-lag_lo] * exp(j*w*(l-anchor_zero))
+//   y_hat[q + m_i + l] += c_i * taps_eff[l-lag_lo]
 //
-// i.e. the CFO phase is evaluated once per pulse and intentionally not varied
-// across the CIR support.  No complete-packet CFO rotation is performed.
+// i.e. the per-event phase e^{j*w*m_i} is combined with the per-lag phase
+// e^{j*w*l} so the support is phase-rotated exactly like the full waveform
+// path (no intra-tap CFO approximation).  With cfo == 0 the taps are used
+// verbatim.  No whole-packet CFO rotation is performed afterwards.
 UWB_API bool apply_discrete_cir_pulses(
     const std::complex<float>* y,
     size_t n,
@@ -316,6 +344,24 @@ UWB_API bool apply_discrete_cir_pulses(
     const DiscreteCirModel& model,
     int64_t roi_lo,
     int64_t roi_hi,
+    DiscreteCirScratch& scratch,
+    std::complex<float>* out,
+    std::complex<float>* ihat,
+    DiscreteCirResult* result = nullptr);
+
+// Option-carrying variant of apply_discrete_cir_pulses().  The legacy entry
+// point above is exactly this call with a default-constructed
+// DiscreteCirApplyOptions.
+UWB_API bool apply_discrete_cir_pulses_ex(
+    const std::complex<float>* y,
+    size_t n,
+    const mod::PulseList& pulses,
+    const std::complex<float>* reference_sync,
+    size_t sync_n,
+    const DiscreteCirModel& model,
+    int64_t roi_lo,
+    int64_t roi_hi,
+    const DiscreteCirApplyOptions& opts,
     DiscreteCirScratch& scratch,
     std::complex<float>* out,
     std::complex<float>* ihat,
@@ -340,7 +386,25 @@ UWB_API DiscreteCirResult fullpacket_cancel_discrete(
     std::complex<float>* out,
     std::complex<float>* ihat);
 
-// Controls whether AVX2/FMA kernel B3 is disabled (for QA / benchmarking).
+// Option-carrying variant of fullpacket_cancel_discrete().  The legacy entry
+// point above is exactly this call with a default-constructed
+// DiscreteCirApplyOptions.
+UWB_API DiscreteCirResult fullpacket_cancel_discrete_ex(
+    const std::complex<float>* y,
+    size_t n,
+    const std::vector<uint8_t>& phr_bits,
+    const std::vector<uint8_t>& wire_psdu,
+    bool fcs_pass,
+    const mod::HrpModConfig& profile,
+    const DiscreteCirModel& model,
+    const std::complex<float>* reference_sync,
+    size_t sync_n,
+    int64_t roi_lo,
+    int64_t roi_hi,
+    const DiscreteCirApplyOptions& opts,
+    DiscreteCirScratch& scratch,
+    std::complex<float>* out,
+    std::complex<float>* ihat);
 // Default (-1) evaluates environment variable UWB_SIC_DISABLE_B3 on query.
 // Setting 0 forces enabled; setting 1 forces disabled.
 UWB_API void set_b3_simd_disabled(int disabled);

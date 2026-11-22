@@ -191,6 +191,9 @@ SicConfig SicUnifiedConfig::to_sic_config() const
     c.enable_fractional = enable_fractional;
     c.enable_cfo = enable_cfo;
     c.detect_threshold = detect_threshold;
+    // Forward the S1 holdout gate.  Without it the PathFractional backend
+    // rejects every window with "uncalibrated_validate_threshold".
+    c.validate_threshold = validate_threshold;
     c.observed_end_sample = observed_end_sample;
     c.fit_residual_max = fit_residual_max;
     return c;
@@ -576,8 +579,13 @@ bool reconstruct_and_subtract_unified(
     std::complex<float>* i_hat,
     SicUnifiedResult& result)
 {
+    // True once some backend has already seeded `out` from `y` for this
+    // transaction (apply_model's own fail-closed copy).  Keeps the unified
+    // fail_closed lambda to AT MOST one bypass copy.
+    bool bypass_copy_done = false;
     auto fail_closed = [&](const char* reason) {
-        if (out && y && n > 0 && out != y && result.copy_out_on_bypass) {
+        if (out && y && n > 0 && out != y && result.copy_out_on_bypass &&
+            !bypass_copy_done) {
             std::copy(y, y + n, out);
         }
         if (i_hat && i_hat != y && i_hat != out) {
@@ -594,8 +602,6 @@ bool reconstruct_and_subtract_unified(
         return fail_closed("invalid_input_or_channel");
     }
 
-    const auto t_recon = Clock::now();
-
     if (channel.backend == SicEstimatorBackend::PathFractional) {
         SicModel model;
         channel.to_parametric(model);
@@ -604,9 +610,29 @@ bool reconstruct_and_subtract_unified(
         SicTimings st;
 
         if (level == SicCancellationLevel::L1_Preamble) {
-            bool ok = apply_model(model, y, n, 0, stemp, sc, scratch.fractional, out, i_hat, &st);
+            // apply_model() owns a fail-closed y -> out copy (and i_hat zero
+            // fill) unless the caller preinitializes both.  Seed them exactly
+            // once here so fail_closed never repeats the copy; skipping the
+            // seed when out == y keeps the in-place mode memcpy-free.
+            if (out != y) {
+                std::copy(y, y + n, out);
+            }
+            if (i_hat && i_hat != y && i_hat != out) {
+                std::fill(i_hat, i_hat + n, std::complex<float>(0.f, 0.f));
+            }
+            bypass_copy_done = true;
+            bool ok = apply_model(model, y, n, 0, stemp, sc, scratch.fractional,
+                                  out, i_hat, &st, /*out_preinitialized=*/true);
+            // apply_model() reports `reconstruct_us` over the whole per-chunk
+            // synthesis INCLUDING the masked subtraction, and `apply_us` as
+            // the parent total.  Attribute the remainder to subtraction
+            // instead of timing the caller's wall clock, which used to fold
+            // the pre-seed copy into subtract_us.
             result.timings.reconstruct_us = static_cast<double>(st.reconstruct_us);
-            result.timings.subtract_us = std::max(0.0, us(t_recon) - result.timings.reconstruct_us);
+            result.timings.subtract_us =
+                (st.apply_us > st.reconstruct_us)
+                    ? static_cast<double>(st.apply_us - st.reconstruct_us)
+                    : 0.0;
             if (!ok) {
                 return fail_closed("apply_model_failed");
             }
@@ -648,11 +674,35 @@ bool reconstruct_and_subtract_unified(
         channel.to_discrete_cir(dm);
         DiscreteCirResult dres;
 
+        // A committed *_ex transaction with compute_roi_energy = true has
+        // already accumulated ||y||^2 and ||out||^2 over the subtraction ROI
+        // BEFORE writing `out`, so the suppression metric never re-reads y and
+        // stays correct for in-place (out == y) cancellation.
+        auto accept_fused_energy = [&](const DiscreteCirResult& dr) {
+            if (!dr.roi_energy_valid) {
+                return;
+            }
+            result.suppression_energy_valid = true;
+            if (std::isfinite(dr.roi_e_y) && std::isfinite(dr.roi_e_out) &&
+                dr.roi_e_y > 0.0 && dr.roi_e_out > 0.0) {
+                result.suppression_db = 10.0 * std::log10(dr.roi_e_y / dr.roi_e_out);
+            }
+        };
+
+        DiscreteCirApplyOptions opts;
+        // The unified fail_closed lambda owns the single bypass copy, so the
+        // low-level transaction must never copy y -> out on failure itself.
+        opts.copy_out_on_fail = false;
+        opts.allow_partial_clip = cfg.allow_partial_window_clip;
+        opts.compute_roi_energy = true;
+
         if (level == SicCancellationLevel::L1_Preamble) {
             // Check if sparse pulse reconstruction is enabled for Ipatov backend
             if (dm.impulse_template && scratch.discrete.sparse_pulse_reconstruct) {
                 mod::PulseList pulses;
-                if (scratch.preamble_cache_valid && !scratch.cached_preamble_events.empty()) {
+                const bool cache_hit =
+                    scratch.preamble_cache_valid && !scratch.cached_preamble_events.empty();
+                if (cache_hit) {
                     pulses.events = scratch.cached_preamble_events.data();
                     pulses.count = scratch.cached_preamble_events.size();
                     pulses.packet_samples = scratch.cached_preamble_samples;
@@ -665,11 +715,17 @@ bool reconstruct_and_subtract_unified(
                     }
                 }
                 if (pulses.count > 0) {
-                    bool ok = apply_discrete_cir_pulses(
+                    // Only the cached event list is known prepared (order,
+                    // signs and the estimator's own y-finite scan); a freshly
+                    // modulated pulse list keeps the public rescan.
+                    opts.transaction_prepared = cache_hit;
+                    bool ok = apply_discrete_cir_pulses_ex(
                         y, n, pulses, templates.sync, templates.sync_len, dm,
-                        cfg.sub_roi_lo, cfg.sub_roi_hi, scratch.discrete, out, i_hat, &dres);
+                        cfg.sub_roi_lo, cfg.sub_roi_hi, opts, scratch.discrete, out, i_hat,
+                        &dres);
                     result.timings.reconstruct_us = dres.channel_us;
                     result.timings.subtract_us = dres.subtract_us;
+                    result.timings.recon_zero_us = dres.zero_us;
                     result.timings.recon_scale_us = dres.scale_us;
                     result.timings.recon_conv_us = dres.convolution_us;
                     result.timings.recon_cfo_rot_us = dres.phase_us + dres.cfo_us;
@@ -686,6 +742,7 @@ bool reconstruct_and_subtract_unified(
                     result.sub_lo = dres.sub_lo;
                     result.sub_hi = dres.sub_hi;
                     result.sub_overlap = (result.sub_hi > result.sub_lo) ? (result.sub_hi - result.sub_lo) : 0;
+                    accept_fused_energy(dres);
                     return true;
                 }
             }
@@ -711,6 +768,7 @@ bool reconstruct_and_subtract_unified(
                 cfg.sub_roi_lo, cfg.sub_roi_hi, scratch.discrete, out, i_hat, &dres);
             result.timings.reconstruct_us = dres.channel_us;
             result.timings.subtract_us = dres.subtract_us;
+            result.timings.recon_zero_us = dres.zero_us;
             result.timings.recon_scale_us = dres.scale_us;
             result.timings.recon_conv_us = dres.convolution_us;
             result.timings.recon_cfo_rot_us = dres.phase_us + dres.cfo_us;
@@ -727,17 +785,24 @@ bool reconstruct_and_subtract_unified(
             result.sub_lo = dres.sub_lo;
             result.sub_hi = dres.sub_hi;
             result.sub_overlap = (result.sub_hi > result.sub_lo) ? (result.sub_hi - result.sub_lo) : 0;
+            accept_fused_energy(dres);
             return true;
         } else {
-            // FullPacket with DiscreteCir / Ipatov
+            // FullPacket with DiscreteCir / Ipatov.  Sparse experiments still
+            // validate the remodulated pulse list themselves; the cached
+            // prefix events stay untouched.
             mod::HrpModConfig modcfg = cfg.to_hrp_mod_config();
-            dres = fullpacket_cancel_discrete(
+            dres = fullpacket_cancel_discrete_ex(
                 y, n, scratch.work_phr_bits, scratch.work_wire_psdu,
                 true, modcfg, dm, templates.sync, templates.sync_len,
-                cfg.sub_roi_lo, cfg.sub_roi_hi, scratch.discrete, out, i_hat);
+                cfg.sub_roi_lo, cfg.sub_roi_hi, opts, scratch.discrete, out, i_hat);
             result.timings.tx_remod_us = dres.tx_us;
             result.timings.reconstruct_us = dres.channel_us;
             result.timings.subtract_us = dres.subtract_us;
+            result.timings.recon_zero_us = dres.zero_us;
+            result.timings.recon_scale_us = dres.scale_us;
+            result.timings.recon_conv_us = dres.convolution_us;
+            result.timings.recon_cfo_rot_us = dres.phase_us + dres.cfo_us;
             result.waveform_scale = dres.waveform_scale;
             if (!dres.committed) {
                 return fail_closed(dres.reason);
@@ -751,6 +816,7 @@ bool reconstruct_and_subtract_unified(
             result.sub_lo = dres.sub_lo;
             result.sub_hi = dres.sub_hi;
             result.sub_overlap = (result.sub_hi > result.sub_lo) ? (result.sub_hi - result.sub_lo) : 0;
+            accept_fused_energy(dres);
             return true;
         }
     }
@@ -876,6 +942,7 @@ bool sic_process_unified(
     result.level = SicCancellationLevel::L0_Bypass;
     result.cancelled_fields = SicKnownFields::None;
     result.suppression_db = 0.0;
+    result.suppression_energy_valid = false;
     result.fallback_reason = nullptr;
 
     if (!y || !result.out || n == 0 || !scratch.prepared ||
@@ -1185,13 +1252,50 @@ bool sic_process_unified(
         s_known_ptr, s_known_len,
         templates, cfg, scratch, result.out, result.i_hat, result);
 
+    // 3b. AutoFallback: a full-packet transaction whose support leaves the
+    // window (edge interferer / pulse tail past the last sample) fails closed
+    // with "context_truncated" before anything is written.  The preamble is
+    // shorter, so retry at L1 with the same known prefix instead of losing the
+    // whole window.  Other failures keep the strict L0 contract.
+    if (!ok && cfg.policy == SicPolicy::AutoFallback &&
+        target_level == SicCancellationLevel::L2_FullPacket && result.reason &&
+        std::strcmp(result.reason, "context_truncated") == 0) {
+        result.fallback_reason = "l2_context_truncated";
+        s_known_ptr = templates.preamble;
+        s_known_len = templates.preamble_len;
+        if (scratch.preamble_cache_valid && !scratch.cached_preamble_waveform.empty()) {
+            s_known_ptr = scratch.cached_preamble_waveform.data();
+            s_known_len = scratch.cached_preamble_waveform.size();
+        } else {
+            mod::HrpModConfig modcfg = cfg.to_hrp_mod_config();
+            size_t n_prefix = 0;
+            if (mod::modulate_prefix_waveform(modcfg, scratch.modulator,
+                                              scratch.work_waveform.data(),
+                                              scratch.work_waveform.size(),
+                                              n_prefix) && n_prefix > 0) {
+                s_known_ptr = scratch.work_waveform.data();
+                s_known_len = n_prefix;
+            }
+        }
+        ok = reconstruct_and_subtract_unified(
+            y, n, channel, SicCancellationLevel::L1_Preamble,
+            SicKnownFields::PreambleSfd, s_known_ptr, s_known_len, templates,
+            cfg, scratch, result.out, result.i_hat, result);
+    }
+
     if (!ok) {
         result.timings.core_total_us = us(t_core_start);
         return true;
     }
 
     // 4. Calculate actual suppression dB in subtraction ROI: 10 * log10(||y||^2 / ||out||^2)
-    if (result.committed && result.sub_hi > result.sub_lo &&
+    // When the fused subtraction pass already measured both ROI energies the
+    // metric is final: re-reading y here would be wrong for in-place output
+    // (out == y) and would add a second full-ROI pass on the hot path.  The
+    // post-hoc fallback is therefore restricted to backends that did not fuse
+    // the energies (PathFractional / non-sparse L1) AND kept y separate.
+    if (result.committed && !result.suppression_energy_valid &&
+        result.out != y && result.sub_hi > result.sub_lo &&
         result.sub_lo >= 0 && result.sub_hi <= static_cast<int64_t>(n)) {
         double e_y = 0.0;
         double e_out = 0.0;

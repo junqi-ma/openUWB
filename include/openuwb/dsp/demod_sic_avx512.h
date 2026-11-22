@@ -113,6 +113,25 @@ void sub_cf32(gr_complex* dst, const gr_complex* src, size_t count);
 void sub3_cf32(gr_complex* dst, const gr_complex* a, const gr_complex* b,
                size_t count);
 
+/**
+ * Fused dst[i] = a[i] - b[i] + double-precision energy accumulation.
+ *
+ * Supports dst == a in place.  Every stored sample is bit-identical to
+ * sub3_cf32() (plain subtraction, no FMA reassociation).  In the same pass it
+ * accumulates
+ *
+ *   *e_a_out   = sum_i |a[i]|^2        (read BEFORE dst is overwritten)
+ *   *e_dst_out = sum_i |dst[i]|^2
+ *
+ * in double precision with independent accumulators.  NaN/Inf in a or b
+ * propagate into the energies (the IEEE default), so a caller can detect a
+ * non-finite reconstruction with std::isfinite(*e_dst_out) alone.  The output
+ * energies are overwritten on entry (not accumulated into the old value).
+ */
+void sub3_energy_cf32(gr_complex* dst, const gr_complex* a,
+                      const gr_complex* b, size_t count, double* e_a_out,
+                      double* e_dst_out);
+
 /** dst[i] *= scale for count complex samples.  Bit-identical to AVX2. */
 void scale_cf32(gr_complex* dst, float scale, size_t count);
 

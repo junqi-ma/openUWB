@@ -19,6 +19,7 @@
 
 #include <openuwb/dsp/detector_core.h> // openuwb::core::uwb_l2_normalize
 #include <openuwb/dsp/demod_sic_avx512.h> // phase-2 wide kernels
+#include <openuwb/support/api.h>              // UWB_API
 #include <openuwb/support/kernel_backend.h>   // per-group backend policy
 #include <openuwb/phy/hrp/common/profile.h>      // kQm35SamplesPerSymbol
 #include <openuwb/support/simd_config.h>      // UWB_SIMD_HAVE_AVX2
@@ -472,6 +473,21 @@ void vector_sub3_complex(std::complex<float>* dst,
                          const std::complex<float>* a,
                          const std::complex<float>* b,
                          size_t count);
+
+// Fused dst = a - b with double-precision energy accumulation:
+//   e_a   += sum |a[i]|^2   (read before dst is overwritten)
+//   e_dst += sum |dst[i]|^2
+// Supports dst == a in place.  `dst[i]` is bit-identical to vector_sub3_complex
+// (no FMA reassociation), and NaN/Inf propagate into the energies so a caller
+// can detect a non-finite reconstruction with std::isfinite(e_dst).  The
+// output references are overwritten on entry.  Used by the SIC transactional
+// subtraction so the ROI energies cost no second pass over the buffers.
+UWB_API void vector_sub3_energy_complex(std::complex<float>* dst,
+                                        const std::complex<float>* a,
+                                        const std::complex<float>* b,
+                                        size_t count,
+                                        double& e_a,
+                                        double& e_dst);
 
 #if UWB_RXOPT_HAVE_AVX2
 __attribute__((target("avx2")))

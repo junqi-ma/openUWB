@@ -16,6 +16,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,22 @@ SicUnifiedTemplates make_templates(const TestPacket& p)
     t.preamble = p.wave.data();
     t.preamble_len = p.wave.size();
     return t;
+}
+
+// Deterministic low-level noise window (no packet).  Used to drive the real
+// L0 bypass path without relying on a data fixture.
+std::vector<cf> make_noise_window(size_t n, uint32_t seed)
+{
+    std::vector<cf> y(n);
+    uint32_t s = seed;
+    auto next = [&s]() {
+        s = s * 1664525u + 1013904223u;
+        return (static_cast<float>((s >> 8) & 0xffffu) / 65536.f - 0.5f) * 0.4f;
+    };
+    for (size_t i = 0; i < n; ++i) {
+        y[i] = cf(next(), next());
+    }
+    return y;
 }
 
 } // namespace
@@ -720,6 +737,245 @@ BOOST_AUTO_TEST_CASE(test_simd_roi_energy_reduction)
     double e_out_nan = 0.0;
     compute_roi_energies(y.data(), out.data(), 0, 100, e_y_nan, e_out_nan);
     BOOST_CHECK(!std::isfinite(e_y_nan));
+}
+
+BOOST_AUTO_TEST_CASE(test_l2_inplace_fused_energy_and_subtimings)
+{
+    TestPacket p(10, 32);
+    SicUnifiedTemplates t = make_templates(p);
+
+    const size_t q = 300;
+    const size_t n = p.wave.size() + 1000;
+    std::vector<cf> y(n, cf(0.f, 0.f));
+    std::copy(p.wave.begin(), p.wave.end(), y.begin() + q);
+
+    SicUnifiedConfig cfg;
+    cfg.policy = SicPolicy::FullPacket;
+    cfg.backend = SicEstimatorBackend::Ipatov;
+    cfg.sparse_pulse_reconstruct = true;
+    cfg.comm_code = 10;
+    cfg.samples_per_symbol = kSps;
+    cfg.sample_rate = kFs;
+    cfg.roi_lo = q - 32;
+    cfg.roi_hi = q + 32;
+    cfg.sub_roi_lo = q;
+    cfg.sub_roi_hi = q + p.wave.size();
+    cfg.max_window_samples = n;
+    cfg.max_packet_samples = n;
+
+    SicUnifiedScratch scratch;
+    BOOST_REQUIRE(prepare_sic_unified(cfg, t, scratch));
+
+    // Reference: out-of-place, no i_hat (same backend path as the live path).
+    std::vector<cf> out(n);
+    SicUnifiedResult ref;
+    ref.out = out.data();
+    ref.i_hat = nullptr;
+    BOOST_REQUIRE(sic_process_unified(y.data(), n, t, cfg, scratch, ref));
+    BOOST_REQUIRE(ref.committed);
+    BOOST_CHECK_EQUAL(static_cast<uint8_t>(ref.level),
+                      static_cast<uint8_t>(SicCancellationLevel::L2_FullPacket));
+    // L2 convolution time must be attributed, no longer a hard 0.0.
+    BOOST_CHECK_GT(ref.timings.recon_conv_us, 0.0);
+    BOOST_CHECK_GT(ref.timings.recon_scale_us, 0.0);
+    BOOST_CHECK_GT(ref.suppression_db, 20.0);
+    // The fused subtraction pass measured the ROI energies: y must NOT be
+    // re-read afterwards.
+    BOOST_CHECK(ref.suppression_energy_valid);
+
+    // In-place: out == y.  The fused energies were accumulated before the
+    // write-back, so the metric must equal the out-of-place one and the output
+    // window must match sample for sample inside the subtraction ROI.
+    std::vector<cf> y_copy = y;
+    SicUnifiedResult inplace;
+    inplace.out = y_copy.data();
+    inplace.i_hat = nullptr;
+    inplace.copy_out_on_bypass = false;
+    BOOST_REQUIRE(sic_process_unified(y.data(), n, t, cfg, scratch, inplace));
+    BOOST_REQUIRE(inplace.committed);
+    BOOST_CHECK_EQUAL(static_cast<uint8_t>(inplace.level),
+                      static_cast<uint8_t>(SicCancellationLevel::L2_FullPacket));
+    BOOST_CHECK(inplace.suppression_energy_valid);
+    BOOST_CHECK_GT(inplace.suppression_db, 20.0);
+    BOOST_CHECK_LT(std::abs(inplace.suppression_db - ref.suppression_db), 1e-4);
+    BOOST_REQUIRE(inplace.sub_hi > inplace.sub_lo);
+    for (int64_t j = inplace.sub_lo; j < inplace.sub_hi; ++j) {
+        BOOST_CHECK_LT(std::abs(y_copy[static_cast<size_t>(j)] -
+                                out[static_cast<size_t>(j)]),
+                       1e-6f);
+    }
+    // Outside the ROI the in-place window is the untouched input.
+    for (int64_t j = 0; j < inplace.sub_lo; ++j) {
+        BOOST_CHECK_EQUAL(y_copy[static_cast<size_t>(j)], y[static_cast<size_t>(j)]);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_inplace_l0_bypass_leaves_input_byte_identical)
+{
+    TestPacket p(10, 32);
+    SicUnifiedTemplates t = make_templates(p);
+
+    const size_t n = 65536;
+    const std::vector<cf> y = make_noise_window(n, 0x5eed1234u);
+
+    SicUnifiedConfig cfg;
+    cfg.policy = SicPolicy::AutoFallback;
+    cfg.backend = SicEstimatorBackend::Ipatov;
+    cfg.sparse_pulse_reconstruct = true;
+    cfg.comm_code = 10;
+    cfg.samples_per_symbol = kSps;
+    cfg.sample_rate = kFs;
+    // Pure noise must not be acquired as a packet.
+    cfg.detect_threshold = 0.90;
+    cfg.roi_lo = 0;
+    cfg.roi_hi = static_cast<int64_t>(n);
+    cfg.sub_roi_lo = 0;
+    cfg.sub_roi_hi = static_cast<int64_t>(n);
+    cfg.max_window_samples = n;
+    cfg.max_packet_samples = n;
+
+    SicUnifiedScratch scratch;
+    BOOST_REQUIRE(prepare_sic_unified(cfg, t, scratch));
+
+    std::vector<cf> y_copy = y;
+    SicUnifiedResult res;
+    res.out = y_copy.data();
+    res.i_hat = nullptr;
+    res.copy_out_on_bypass = false;
+
+    BOOST_REQUIRE(sic_process_unified(y.data(), n, t, cfg, scratch, res));
+
+    BOOST_CHECK(!res.committed);
+    BOOST_CHECK_EQUAL(static_cast<uint8_t>(res.level),
+                      static_cast<uint8_t>(SicCancellationLevel::L0_Bypass));
+    BOOST_CHECK_EQUAL(res.suppression_db, 0.0);
+    BOOST_CHECK(!res.suppression_energy_valid);
+    // In-place L0 must never touch the caller's window.
+    BOOST_CHECK_EQUAL(std::memcmp(y_copy.data(), y.data(), n * sizeof(cf)), 0);
+}
+
+BOOST_AUTO_TEST_CASE(test_auto_fallback_l2_truncated_retries_l1)
+{
+    TestPacket p(10, 32);
+    SicUnifiedTemplates t = make_templates(p);
+
+    const size_t q = 300;
+    // A wide CIR hull (128 taps) places the full-packet support at
+    // support_hi = q + lag_lo + tap_count + packet_samples, past the window,
+    // while the received packet itself is complete (the comm demod needs some
+    // trailing samples) and the much shorter SYNC + SFD preamble still fits.
+    // AutoFallback must therefore retry at L1 instead of bypassing.
+    const size_t pad = 64;
+    const size_t n = q + p.wave.size() + pad;
+    std::vector<cf> y(n, cf(0.f, 0.f));
+    std::copy(p.wave.begin(), p.wave.end(), y.begin() + q);
+
+    SicUnifiedConfig cfg;
+    cfg.policy = SicPolicy::AutoFallback;
+    cfg.backend = SicEstimatorBackend::Ipatov;
+    cfg.sparse_pulse_reconstruct = true;
+    cfg.comm_code = 10;
+    cfg.samples_per_symbol = kSps;
+    cfg.sample_rate = kFs;
+    cfg.tap_count = 128;
+    cfg.roi_lo = q - 32;
+    cfg.roi_hi = q + 32;
+    cfg.sub_roi_lo = q;
+    cfg.sub_roi_hi = static_cast<int64_t>(n);
+    cfg.max_window_samples = n;
+    cfg.max_packet_samples = n;
+
+    SicUnifiedScratch scratch;
+    BOOST_REQUIRE(prepare_sic_unified(cfg, t, scratch));
+
+    std::vector<cf> out(n);
+    SicUnifiedResult res;
+    res.out = out.data();
+    res.i_hat = nullptr;
+    BOOST_REQUIRE(sic_process_unified(y.data(), n, t, cfg, scratch, res));
+
+    BOOST_REQUIRE_MESSAGE(res.committed,
+                          "reason=" << (res.reason ? res.reason : "null"));
+    BOOST_CHECK_EQUAL(static_cast<uint8_t>(res.level),
+                      static_cast<uint8_t>(SicCancellationLevel::L1_Preamble));
+    BOOST_REQUIRE(res.fallback_reason != nullptr);
+    BOOST_CHECK_EQUAL(std::string(res.fallback_reason), "l2_context_truncated");
+    BOOST_CHECK_EQUAL(std::string(res.reason), "committed_preamble_sparse_pulse");
+    BOOST_CHECK_GT(res.suppression_db, 15.0);
+    BOOST_CHECK(res.sub_hi <= static_cast<int64_t>(n));
+
+    // Opt-in clipping keeps the same window eligible for a direct L2
+    // transaction instead of the L1 downgrade.
+    cfg.policy = SicPolicy::FullPacket;
+    cfg.allow_partial_window_clip = true;
+    BOOST_REQUIRE(prepare_sic_unified(cfg, t, scratch));
+    SicUnifiedResult clipped;
+    clipped.out = out.data();
+    clipped.i_hat = nullptr;
+    BOOST_REQUIRE(sic_process_unified(y.data(), n, t, cfg, scratch, clipped));
+    BOOST_REQUIRE_MESSAGE(clipped.committed,
+                          "reason=" << (clipped.reason ? clipped.reason : "null"));
+    BOOST_CHECK_EQUAL(static_cast<uint8_t>(clipped.level),
+                      static_cast<uint8_t>(SicCancellationLevel::L2_FullPacket));
+    BOOST_CHECK(clipped.sub_hi <= static_cast<int64_t>(n));
+    BOOST_CHECK_GT(clipped.suppression_db, 20.0);
+}
+
+BOOST_AUTO_TEST_CASE(test_path_fractional_validate_threshold_forwarded)
+{
+    TestPacket p(10, 32);
+    SicUnifiedTemplates t = make_templates(p);
+
+    const size_t q = 300;
+    const size_t n = p.wave.size() + 1000;
+    std::vector<cf> y(n, cf(0.f, 0.f));
+    std::copy(p.wave.begin(), p.wave.end(), y.begin() + q);
+
+    SicUnifiedConfig cfg;
+    cfg.policy = SicPolicy::PreambleOnly;
+    cfg.backend = SicEstimatorBackend::PathFractional;
+    cfg.comm_code = 10;
+    cfg.samples_per_symbol = kSps;
+    cfg.sample_rate = kFs;
+    cfg.roi_lo = q - 32;
+    cfg.roi_hi = q + 32;
+    cfg.sub_roi_lo = q;
+    cfg.sub_roi_hi = q + 64 * kSps;
+    cfg.max_window_samples = n;
+    cfg.max_packet_samples = n;
+
+    SicUnifiedScratch scratch;
+    BOOST_REQUIRE(prepare_sic_unified(cfg, t, scratch));
+
+    std::vector<cf> out(n);
+    std::vector<cf> i_hat(n);
+
+    // Default SicUnifiedConfig::validate_threshold must reach SicConfig.
+    SicUnifiedResult res;
+    res.out = out.data();
+    res.i_hat = i_hat.data();
+    BOOST_REQUIRE(sic_process_unified(y.data(), n, t, cfg, scratch, res));
+    BOOST_CHECK_MESSAGE(
+        !(res.reason && std::strcmp(res.reason, "uncalibrated_validate_threshold") == 0),
+        "reason=" << (res.reason ? res.reason : "null"));
+    BOOST_CHECK_MESSAGE(
+        !(res.channel.reason &&
+          std::strcmp(res.channel.reason, "uncalibrated_validate_threshold") == 0),
+        "channel.reason=" << (res.channel.reason ? res.channel.reason : "null"));
+    BOOST_REQUIRE_MESSAGE(res.committed,
+                          "reason=" << (res.reason ? res.reason : "null"));
+    BOOST_CHECK_EQUAL(std::string(res.reason), "committed_preamble_fractional");
+
+    // Disabling the gate explicitly must still be rejected: proves the fix is
+    // the forwarded default, not a removed calibration check.
+    cfg.validate_threshold = 0.0;
+    SicUnifiedResult uncal;
+    uncal.out = out.data();
+    uncal.i_hat = i_hat.data();
+    BOOST_REQUIRE(sic_process_unified(y.data(), n, t, cfg, scratch, uncal));
+    BOOST_CHECK(!uncal.committed);
+    BOOST_REQUIRE(uncal.reason != nullptr);
+    BOOST_CHECK_EQUAL(std::string(uncal.reason), "uncalibrated_validate_threshold");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -573,4 +573,92 @@ BOOST_AUTO_TEST_CASE(repeated_sic_windows_have_no_state_residue)
     }
 }
 
+BOOST_AUTO_TEST_CASE(inplace_l2_collision_reports_fused_suppression)
+{
+    const auto mixed = make_mixed_window(0x789au, 6.0f);
+    const auto profile = target_profile();
+    auto options = make_sic_options(sic::SicPolicy::FullPacket);
+    attach_sic_templates(options);
+    live::PacketProcessor processor(rx_taps(), reference_sync(), 450000,
+                                    std::move(options));
+
+    const auto req = request_at(mixed.target_work, 401);
+    const auto r = processor.process(req, mixed.native.data(),
+                                     mixed.native.size(), profile, false);
+    BOOST_TEST_MESSAGE("in-place L2 level=" << int(r.sic_level)
+                       << " reason=" << r.sic_reason
+                       << " suppression_db=" << r.sic_suppression_db
+                       << " fcs=" << r.decoded.payload.fcs_pass);
+    BOOST_REQUIRE(r.sic_executed);
+    BOOST_REQUIRE(r.sic_ok);
+    BOOST_REQUIRE(r.sic_committed);
+    BOOST_CHECK_EQUAL(int(r.sic_level),
+                      int(sic::SicCancellationLevel::L2_FullPacket));
+    // In-place subtraction (out == work_) must measure suppression from the
+    // fused subtraction energies.  Re-reading the already-subtracted window
+    // would report ~0 dB.
+    BOOST_CHECK_GT(r.sic_suppression_db, 10.0);
+    BOOST_REQUIRE(decoded_ok(r.decoded));
+    BOOST_CHECK(r.decoded.payload.bytes == mixed.target_wire);
+
+    // The in-place buffer is re-derived per call: an identical repeated window
+    // must reproduce the same decode with no SIC residue.
+    const auto r2 = processor.process(req, mixed.native.data(),
+                                      mixed.native.size(), profile, false);
+    BOOST_REQUIRE(r2.sic_committed);
+    BOOST_CHECK_EQUAL(int(r2.sic_level),
+                      int(sic::SicCancellationLevel::L2_FullPacket));
+    require_same_decode(r.decoded, r2.decoded);
+}
+
+BOOST_AUTO_TEST_CASE(inplace_sic_alternating_clean_and_collision_windows)
+{
+    const auto profile = target_profile();
+    auto options = make_sic_options(sic::SicPolicy::AutoFallback);
+    attach_sic_templates(options);
+    live::PacketProcessor processor(rx_taps(), reference_sync(), 450000,
+                                    std::move(options));
+    live::PacketProcessor baseline(rx_taps(), reference_sync(), 450000);
+
+    unsigned clean_fcs = 0;
+    unsigned collision_fcs = 0;
+    for (uint32_t k = 0; k < 4; ++k) {
+        // No interferer: SIC runs but must fail open in place (L0), leaving the
+        // resampled window byte-identical to the --sic off baseline decode.
+        const auto clean = make_target_only_native(0x7a00u + k);
+        const auto clean_req = request_at(4096, 500 + k);
+        const auto cr = processor.process(clean_req, clean.data(), clean.size(),
+                                          profile, false);
+        BOOST_REQUIRE_MESSAGE(cr.sic_executed, "clean packet " << k
+                            << " SIC did not run");
+        BOOST_CHECK_EQUAL(int(cr.sic_level),
+                          int(sic::SicCancellationLevel::L0_Bypass));
+        BOOST_CHECK_EQUAL(cr.sic_suppression_db, 0.0);
+        const auto cb = baseline.process(clean_req, clean.data(), clean.size(),
+                                         profile, false);
+        require_same_decode(cb.decoded, cr.decoded);
+        if (decoded_ok(cr.decoded)) {
+            ++clean_fcs;
+        }
+
+        // Strong collision: the same in-place transaction must commit and
+        // recover the target payload.
+        const auto mixed = make_mixed_window(0x7a00u + k, 6.0f);
+        const auto mixed_req = request_at(mixed.target_work, 600 + k);
+        const auto mr = processor.process(mixed_req, mixed.native.data(),
+                                          mixed.native.size(), profile, false);
+        BOOST_REQUIRE_MESSAGE(mr.sic_ok, "collision packet " << k
+                            << " SIC failed: " << mr.sic_reason);
+        BOOST_REQUIRE_MESSAGE(mr.sic_committed, "collision packet " << k
+                            << " SIC did not commit");
+        if (decoded_ok(mr.decoded) && mr.decoded.payload.bytes == mixed.target_wire) {
+            ++collision_fcs;
+        }
+    }
+    // 4/4 clean and 4/4 collision FCS: no PRR change from the in-place path and
+    // no state carried between windows.
+    BOOST_CHECK_EQUAL(clean_fcs, 4u);
+    BOOST_CHECK_EQUAL(collision_fcs, 4u);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

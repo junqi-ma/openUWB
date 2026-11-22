@@ -1781,6 +1781,135 @@ build_sfd_template(const std::vector<std::complex<float>>& template_wf,
     openuwb::core::uwb_l2_normalize(out);
 }
 
+namespace {
+
+#if UWB_RXOPT_HAVE_AVX2
+// Local AVX2 three-operand subtract.  Sixteen complex samples per iteration
+// (4 x 256-bit) plus one 256-bit register and a scalar tail.  Both sources are
+// loaded before dst is stored, so dst == a stays safe.
+__attribute__((target("avx2")))
+void vector_sub3_complex_avx2(std::complex<float>* dst,
+                              const std::complex<float>* a,
+                              const std::complex<float>* b, size_t count)
+{
+    float* d = reinterpret_cast<float*>(dst);
+    const float* pa = reinterpret_cast<const float*>(a);
+    const float* pb = reinterpret_cast<const float*>(b);
+    size_t i = 0;
+    const size_t limit16 = count & ~size_t(15);
+    for (; i < limit16; i += 16) {
+        const __m256 a0 = _mm256_loadu_ps(pa + 2 * i);
+        const __m256 a1 = _mm256_loadu_ps(pa + 2 * i + 8);
+        const __m256 a2 = _mm256_loadu_ps(pa + 2 * i + 16);
+        const __m256 a3 = _mm256_loadu_ps(pa + 2 * i + 24);
+        const __m256 b0 = _mm256_loadu_ps(pb + 2 * i);
+        const __m256 b1 = _mm256_loadu_ps(pb + 2 * i + 8);
+        const __m256 b2 = _mm256_loadu_ps(pb + 2 * i + 16);
+        const __m256 b3 = _mm256_loadu_ps(pb + 2 * i + 24);
+        _mm256_storeu_ps(d + 2 * i, _mm256_sub_ps(a0, b0));
+        _mm256_storeu_ps(d + 2 * i + 8, _mm256_sub_ps(a1, b1));
+        _mm256_storeu_ps(d + 2 * i + 16, _mm256_sub_ps(a2, b2));
+        _mm256_storeu_ps(d + 2 * i + 24, _mm256_sub_ps(a3, b3));
+    }
+    for (; i + 4 <= count; i += 4) {
+        const __m256 va = _mm256_loadu_ps(pa + 2 * i);
+        const __m256 vb = _mm256_loadu_ps(pb + 2 * i);
+        _mm256_storeu_ps(d + 2 * i, _mm256_sub_ps(va, vb));
+    }
+    for (; i < count; ++i)
+        dst[i] = a[i] - b[i];
+}
+
+// Fused AVX2 dst = a - b + double energies.  Eight complex samples per
+// iteration (2 x 256-bit loads = four 128-bit halves per energy), four
+// independent __m256d accumulators per energy -- the same structure as
+// compute_roi_energies() in lib/sic/uwb_sic_unified.cc.  Squares are formed in
+// float and widened to double, matching that reference and the AVX-512 kernel.
+__attribute__((target("avx2")))
+void vector_sub3_energy_complex_avx2(std::complex<float>* dst,
+                                     const std::complex<float>* a,
+                                     const std::complex<float>* b,
+                                     size_t count, double& e_a,
+                                     double& e_dst)
+{
+    float* d = reinterpret_cast<float*>(dst);
+    const float* pa = reinterpret_cast<const float*>(a);
+    const float* pb = reinterpret_cast<const float*>(b);
+
+    __m256d ea0 = _mm256_setzero_pd();
+    __m256d ea1 = _mm256_setzero_pd();
+    __m256d ea2 = _mm256_setzero_pd();
+    __m256d ea3 = _mm256_setzero_pd();
+    __m256d ed0 = _mm256_setzero_pd();
+    __m256d ed1 = _mm256_setzero_pd();
+    __m256d ed2 = _mm256_setzero_pd();
+    __m256d ed3 = _mm256_setzero_pd();
+
+    size_t i = 0;
+    const size_t limit8 = count & ~size_t(7);
+    for (; i < limit8; i += 8) {
+        // Load a before overwriting dst, so dst == a is safe.
+        const __m256 va0 = _mm256_loadu_ps(pa + 2 * i);
+        const __m256 va1 = _mm256_loadu_ps(pa + 2 * i + 8);
+        const __m256 vb0 = _mm256_loadu_ps(pb + 2 * i);
+        const __m256 vb1 = _mm256_loadu_ps(pb + 2 * i + 8);
+        const __m256 vd0 = _mm256_sub_ps(va0, vb0);
+        const __m256 vd1 = _mm256_sub_ps(va1, vb1);
+        _mm256_storeu_ps(d + 2 * i, vd0);
+        _mm256_storeu_ps(d + 2 * i + 8, vd1);
+
+        const __m256 sa0 = _mm256_mul_ps(va0, va0);
+        const __m256 sa1 = _mm256_mul_ps(va1, va1);
+        const __m256 sd0 = _mm256_mul_ps(vd0, vd0);
+        const __m256 sd1 = _mm256_mul_ps(vd1, vd1);
+
+        ea0 = _mm256_add_pd(
+            ea0, _mm256_cvtps_pd(_mm256_castps256_ps128(sa0)));
+        ea1 = _mm256_add_pd(
+            ea1, _mm256_cvtps_pd(_mm256_extractf128_ps(sa0, 1)));
+        ea2 = _mm256_add_pd(
+            ea2, _mm256_cvtps_pd(_mm256_castps256_ps128(sa1)));
+        ea3 = _mm256_add_pd(
+            ea3, _mm256_cvtps_pd(_mm256_extractf128_ps(sa1, 1)));
+
+        ed0 = _mm256_add_pd(
+            ed0, _mm256_cvtps_pd(_mm256_castps256_ps128(sd0)));
+        ed1 = _mm256_add_pd(
+            ed1, _mm256_cvtps_pd(_mm256_extractf128_ps(sd0, 1)));
+        ed2 = _mm256_add_pd(
+            ed2, _mm256_cvtps_pd(_mm256_castps256_ps128(sd1)));
+        ed3 = _mm256_add_pd(
+            ed3, _mm256_cvtps_pd(_mm256_extractf128_ps(sd1, 1)));
+    }
+
+    alignas(32) double buf[4];
+    _mm256_storeu_pd(buf, _mm256_add_pd(_mm256_add_pd(ea0, ea1),
+                                        _mm256_add_pd(ea2, ea3)));
+    double sum_a = buf[0] + buf[1] + buf[2] + buf[3];
+    _mm256_storeu_pd(buf, _mm256_add_pd(_mm256_add_pd(ed0, ed1),
+                                        _mm256_add_pd(ed2, ed3)));
+    double sum_dst = buf[0] + buf[1] + buf[2] + buf[3];
+
+    for (; i < count; ++i) {
+        const float ar = pa[2 * i];
+        const float ai = pa[2 * i + 1];
+        const float dr = ar - pb[2 * i];
+        const float di = ai - pb[2 * i + 1];
+        d[2 * i] = dr;
+        d[2 * i + 1] = di;
+        sum_a += static_cast<double>(ar * ar) +
+                 static_cast<double>(ai * ai);
+        sum_dst += static_cast<double>(dr * dr) +
+                   static_cast<double>(di * di);
+    }
+
+    e_a = sum_a;
+    e_dst = sum_dst;
+}
+#endif
+
+} // namespace
+
 void vector_accumulate_complex(std::complex<float>* dst,
                                const std::complex<float>* src,
                                size_t count)
@@ -1838,8 +1967,56 @@ void vector_sub3_complex(std::complex<float>* dst,
         return;
     }
 #endif
+#if UWB_RXOPT_HAVE_AVX2
+    if (has_avx2_fma()) {
+        vector_sub3_complex_avx2(dst, a, b, count);
+        return;
+    }
+#endif
     for (size_t m = 0; m < count; ++m)
         dst[m] = a[m] - b[m];
+}
+
+void vector_sub3_energy_complex(std::complex<float>* dst,
+                                const std::complex<float>* a,
+                                const std::complex<float>* b, size_t count,
+                                double& e_a, double& e_dst)
+{
+    // Overwrite (never accumulate into) the caller's energies on entry.
+    e_a = 0.0;
+    e_dst = 0.0;
+    if (count == 0)
+        return;
+#if UWB_SIMD_HAVE_AVX512
+    if (use_avx512(openuwb::core::simd::KernelGroup::Sync)) {
+        openuwb::core::simd::avx512::sub3_energy_cf32(dst, a, b, count, &e_a,
+                                                      &e_dst);
+        return;
+    }
+#endif
+#if UWB_RXOPT_HAVE_AVX2
+    if (has_avx2_fma()) {
+        vector_sub3_energy_complex_avx2(dst, a, b, count, e_a, e_dst);
+        return;
+    }
+#endif
+    // Scalar double fallback: float squares widened to double, NaN/Inf
+    // propagate through the IEEE default so isfinite(e_dst) still fails.
+    double sum_a = 0.0;
+    double sum_dst = 0.0;
+    for (size_t m = 0; m < count; ++m) {
+        const float ar = a[m].real();
+        const float ai = a[m].imag();
+        const float dr = ar - b[m].real();
+        const float di = ai - b[m].imag();
+        dst[m] = std::complex<float>(dr, di);
+        sum_a += static_cast<double>(ar * ar) +
+                 static_cast<double>(ai * ai);
+        sum_dst += static_cast<double>(dr * dr) +
+                   static_cast<double>(di * di);
+    }
+    e_a = sum_a;
+    e_dst = sum_dst;
 }
 
 void vector_accumulate_scaled_complex(std::complex<float>* dst,

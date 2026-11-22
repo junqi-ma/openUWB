@@ -238,6 +238,68 @@ UWB_DS_AVX512_TARGET void sub3_cf32(gr_complex* dst, const gr_complex* a,
             reinterpret_cast<const float*>(b), 2 * count);
 }
 
+UWB_DS_AVX512_TARGET void sub3_energy_cf32(gr_complex* dst, const gr_complex* a,
+                                           const gr_complex* b, size_t count,
+                                           double* e_a_out, double* e_dst_out)
+{
+    // Four independent 512-bit double chains (two per energy) keep the
+    // convert/add latency off the critical path.  Squares are evaluated in
+    // float -- matching the AVX2 reference and compute_roi_energies() -- and
+    // widened to double before the accumulation, so each energy is a
+    // double-precision sum of float squares.  The subtraction itself is the
+    // plain element-wise _mm512_sub_ps, so every stored sample is bit-
+    // identical to sub3_cf32().
+    __m512d ea0 = _mm512_setzero_pd();
+    __m512d ea1 = _mm512_setzero_pd();
+    __m512d ed0 = _mm512_setzero_pd();
+    __m512d ed1 = _mm512_setzero_pd();
+
+    const float* pa = reinterpret_cast<const float*>(a);
+    const float* pb = reinterpret_cast<const float*>(b);
+    float* pd = reinterpret_cast<float*>(dst);
+
+    size_t i = 0;
+    const size_t limit = count & ~size_t(7);
+    for (; i < limit; i += 8) {
+        // Both sources are loaded before dst is stored, so dst == a is safe.
+        const __m512 va = _mm512_loadu_ps(pa + 2 * i);
+        const __m512 vb = _mm512_loadu_ps(pb + 2 * i);
+        const __m512 vd = _mm512_sub_ps(va, vb);
+        _mm512_storeu_ps(pd + 2 * i, vd);
+
+        const __m512 sa = _mm512_mul_ps(va, va);
+        const __m512 sd = _mm512_mul_ps(vd, vd);
+        ea0 = _mm512_add_pd(ea0,
+                            _mm512_cvtps_pd(_mm512_castps512_ps256(sa)));
+        ea1 = _mm512_add_pd(ea1,
+                            _mm512_cvtps_pd(_mm512_extractf32x8_ps(sa, 1)));
+        ed0 = _mm512_add_pd(ed0,
+                            _mm512_cvtps_pd(_mm512_castps512_ps256(sd)));
+        ed1 = _mm512_add_pd(ed1,
+                            _mm512_cvtps_pd(_mm512_extractf32x8_ps(sd, 1)));
+    }
+
+    double e_a = _mm512_reduce_add_pd(_mm512_add_pd(ea0, ea1));
+    double e_dst = _mm512_reduce_add_pd(_mm512_add_pd(ed0, ed1));
+
+    // Scalar double tail (count % 8), same float-square contract.
+    for (; i < count; ++i) {
+        const float ar = pa[2 * i];
+        const float ai = pa[2 * i + 1];
+        const float dr = ar - pb[2 * i];
+        const float di = ai - pb[2 * i + 1];
+        pd[2 * i] = dr;
+        pd[2 * i + 1] = di;
+        e_a += static_cast<double>(ar * ar) + static_cast<double>(ai * ai);
+        e_dst += static_cast<double>(dr * dr) + static_cast<double>(di * di);
+    }
+
+    if (e_a_out)
+        *e_a_out = e_a;
+    if (e_dst_out)
+        *e_dst_out = e_dst;
+}
+
 UWB_DS_AVX512_TARGET void scale_cf32(gr_complex* dst, float scale,
                                      size_t count)
 {

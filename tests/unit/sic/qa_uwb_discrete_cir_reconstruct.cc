@@ -261,6 +261,67 @@ struct TransactionRig {
     }
 };
 
+// Sparse-pulse rig: a unit-impulse packet (External pulse {1, 0}) plus the
+// Ipatov scratch the sparse reconstruction consumes.  `events` is a stable
+// copy because modulate_pulse_list() returns a view into the modulator
+// scratch.
+struct SparseRig {
+    std::vector<uint8_t> wire;
+    mod::HrpModConfig unit;
+    mod::HrpModScratch ms;
+    mod::PulseList pl;
+    std::vector<mod::PulseEvent> events;
+    std::vector<cf> unit_wave; // the same packet as a real unit-impulse waveform
+    size_t n = 0;
+    int64_t q = 2048;
+    sic::DiscreteCirScratch scratch;
+
+    explicit SparseRig(size_t wire_len = 30, uint32_t seed = 909)
+    {
+        wire = mod::make_random_psdu(wire_len, seed, true);
+        unit.code_index = 10;
+        unit.sync_repetitions = 64;
+        unit.sfd_mode = "4z2";
+        unit.peak_amplitude = 1.f;
+        unit.pulse.shape = mod::PulseShape::External;
+        unit.pulse.external_n_taps = 2;
+        unit.external_taps = { 1.f, 0.f };
+        const size_t cap = 300000;
+        ms.reserve(127, cap);
+        BOOST_REQUIRE(
+            mod::modulate_pulse_list(wire.data(), wire.size(), unit, ms, cap, pl));
+        events.assign(pl.events, pl.events + pl.count);
+        pl.events = events.data();
+        n = pl.packet_samples + 4096;
+        unit_wave.assign(pl.packet_samples, cf{});
+        for (const auto& e : events)
+            unit_wave[e.sample_offset] = cf(float(e.sign), 0.f);
+        reset_scratch();
+    }
+
+    void reset_scratch()
+    {
+        scratch.reserve(n);
+        scratch.prepared = true;
+        scratch.sps = kSps;
+        scratch.ipatov_correlation = true;
+        scratch.sparse_pulse_reconstruct = true;
+        scratch.impulse_sync.assign(kSps, cf{});
+        const int8_t* code = demod::GetPreambleCode(10);
+        for (size_t c = 0; c < demod::kQm35CodeLength; ++c)
+            scratch.impulse_sync[8 * c] = cf(float(code[c]), 0.f);
+        scratch.max_packet_samples = pl.packet_samples + 64;
+    }
+
+    sic::DiscreteCirModel model(int64_t origin, int64_t lag_lo,
+                                size_t taps) const
+    {
+        sic::DiscreteCirModel m = make_model(origin, lag_lo, taps);
+        m.impulse_template = true;
+        return m;
+    }
+};
+
 } // namespace
 
 BOOST_AUTO_TEST_CASE(discrete_apply_matches_independent_direct_convolution)
@@ -739,154 +800,6 @@ BOOST_AUTO_TEST_CASE(discrete_transaction_length_edges_16_and_127)
     long_rig.expect_bypass();
 }
 
-BOOST_AUTO_TEST_CASE(sparse_pulse_apply_matches_approximate_cfo_reference)
-{
-    auto wire=mod::make_random_psdu(30,909,true);
-    mod::HrpModConfig unit;
-    unit.code_index=10; unit.sync_repetitions=64; unit.sfd_mode="4z2";
-    unit.peak_amplitude=1.f;
-    unit.pulse.shape=mod::PulseShape::External;
-    unit.pulse.external_n_taps=2; unit.external_taps={1.f,0.f};
-    mod::HrpModScratch ms;
-    const size_t cap=300000;
-    ms.reserve(127,cap);
-    mod::PulseList pl;
-    BOOST_REQUIRE(mod::modulate_pulse_list(wire.data(),wire.size(),unit,ms,cap,pl));
-    std::vector<mod::PulseEvent> events(pl.events,pl.events+pl.count);
-    pl.events=events.data();
-
-    const int64_t q=2048;
-    const size_t n=pl.packet_samples+4096;
-    const int8_t* code=demod::GetPreambleCode(10);
-    for (double cfo : {0.0,-50000.0,50000.0}) {
-        sic::DiscreteCirModel m=make_model(q,-2,10);
-        m.impulse_template=true;
-        m.cfo_hz=cfo;
-        set_active(m,{{-2,cf(0.9f,-0.2f)},{0,cf(0.4f,0.25f)},
-                      {7,cf(-0.15f,0.1f)}});
-        sic::DiscreteCirScratch s;
-        s.prepared=true; s.sps=kSps; s.max_window_samples=n;
-        s.ipatov_correlation=true; s.sparse_pulse_reconstruct=true;
-        s.max_packet_samples=pl.packet_samples+64;
-        s.waveform.assign(s.max_packet_samples,cf{});
-        s.scaled_waveform.assign(s.max_packet_samples,cf{});
-        s.accumulator.assign(n,cf{});
-        s.fir_tmp.assign(n,cf{});
-        s.impulse_sync.assign(kSps,cf{});
-        for (size_t c=0;c<demod::kQm35CodeLength;++c)
-            s.impulse_sync[8*c]=cf(float(code[c]),0.f);
-
-        std::vector<cf> y(n,cf(0.01f,-0.02f)),out(n),ihat(n);
-        sic::DiscreteCirResult r;
-        BOOST_REQUIRE_MESSAGE(sic::apply_discrete_cir_pulses(
-                                  y.data(),n,pl,s.impulse_sync.data(),
-                                  s.impulse_sync.size(),m,0,int64_t(n),s,
-                                  out.data(),ihat.data(),&r),
-                              r.reason);
-        BOOST_CHECK(r.committed);
-        BOOST_CHECK_EQUAL(std::string(r.reason),"committed");
-        BOOST_CHECK_EQUAL(r.cfo_us,0.0);
-        BOOST_CHECK_EQUAL(r.pulse_event_count,pl.count);
-        BOOST_CHECK_EQUAL(r.pulse_packet_samples,pl.packet_samples);
-
-        // Independent double scalar implementation of the approximate form
-        // c_i = sign_i*exp(j*w*(q+m_i-anchor)); yhat[q+m_i+lag] += c_i*taps.
-        std::vector<cd> want(n,cd{});
-        const double omega=2.0*kPi*cfo/kWorkRateHz;
-        for (const auto& e : events) {
-            const cd c=double(e.sign)*std::polar(
-                1.0,omega*double(q+int64_t(e.sample_offset)-
-                                 m.phase_reference_sample));
-            for (size_t d=0;d<m.tap_count;++d) {
-                const int64_t j=q+int64_t(e.sample_offset)+m.lag_lo+
-                               int64_t(d);
-                if (j>=0 && j<int64_t(n))
-                    want[static_cast<size_t>(j)] += c*cd(m.taps[d]);
-            }
-        }
-        float worst=0.f;
-        for (size_t j=0;j<n;++j)
-            worst=std::max(worst,std::abs(ihat[j]-cf(want[j])));
-        BOOST_CHECK_LT(worst,2e-5f);
-        const int64_t lo=q+m.lag_lo;
-        const int64_t hi=lo+int64_t(m.tap_count)+int64_t(pl.packet_samples);
-        for (int64_t j=0;j<int64_t(n);++j) {
-            if (j<lo || j>=hi) {
-                BOOST_CHECK_EQUAL(ihat[static_cast<size_t>(j)],cf{});
-            }
-            if (j<lo || j>=hi)
-                BOOST_CHECK_EQUAL(out[static_cast<size_t>(j)],y[static_cast<size_t>(j)]);
-            else
-                BOOST_CHECK_LT(std::abs(out[static_cast<size_t>(j)]-
-                                        (y[static_cast<size_t>(j)]-
-                                         ihat[static_cast<size_t>(j)])),1e-6f);
-        }
-
-        // Optional ihat: the same reconstruction must be produced and the
-        // support flanks outside the consumer ROI must still equal y.
-        std::vector<cf> out_only(n);
-        sic::DiscreteCirResult rn;
-        BOOST_REQUIRE_MESSAGE(sic::apply_discrete_cir_pulses(
-                                  y.data(),n,pl,s.impulse_sync.data(),
-                                  s.impulse_sync.size(),m,0,int64_t(n),s,
-                                  out_only.data(),nullptr,&rn),
-                              rn.reason);
-        BOOST_CHECK(rn.committed);
-        for (int64_t j=0;j<int64_t(n);++j) {
-            const size_t u=static_cast<size_t>(j);
-            if (j<lo || j>=hi)
-                BOOST_CHECK_EQUAL(out_only[u],y[u]);
-            else
-                BOOST_CHECK_LT(std::abs(out_only[u]-
-                                        (y[u]-ihat[u])),1e-6f);
-        }
-    }
-
-    // Representation failures must bypass transactionally.
-    {
-        sic::DiscreteCirModel m=make_model(q,-2,10);
-        m.impulse_template=true;
-        set_active(m,{{0,cf(0.5f,0.0f)}});
-        sic::DiscreteCirScratch s;
-        s.prepared=true; s.sps=kSps; s.max_window_samples=n;
-        s.ipatov_correlation=true; s.sparse_pulse_reconstruct=true;
-        s.impulse_sync.assign(kSps,cf{});
-        for (size_t c=0;c<demod::kQm35CodeLength;++c)
-            s.impulse_sync[8*c]=cf(float(code[c]),0.f);
-        std::vector<cf> y(n,cf(0.02f,0.01f)),out(n),ihat(n);
-        auto check_fail=[&](const mod::PulseList& bad,const char* reason){
-            sic::DiscreteCirResult r;
-            BOOST_CHECK(!sic::apply_discrete_cir_pulses(
-                y.data(),n,bad,s.impulse_sync.data(),s.impulse_sync.size(),
-                m,0,int64_t(n),s,out.data(),ihat.data(),&r));
-            BOOST_CHECK_EQUAL(std::string(r.reason),reason);
-            BOOST_CHECK_EQUAL(std::memcmp(y.data(),out.data(),n*sizeof(cf)),0);
-            BOOST_CHECK_EQUAL(count_nonzero(ihat,0,0),0);
-        };
-        auto duplicate=events;
-        if (duplicate.size()>1) duplicate[1].sample_offset=duplicate[0].sample_offset;
-        mod::PulseList bad{duplicate.data(),duplicate.size(),pl.packet_samples};
-        check_fail(bad,"invalid_pulse_list");
-
-        auto wrong_sync=events;
-        wrong_sync[0].sign=static_cast<int8_t>(-wrong_sync[0].sign);
-        mod::PulseList bad_sync{wrong_sync.data(),wrong_sync.size(),
-                                pl.packet_samples};
-        check_fail(bad_sync,"pulse_template_mismatch");
-
-        auto far=m;
-        far.q=int64_t(n)-1;
-        far.phase_reference_sample=far.q;
-        sic::DiscreteCirResult rf;
-        BOOST_CHECK(!sic::apply_discrete_cir_pulses(
-            y.data(),n,pl,s.impulse_sync.data(),s.impulse_sync.size(),far,
-            0,int64_t(n),s,out.data(),ihat.data(),&rf));
-        BOOST_CHECK_EQUAL(std::string(rf.reason),"context_truncated");
-        BOOST_CHECK_EQUAL(std::memcmp(y.data(),out.data(),n*sizeof(cf)),0);
-        BOOST_CHECK_EQUAL(count_nonzero(ihat,0,0),0);
-    }
-}
-
 BOOST_AUTO_TEST_CASE(discrete_numeric_safety_and_scratch_capacity_bypass)
 {
     ApplyRig rig(4096, 1024);
@@ -1107,86 +1020,566 @@ BOOST_AUTO_TEST_CASE(b1_avoid_out_double_write_and_ihat_semantics)
     BOOST_CHECK_EQUAL(count_nonzero(ihat_fail, 0, 0), 0);
 }
 
+BOOST_AUTO_TEST_CASE(sparse_pulse_apply_matches_exact_cfo_reference)
+{
+    SparseRig rig;
+    const int64_t q = rig.q;
+    const size_t n = rig.n;
+    const std::vector<mod::PulseEvent>& events = rig.events;
+
+    for (double cfo : { 0.0, -50000.0, 50000.0, 100000.0 }) {
+        sic::DiscreteCirModel m = rig.model(q, -2, 10);
+        m.cfo_hz = cfo;
+        set_active(m, { { -2, cf(0.9f, -0.2f) }, { 0, cf(0.4f, 0.25f) },
+                        { 7, cf(-0.15f, 0.1f) } });
+        const int64_t lo = q + m.lag_lo;
+        const int64_t hi =
+            lo + int64_t(m.tap_count) + int64_t(rig.pl.packet_samples);
+
+        std::vector<cf> y(n, cf(0.01f, -0.02f)), out(n), ihat(n);
+        sic::DiscreteCirResult r;
+        BOOST_REQUIRE_MESSAGE(
+            sic::apply_discrete_cir_pulses(
+                y.data(), n, rig.pl, rig.scratch.impulse_sync.data(),
+                rig.scratch.impulse_sync.size(), m, 0, int64_t(n), rig.scratch,
+                out.data(), ihat.data(), &r),
+            r.reason);
+        BOOST_CHECK(r.committed);
+        BOOST_CHECK_EQUAL(std::string(r.reason), "committed");
+        BOOST_CHECK_EQUAL(r.cfo_us, 0.0);
+        BOOST_CHECK_EQUAL(r.pulse_event_count, rig.pl.count);
+        BOOST_CHECK_EQUAL(r.pulse_packet_samples, rig.pl.packet_samples);
+
+        // Independent double oracle of the EXACT discrete model.  Both the
+        // event phase exp(j*w*m_i) and the per-lag phase exp(j*w*l) must be
+        // present; the old approximate form only had exp(j*w*m_i).
+        std::vector<cd> want(n, cd{});
+        const double omega = 2.0 * kPi * cfo / kWorkRateHz;
+        for (const auto& e : events) {
+            const double mph = omega * double(int64_t(e.sample_offset));
+            for (size_t d = 0; d < m.tap_count; ++d) {
+                const int64_t lag = m.lag_lo + int64_t(d);
+                const int64_t j = q + int64_t(e.sample_offset) + lag;
+                if (j >= 0 && j < int64_t(n))
+                    want[static_cast<size_t>(j)] +=
+                        double(e.sign) *
+                        std::polar(1.0, mph + omega * double(lag)) *
+                        cd(m.taps[d]);
+            }
+        }
+        float worst = 0.f;
+        for (size_t j = 0; j < n; ++j)
+            worst = std::max(worst, std::abs(ihat[j] - cf(want[j])));
+        BOOST_CHECK_LT(worst, 2e-5f);
+
+        for (int64_t j = 0; j < int64_t(n); ++j) {
+            const size_t u = static_cast<size_t>(j);
+            if (j < lo || j >= hi) {
+                BOOST_CHECK_EQUAL(ihat[u], cf{});
+                BOOST_CHECK_EQUAL(out[u], y[u]);
+            } else {
+                BOOST_CHECK_LT(std::abs(out[u] - (y[u] - ihat[u])), 1e-6f);
+            }
+        }
+
+        // The L1D tile path must reproduce the full-buffer ihat path
+        // BIT-FOR-BIT (same events, same kernels, same addition order).
+        std::vector<cf> out_only(n);
+        sic::DiscreteCirResult rn;
+        BOOST_REQUIRE_MESSAGE(
+            sic::apply_discrete_cir_pulses(
+                y.data(), n, rig.pl, rig.scratch.impulse_sync.data(),
+                rig.scratch.impulse_sync.size(), m, 0, int64_t(n), rig.scratch,
+                out_only.data(), nullptr, &rn),
+            rn.reason);
+        BOOST_CHECK(rn.committed);
+        BOOST_CHECK_EQUAL(std::memcmp(out_only.data(), out.data(),
+                                      n * sizeof(cf)),
+                          0);
+
+        if (cfo == 100000.0) {
+            // 100 kHz high-CFO regression against the full-waveform path,
+            // which rotates exp(j*w*(j-q)) exactly.  The sparse model must
+            // match to float rounding only: relative L2 residual < 1e-4.
+            std::vector<cf> full_out(n), full_ihat(n);
+            sic::DiscreteCirResult rf;
+            BOOST_REQUIRE_MESSAGE(
+                sic::apply_discrete_cir(
+                    y.data(), n, rig.unit_wave.data(), rig.unit_wave.size(),
+                    rig.scratch.impulse_sync.data(),
+                    rig.scratch.impulse_sync.size(), m, 0, int64_t(n),
+                    rig.scratch, full_out.data(), full_ihat.data(), &rf),
+                rf.reason);
+            BOOST_CHECK(rf.committed);
+            double num = 0.0, den = 0.0;
+            for (int64_t j = lo; j < hi; ++j) {
+                const size_t u = static_cast<size_t>(j);
+                num += std::norm(cd(ihat[u]) - cd(full_ihat[u]));
+                den += std::norm(cd(full_ihat[u]));
+            }
+            BOOST_REQUIRE_GT(den, 0.0);
+            BOOST_CHECK_LT(std::sqrt(num / den), 1e-4);
+        }
+    }
+
+    // Representation failures must bypass transactionally.
+    {
+        sic::DiscreteCirModel m = make_model(q, -2, 10);
+        m.impulse_template = true;
+        set_active(m, { { 0, cf(0.5f, 0.0f) } });
+        std::vector<cf> y(n, cf(0.02f, 0.01f)), out(n), ihat(n);
+        auto check_fail = [&](const mod::PulseList& bad, const char* reason) {
+            sic::DiscreteCirResult r;
+            BOOST_CHECK(!sic::apply_discrete_cir_pulses(
+                y.data(), n, bad, rig.scratch.impulse_sync.data(),
+                rig.scratch.impulse_sync.size(), m, 0, int64_t(n),
+                rig.scratch, out.data(), ihat.data(), &r));
+            BOOST_CHECK_EQUAL(std::string(r.reason), reason);
+            BOOST_CHECK_EQUAL(std::memcmp(y.data(), out.data(), n * sizeof(cf)),
+                              0);
+            BOOST_CHECK_EQUAL(count_nonzero(ihat, 0, 0), 0);
+        };
+        auto duplicate = events;
+        if (duplicate.size() > 1)
+            duplicate[1].sample_offset = duplicate[0].sample_offset;
+        mod::PulseList bad{ duplicate.data(), duplicate.size(),
+                            rig.pl.packet_samples };
+        check_fail(bad, "invalid_pulse_list");
+
+        auto wrong_sync = events;
+        wrong_sync[0].sign = static_cast<int8_t>(-wrong_sync[0].sign);
+        mod::PulseList bad_sync{ wrong_sync.data(), wrong_sync.size(),
+                                 rig.pl.packet_samples };
+        check_fail(bad_sync, "pulse_template_mismatch");
+
+        auto far = m;
+        far.q = int64_t(n) - 1;
+        far.phase_reference_sample = far.q;
+        sic::DiscreteCirResult rf;
+        BOOST_CHECK(!sic::apply_discrete_cir_pulses(
+            y.data(), n, rig.pl, rig.scratch.impulse_sync.data(),
+            rig.scratch.impulse_sync.size(), far, 0, int64_t(n), rig.scratch,
+            out.data(), ihat.data(), &rf));
+        BOOST_CHECK_EQUAL(std::string(rf.reason), "context_truncated");
+        BOOST_CHECK_EQUAL(std::memcmp(y.data(), out.data(), n * sizeof(cf)), 0);
+        BOOST_CHECK_EQUAL(count_nonzero(ihat, 0, 0), 0);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(b2_b3_sparse_pulse_avx2_fma_20tap_and_fallback_parity)
 {
-    auto wire = mod::make_random_psdu(30, 909, true);
-    mod::HrpModConfig unit;
-    unit.code_index = 10;
-    unit.sync_repetitions = 64;
-    unit.sfd_mode = "4z2";
-    unit.peak_amplitude = 1.f;
-    unit.pulse.shape = mod::PulseShape::External;
-    unit.pulse.external_n_taps = 2;
-    unit.external_taps = { 1.f, 0.f };
-    mod::HrpModScratch ms;
-    const size_t cap = 300000;
-    ms.reserve(127, cap);
-    mod::PulseList pl;
-    BOOST_REQUIRE(mod::modulate_pulse_list(wire.data(), wire.size(), unit, ms, cap, pl));
-    std::vector<mod::PulseEvent> events(pl.events, pl.events + pl.count);
-    pl.events = events.data();
-
-    const int64_t q = 2048;
-    const size_t n = pl.packet_samples + 4096;
-    const int8_t* code = demod::GetPreambleCode(10);
-
-    sic::DiscreteCirScratch s;
-    s.reserve(n);
-    s.prepared = true;
-    s.sps = kSps;
-    s.ipatov_correlation = true;
-    s.sparse_pulse_reconstruct = true;
-    s.impulse_sync.assign(kSps, cf{});
-    for (size_t c = 0; c < demod::kQm35CodeLength; ++c)
-        s.impulse_sync[8 * c] = cf(float(code[c]), 0.f);
-
+    SparseRig rig;
+    const int64_t q = rig.q;
+    const size_t n = rig.n;
     std::vector<cf> y(n, cf(0.01f, -0.02f));
 
-    // Test both 20-tap (B3 fast path) and 19-tap (generic fallback)
-    for (size_t tap_count : { 20UL, 19UL }) {
+    // 20 taps keeps the fully unrolled register-resident fast path; every
+    // other width must use the generic AVX2+FMA kernels instead of silently
+    // falling back to the noinline scalar fused_axpy.
+    for (size_t tap_count : { 1, 7, 16, 19, 20, 24, 32, 48 }) {
         for (double cfo : { 0.0, 35000.0 }) {
-            sic::DiscreteCirModel m = make_model(q, -1, tap_count);
-            m.impulse_template = true;
+            sic::DiscreteCirModel m = rig.model(q, -1, tap_count);
             m.cfo_hz = cfo;
-            for (size_t t = 0; t < tap_count; ++t) {
+            for (size_t t = 0; t < tap_count; ++t)
                 m.taps[t] = cf(0.1f * float(t + 1), -0.05f * float(t));
-            }
             m.active_count = tap_count;
-            for (size_t t = 0; t < tap_count; ++t) {
-                m.active_lags[t] = static_cast<int16_t>(m.lag_lo + int64_t(t));
-            }
+            for (size_t t = 0; t < tap_count; ++t)
+                m.active_lags[t] =
+                    static_cast<int16_t>(m.lag_lo + int64_t(t));
 
-            // Run with B3 SIMD enabled
+            // Run with B3 SIMD enabled.
             sic::set_b3_simd_disabled(0);
             std::vector<cf> out_opt(n), ihat_opt(n);
             sic::DiscreteCirResult r_opt;
             BOOST_REQUIRE(sic::apply_discrete_cir_pulses(
-                y.data(), n, pl, s.impulse_sync.data(), s.impulse_sync.size(),
-                m, 0, int64_t(n), s, out_opt.data(), ihat_opt.data(), &r_opt));
+                y.data(), n, rig.pl, rig.scratch.impulse_sync.data(),
+                rig.scratch.impulse_sync.size(), m, 0, int64_t(n), rig.scratch,
+                out_opt.data(), ihat_opt.data(), &r_opt));
             BOOST_CHECK(r_opt.committed);
 
-            // Run with B3 SIMD disabled (generic fallback path)
+            // Run with B3 SIMD disabled (scalar reference).
             sic::set_b3_simd_disabled(1);
             std::vector<cf> out_fallback(n), ihat_fallback(n);
             sic::DiscreteCirResult r_fallback;
             BOOST_REQUIRE(sic::apply_discrete_cir_pulses(
-                y.data(), n, pl, s.impulse_sync.data(), s.impulse_sync.size(),
-                m, 0, int64_t(n), s, out_fallback.data(), ihat_fallback.data(), &r_fallback));
+                y.data(), n, rig.pl, rig.scratch.impulse_sync.data(),
+                rig.scratch.impulse_sync.size(), m, 0, int64_t(n), rig.scratch,
+                out_fallback.data(), ihat_fallback.data(), &r_fallback));
             BOOST_CHECK(r_fallback.committed);
             sic::set_b3_simd_disabled(-1);
 
             if (cfo == 0.0) {
-                // Zero CFO must be bit-for-bit identical between AVX2 and fallback!
-                BOOST_CHECK_EQUAL(std::memcmp(out_opt.data(), out_fallback.data(), n * sizeof(cf)), 0);
-                BOOST_CHECK_EQUAL(std::memcmp(ihat_opt.data(), ihat_fallback.data(), n * sizeof(cf)), 0);
+                // Zero CFO must be bit-for-bit identical between the SIMD
+                // kernels and the scalar reference.
+                BOOST_CHECK_EQUAL(std::memcmp(out_opt.data(),
+                                              out_fallback.data(),
+                                              n * sizeof(cf)),
+                                  0);
+                BOOST_CHECK_EQUAL(std::memcmp(ihat_opt.data(),
+                                              ihat_fallback.data(),
+                                              n * sizeof(cf)),
+                                  0);
             } else {
-                // Non-zero CFO uses FMA vs non-FMA, should agree within float numerical precision
+                // Non-zero CFO uses FMA vs non-FMA; the accepted error scales
+                // with the tap count (the 20-tap bar stays at 1e-5).
                 float max_err = 0.f;
-                for (size_t j = 0; j < n; ++j) {
-                    max_err = std::max(max_err, std::abs(out_opt[j] - out_fallback[j]));
-                }
-                BOOST_CHECK_LT(max_err, 1e-5f);
+                for (size_t j = 0; j < n; ++j)
+                    max_err =
+                        std::max(max_err, std::abs(out_opt[j] - out_fallback[j]));
+                const float limit =
+                    1e-5f * std::max(1.f, float(tap_count) / 20.f);
+                BOOST_CHECK_LT(max_err, limit);
             }
         }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(tile_path_matches_full_ihat_path_bit_exact)
+{
+    SparseRig rig;
+    std::vector<cf> y(rig.n, cf(0.01f, -0.02f));
+
+    for (size_t tap_count : { size_t(7), size_t(20) }) {
+        for (double cfo : { 0.0, 35000.0 }) {
+            sic::DiscreteCirModel m = rig.model(rig.q, -1, tap_count);
+            m.cfo_hz = cfo;
+            for (size_t t = 0; t < tap_count; ++t)
+                m.taps[t] = cf(0.1f * float(t + 1), -0.05f * float(t));
+            m.active_count = tap_count;
+            for (size_t t = 0; t < tap_count; ++t)
+                m.active_lags[t] =
+                    static_cast<int16_t>(m.lag_lo + int64_t(t));
+
+            const int64_t roi_lo = 1000;
+            const int64_t roi_hi = int64_t(rig.n) - 1000;
+            sic::DiscreteCirApplyOptions opts;
+            opts.compute_roi_energy = true;
+
+            // Reference: full-materialized ihat path.
+            std::vector<cf> out_ref(rig.n), ihat_ref(rig.n);
+            sic::DiscreteCirResult r_ref;
+            BOOST_REQUIRE_MESSAGE(
+                sic::apply_discrete_cir_pulses_ex(
+                    y.data(), rig.n, rig.pl, rig.scratch.impulse_sync.data(),
+                    rig.scratch.impulse_sync.size(), m, roi_lo, roi_hi, opts,
+                    rig.scratch, out_ref.data(), ihat_ref.data(), &r_ref),
+                r_ref.reason);
+            BOOST_CHECK(r_ref.committed);
+            BOOST_CHECK(r_ref.roi_energy_valid);
+
+            // L1D tile path, out != y.
+            std::vector<cf> out_tile(rig.n, cf(0.f, 0.f));
+            sic::DiscreteCirResult r_tile;
+            BOOST_REQUIRE_MESSAGE(
+                sic::apply_discrete_cir_pulses_ex(
+                    y.data(), rig.n, rig.pl, rig.scratch.impulse_sync.data(),
+                    rig.scratch.impulse_sync.size(), m, roi_lo, roi_hi, opts,
+                    rig.scratch, out_tile.data(), nullptr, &r_tile),
+                r_tile.reason);
+            BOOST_CHECK(r_tile.committed);
+            BOOST_CHECK(r_tile.roi_energy_valid);
+            BOOST_CHECK_EQUAL(std::memcmp(out_ref.data(), out_tile.data(),
+                                          rig.n * sizeof(cf)),
+                              0);
+
+            // L1D tile path, out == y in place.
+            std::vector<cf> y_inplace = y;
+            sic::DiscreteCirResult r_inplace;
+            BOOST_REQUIRE_MESSAGE(
+                sic::apply_discrete_cir_pulses_ex(
+                    y_inplace.data(), rig.n, rig.pl,
+                    rig.scratch.impulse_sync.data(),
+                    rig.scratch.impulse_sync.size(), m, roi_lo, roi_hi, opts,
+                    rig.scratch, y_inplace.data(), nullptr, &r_inplace),
+                r_inplace.reason);
+            BOOST_CHECK(r_inplace.committed);
+            BOOST_CHECK_EQUAL(std::memcmp(y_inplace.data(), out_tile.data(),
+                                          rig.n * sizeof(cf)),
+                              0);
+
+            // ROI energies against an independent double accumulation.  The
+            // contract (matching compute_roi_energies) is float squares
+            // widened to double, accumulated over support ∩ ROI.
+            BOOST_REQUIRE_EQUAL(r_ref.sub_lo, r_tile.sub_lo);
+            BOOST_REQUIRE_EQUAL(r_ref.sub_hi, r_tile.sub_hi);
+            double e_y = 0.0, e_out = 0.0;
+            for (int64_t j = r_tile.sub_lo; j < r_tile.sub_hi; ++j) {
+                const cf yv = y[static_cast<size_t>(j)];
+                const cf ov = out_tile[static_cast<size_t>(j)];
+                e_y += double(yv.real() * yv.real()) +
+                       double(yv.imag() * yv.imag());
+                e_out += double(ov.real() * ov.real()) +
+                         double(ov.imag() * ov.imag());
+            }
+            auto rel = [](double a, double b) {
+                return std::fabs(a - b) / std::max(1e-300, std::fabs(b));
+            };
+            BOOST_CHECK_LT(rel(r_tile.roi_e_y, e_y), 1e-12);
+            BOOST_CHECK_LT(rel(r_tile.roi_e_out, e_out), 1e-12);
+            BOOST_CHECK_LT(rel(r_ref.roi_e_y, e_y), 1e-12);
+            BOOST_CHECK_LT(rel(r_ref.roi_e_out, e_out), 1e-12);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(partial_window_clip_left_and_right_edges)
+{
+    SparseRig rig;
+    // q = 2 with lag_lo = -4 puts the support start at -2 (left clip) while a
+    // window ending `n = packet_samples - 1000` cuts the packet tail (right
+    // clip): hi = q + lag_lo + tap_count + packet_samples > n.
+    const int64_t q = 2;
+    const size_t n = rig.pl.packet_samples - 1000;
+    BOOST_REQUIRE_GT(n, size_t(kSyncSamples));
+    const size_t tap_count = 7;
+    const double cfo = 20000.0;
+
+    sic::DiscreteCirModel m = rig.model(q, -4, tap_count);
+    m.cfo_hz = cfo;
+    for (size_t t = 0; t < tap_count; ++t)
+        m.taps[t] = cf(0.1f * float(t + 1), -0.05f * float(t));
+    m.active_count = tap_count;
+    for (size_t t = 0; t < tap_count; ++t)
+        m.active_lags[t] = static_cast<int16_t>(m.lag_lo + int64_t(t));
+    const int64_t lo = q + m.lag_lo;
+    BOOST_REQUIRE_LT(lo, 0);
+    BOOST_REQUIRE_GT(lo + int64_t(tap_count) + int64_t(rig.pl.packet_samples),
+                     int64_t(n));
+
+    std::vector<cf> y(n, cf(0.003f, -0.004f));
+    const cf sentinel(777.f, -777.f);
+    const size_t guard = 8;
+
+    // Default: an incomplete observed packet is a hard bypass.
+    {
+        std::vector<cf> out(n + guard, sentinel), ihat(n, sentinel);
+        std::vector<cf> out_guard(out);
+        sic::DiscreteCirResult r;
+        BOOST_CHECK(!sic::apply_discrete_cir_pulses(
+            y.data(), n, rig.pl, rig.scratch.impulse_sync.data(),
+            rig.scratch.impulse_sync.size(), m, 0, int64_t(n), rig.scratch,
+            out.data(), ihat.data(), &r));
+        BOOST_CHECK_EQUAL(std::string(r.reason), "context_truncated");
+        BOOST_CHECK_EQUAL(std::memcmp(out.data(), y.data(), n * sizeof(cf)), 0);
+        BOOST_CHECK_EQUAL(count_nonzero(ihat, 0, 0), 0);
+        BOOST_CHECK_EQUAL(std::memcmp(out.data() + n, out_guard.data() + n,
+                                      guard * sizeof(cf)),
+                          0);
+    }
+
+    sic::DiscreteCirApplyOptions opts;
+    opts.allow_partial_clip = true;
+    opts.compute_roi_energy = true;
+
+    // Opt-in: clipped ihat path.
+    std::vector<cf> out_ref(n + guard, sentinel), ihat_ref(n, sentinel);
+    std::vector<cf> out_ref_guard(out_ref);
+    sic::DiscreteCirResult r_ref;
+    BOOST_REQUIRE_MESSAGE(
+        sic::apply_discrete_cir_pulses_ex(
+            y.data(), n, rig.pl, rig.scratch.impulse_sync.data(),
+            rig.scratch.impulse_sync.size(), m, 0, int64_t(n), opts,
+            rig.scratch, out_ref.data(), ihat_ref.data(), &r_ref),
+        r_ref.reason);
+    BOOST_CHECK(r_ref.committed);
+    BOOST_CHECK_EQUAL(r_ref.support_lo, lo);
+    BOOST_CHECK_EQUAL(r_ref.sub_lo, 0);
+    BOOST_CHECK_EQUAL(r_ref.sub_hi, int64_t(n));
+    BOOST_CHECK(r_ref.roi_energy_valid);
+    BOOST_CHECK_EQUAL(std::memcmp(out_ref.data() + n, out_ref_guard.data() + n,
+                                  guard * sizeof(cf)),
+                      0);
+
+    // Opt-in: clipped L1D tile path (ihat == nullptr).
+    std::vector<cf> out_tile(n + guard, sentinel);
+    std::vector<cf> out_tile_guard(out_tile);
+    sic::DiscreteCirResult r_tile;
+    BOOST_REQUIRE_MESSAGE(
+        sic::apply_discrete_cir_pulses_ex(
+            y.data(), n, rig.pl, rig.scratch.impulse_sync.data(),
+            rig.scratch.impulse_sync.size(), m, 0, int64_t(n), opts,
+            rig.scratch, out_tile.data(), nullptr, &r_tile),
+        r_tile.reason);
+    BOOST_CHECK(r_tile.committed);
+    BOOST_CHECK(r_tile.roi_energy_valid);
+    BOOST_CHECK_EQUAL(std::memcmp(out_tile.data() + n,
+                                  out_tile_guard.data() + n,
+                                  guard * sizeof(cf)),
+                      0);
+
+    // Independent double oracle: only tap fragments that land inside [0, n)
+    // may contribute, and neither boundary may be written out of bounds.
+    std::vector<cd> want(n, cd{});
+    const double omega = 2.0 * kPi * cfo / kWorkRateHz;
+    for (const auto& e : rig.events) {
+        const double mph = omega * double(int64_t(e.sample_offset));
+        for (size_t d = 0; d < tap_count; ++d) {
+            const int64_t lag = m.lag_lo + int64_t(d);
+            const int64_t j = q + int64_t(e.sample_offset) + lag;
+            if (j < 0 || j >= int64_t(n))
+                continue;
+            want[static_cast<size_t>(j)] +=
+                double(e.sign) * std::polar(1.0, mph + omega * double(lag)) *
+                cd(m.taps[d]);
+        }
+    }
+    float worst_ref = 0.f, worst_tile = 0.f;
+    for (size_t j = 0; j < n; ++j) {
+        const cf expected = cf(cd(y[j]) - want[j]);
+        worst_ref = std::max(worst_ref, std::abs(out_ref[j] - expected));
+        worst_tile = std::max(worst_tile, std::abs(out_tile[j] - expected));
+    }
+    BOOST_CHECK_LT(worst_ref, 3e-5f);
+    BOOST_CHECK_LT(worst_tile, 3e-5f);
+
+    // Fused energies cover exactly the support ∩ window under a double
+    // accumulation of the same float squares the kernel forms.
+    double e_y = 0.0, e_out = 0.0;
+    for (int64_t j = r_tile.sub_lo; j < r_tile.sub_hi; ++j) {
+        const cf yv = y[static_cast<size_t>(j)];
+        const cf ov = out_tile[static_cast<size_t>(j)];
+        e_y += double(yv.real() * yv.real()) + double(yv.imag() * yv.imag());
+        e_out += double(ov.real() * ov.real()) + double(ov.imag() * ov.imag());
+    }
+    auto rel = [](double a, double b) {
+        return std::fabs(a - b) / std::max(1e-300, std::fabs(b));
+    };
+    BOOST_CHECK_LT(rel(r_tile.roi_e_y, e_y), 1e-10);
+    BOOST_CHECK_LT(rel(r_tile.roi_e_out, e_out), 1e-10);
+}
+
+BOOST_AUTO_TEST_CASE(copy_out_on_fail_false_skips_buffer_write)
+{
+    SparseRig rig;
+    const size_t tap_count = 7;
+    sic::DiscreteCirModel m = rig.model(rig.q, -1, tap_count);
+    for (size_t t = 0; t < tap_count; ++t) {
+        m.taps[t] = cf(0.1f * float(t + 1), -0.05f * float(t));
+        m.active_lags[t] = static_cast<int16_t>(m.lag_lo + int64_t(t));
+    }
+    m.active_count = tap_count;
+    // Support cannot fit at the very end of the window -> context_truncated.
+    m.q = int64_t(rig.n) - 1;
+    m.phase_reference_sample = m.q;
+
+    std::vector<cf> y(rig.n, cf(0.02f, 0.01f));
+    const cf sentinel(999.f, -999.f);
+
+    {
+        std::vector<cf> out(rig.n, sentinel);
+        sic::DiscreteCirApplyOptions opts;
+        opts.copy_out_on_fail = false;
+        sic::DiscreteCirResult r;
+        BOOST_CHECK(!sic::apply_discrete_cir_pulses_ex(
+            y.data(), rig.n, rig.pl, rig.scratch.impulse_sync.data(),
+            rig.scratch.impulse_sync.size(), m, 0, int64_t(rig.n), opts,
+            rig.scratch, out.data(), nullptr, &r));
+        BOOST_CHECK_EQUAL(std::string(r.reason), "context_truncated");
+        // The opted-out failure must not touch the output buffer at all.
+        bool untouched = true;
+        for (size_t j = 0; j < rig.n; ++j)
+            if (!(out[j] == sentinel))
+                untouched = false;
+        BOOST_CHECK(untouched);
+    }
+
+    {
+        // Default copy_out_on_fail == true restores the observation.
+        std::vector<cf> out(rig.n, sentinel);
+        sic::DiscreteCirApplyOptions opts;
+        sic::DiscreteCirResult r;
+        BOOST_CHECK(!sic::apply_discrete_cir_pulses_ex(
+            y.data(), rig.n, rig.pl, rig.scratch.impulse_sync.data(),
+            rig.scratch.impulse_sync.size(), m, 0, int64_t(rig.n), opts,
+            rig.scratch, out.data(), nullptr, &r));
+        BOOST_CHECK_EQUAL(std::string(r.reason), "context_truncated");
+        BOOST_CHECK_EQUAL(std::memcmp(out.data(), y.data(),
+                                      rig.n * sizeof(cf)),
+                          0);
+    }
+
+    // The transactional wrapper honours the same option on its own failures.
+    {
+        TransactionRig tr(32, 19);
+        const std::vector<cf> before = tr.out;
+        sic::DiscreteCirApplyOptions opts;
+        opts.copy_out_on_fail = false;
+        auto r = sic::fullpacket_cancel_discrete_ex(
+            tr.y.data(), tr.n, tr.pkt.phr, tr.pkt.psdu, false, tr.pkt.profile,
+            tr.model, tr.ref.data(), tr.ref.size(), 0, int64_t(tr.n), opts,
+            tr.scratch, tr.out.data(), tr.ihat.data());
+        BOOST_CHECK_EQUAL(std::string(r.reason), "fcs_failed");
+        BOOST_CHECK_EQUAL(std::memcmp(tr.out.data(), before.data(),
+                                      tr.n * sizeof(cf)),
+                          0);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(inplace_overflow_injection_is_fail_closed)
+{
+    SparseRig rig;
+    const size_t tap_count = 7;
+    std::vector<cf> y(rig.n, cf(0.01f, -0.02f));
+
+    // Sanity: the same in-place call with normal taps commits and modifies the
+    // observation inside the ROI.
+    {
+        sic::DiscreteCirModel m = rig.model(rig.q, -1, tap_count);
+        for (size_t t = 0; t < tap_count; ++t) {
+            m.taps[t] = cf(0.1f * float(t + 1), -0.05f * float(t));
+            m.active_lags[t] = static_cast<int16_t>(m.lag_lo + int64_t(t));
+        }
+        m.active_count = tap_count;
+        std::vector<cf> y_inplace = y;
+        sic::DiscreteCirResult r;
+        BOOST_REQUIRE_MESSAGE(
+            sic::apply_discrete_cir_pulses(
+                y_inplace.data(), rig.n, rig.pl,
+                rig.scratch.impulse_sync.data(),
+                rig.scratch.impulse_sync.size(), m, 0, int64_t(rig.n),
+                rig.scratch, y_inplace.data(), nullptr, &r),
+            r.reason);
+        BOOST_CHECK(r.committed);
+        BOOST_CHECK(std::memcmp(y_inplace.data(), y.data(),
+                                rig.n * sizeof(cf)) != 0);
+    }
+
+    // Inject finite taps far above the safe in-place bound.  The two-phase
+    // scratch.accumulator fallback must validate before it writes, so the
+    // in-place window stays byte-identical on failure.
+    sic::DiscreteCirModel m = rig.model(rig.q, -1, tap_count);
+    const float huge = std::numeric_limits<float>::max();
+    for (size_t t = 0; t < tap_count; ++t) {
+        m.taps[t] = cf(huge, 0.f);
+        m.active_lags[t] = static_cast<int16_t>(m.lag_lo + int64_t(t));
+    }
+    m.active_count = tap_count;
+
+    {
+        std::vector<cf> y_inplace = y;
+        sic::DiscreteCirResult r;
+        BOOST_CHECK(!sic::apply_discrete_cir_pulses(
+            y_inplace.data(), rig.n, rig.pl, rig.scratch.impulse_sync.data(),
+            rig.scratch.impulse_sync.size(), m, 0, int64_t(rig.n),
+            rig.scratch, y_inplace.data(), nullptr, &r));
+        BOOST_CHECK_EQUAL(std::string(r.reason), "nonfinite_reconstruction");
+        BOOST_CHECK(!r.committed);
+        BOOST_CHECK_EQUAL(std::memcmp(y_inplace.data(), y.data(),
+                                      rig.n * sizeof(cf)),
+                          0);
+    }
+
+    // Out-of-place failure also restores out == y (copy_out_on_fail default).
+    {
+        std::vector<cf> out(rig.n, cf(5.f, -5.f));
+        sic::DiscreteCirResult r;
+        BOOST_CHECK(!sic::apply_discrete_cir_pulses(
+            y.data(), rig.n, rig.pl, rig.scratch.impulse_sync.data(),
+            rig.scratch.impulse_sync.size(), m, 0, int64_t(rig.n),
+            rig.scratch, out.data(), nullptr, &r));
+        BOOST_CHECK_EQUAL(std::string(r.reason), "nonfinite_reconstruction");
+        BOOST_CHECK_EQUAL(std::memcmp(out.data(), y.data(),
+                                      rig.n * sizeof(cf)),
+                          0);
     }
 }

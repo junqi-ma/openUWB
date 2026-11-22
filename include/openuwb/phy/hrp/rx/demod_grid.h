@@ -15,6 +15,13 @@ namespace openuwb::demod::core {
 inline constexpr float kLockedInnerNarrowRawGate = 0.045f;
 inline constexpr float kSfdGridPeakFloor = 0.008f;
 inline constexpr double kSfdGridParFloor = 1.5;
+// Stage 5 (NS-SFD) relative PAR gate on the +/-8-chip search window (17 lags):
+// compares peak normalized correlation power against the mean power outside
+// the +/-guard chip mainlobe, replacing the legacy 0.30 absolute floor so
+// low-SNR packets that passed Stage 3 are not rejected before PHR/FEC.
+inline constexpr double kNsSfdParFloor = 12.0;
+inline constexpr size_t kNsSfdParGuard = 2;
+inline constexpr size_t kNsSfdParMinBackground = 8;
 
 // ---------------------------------------------------------------------------
 // Integer chip-grid admission

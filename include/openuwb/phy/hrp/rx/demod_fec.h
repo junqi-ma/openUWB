@@ -395,7 +395,9 @@ void local_cl3_trellis_flip(const float* llr0,
                             std::vector<int8_t>& out_bits);
 
 // RS(63,55) Errors-and-Erasures decoder (`v` erasures + `e` unknown errors,
-// 2*e + v <= 8, capped at v <= 6 so at least 2 residual parity checks remain).
+// 2*e + v <= 8).  v may go up to 8: with v = 8 the block is pure-erasure
+// decoded and the Berlekamp-Massey residual must be empty (e = 0); v > 8
+// falls back to the plain errors-only decoder.
 bool rs_decode_block_erasures(const int8_t* coded378,
                               const int* eras_pos,
                               int v,
@@ -405,11 +407,11 @@ bool rs_decode_block_erasures(const int8_t* coded378,
 // candidate generator runs first:
 //
 //   Phase 1 (zero Viterbi cost): every block whose trellis-decoded codeword
-//   fails RS gets up to three RS(63,55) errors-and-erasures attempts (v = 2, 4,
-//   6) built from the six least-reliable RS symbols of that block.  If every
-//   block produced at least one candidate, one combined CRC-16 check decides
-//   the packet immediately -- the 21 local Trellis-Chase re-decodes are then
-//   never run.
+//   fails RS gets up to four RS(63,55) errors-and-erasures attempts (v = 2, 4,
+//   6, 8) built from the eight least-reliable RS symbols of that block.  If
+//   every block produced at least one candidate, one combined CRC-16 check
+//   decides the packet immediately -- the 21 local Trellis-Chase re-decodes
+//   are then never run.
 //
 //   Phase 2 (only if phase 1 could not close the frame): 6 single and 15 pair
 //   local trellis flips on the weakest merges of each still-failing block.
@@ -510,9 +512,11 @@ void clip_biorth_metrics(float* m0, float* m1, size_t N,
                          float clip_factor = 4.0f);
 
 // Bi-orthogonal twin of rescue_payload_soft(): identical two-phase logic
-// (Phase 1 RS errors-and-erasures v = 2/4/6, Phase 2 six single + fifteen pair
-// trellis flips), only the local re-decode uses the ML branch metric.  Only a
-// full-frame CRC-16 match is accepted.
+// (Phase 1 RS errors-and-erasures v = 2/4/6/8, Phase 2 six single + fifteen
+// pair trellis flips), only the local re-decode uses the ML branch metric.
+// Each Phase 2 flip whose plain RS decode fails is additionally retried with
+// a joint RS erasure decode over the four weakest symbols outside the flipped
+// window (then the two weakest).  Only a full-frame CRC-16 match is accepted.
 bool rescue_payload_biorth(const float* m0,
                            const float* m1,
                            size_t total,

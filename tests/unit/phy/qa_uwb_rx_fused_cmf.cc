@@ -11,6 +11,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <limits>
 #include <random>
 #include <utility>
 #include <vector>
@@ -2075,4 +2076,161 @@ BOOST_AUTO_TEST_CASE(known_hop_phr_matches_four_candidate)
         rx.data(), rx.size(), taps.data(), kTap, chip_start,
         rxfusion::kSamplesPerChip, phr_start, bad.data(), 1, rot, got,
         scratch_got));
+}
+
+// ---------------------------------------------------------------------------
+// WP2: adaptive CIR-tap denoise.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(cir_denoise_keeps_multipath_and_zeroes_noise)
+{
+    std::mt19937 rng(87654321);
+    std::normal_distribution<float> nd(0.0f, 0.02f);
+    std::vector<cf> taps(kTap);
+    for (auto& h : taps)
+        h = cf(nd(rng), nd(rng));
+    taps[18] = cf(1.0f, 0.0f);
+    taps[19] = cf(0.5f, 0.0f);
+    taps[21] = cf(0.3f, 0.0f);
+    const std::vector<cf> original = taps;
+
+    std::vector<cf> out(kTap, cf(0.0f, 0.0f));
+    rxfusion::denoise_cir_taps(taps.data(), taps.size(), out.data());
+
+    // The three true multipath taps survive verbatim.
+    BOOST_CHECK(out[18] == original[18]);
+    BOOST_CHECK(out[19] == original[19]);
+    BOOST_CHECK(out[21] == original[21]);
+    BOOST_CHECK_CLOSE(std::abs(out[18]), 1.0f, 1e-4);
+    BOOST_CHECK_CLOSE(std::abs(out[19]), 0.5f, 1e-4);
+    BOOST_CHECK_CLOSE(std::abs(out[21]), 0.3f, 1e-4);
+
+    // With a 6x weakest-half floor on complex Gaussian noise, ~90% of the 35
+    // noise-only taps fall below the threshold (mean ~31); assert a safe floor.
+    size_t zeroed_noise = 0;
+    size_t non_zero = 0;
+    for (size_t q = 0; q < taps.size(); ++q) {
+        if (out[q] != cf(0.0f, 0.0f))
+            ++non_zero;
+        if (q == 18 || q == 19 || q == 21)
+            continue;
+        if (out[q] == cf(0.0f, 0.0f))
+            ++zeroed_noise;
+    }
+    BOOST_TEST_MESSAGE("cir denoise zeroed " << zeroed_noise
+                                             << "/35 noise taps, kept "
+                                             << non_zero);
+    BOOST_CHECK_GE(zeroed_noise, 26u);
+    // At least min_keep (4) taps are always retained.
+    BOOST_CHECK_GE(non_zero, 4u);
+
+    // The source CIR is never modified.
+    BOOST_CHECK(taps == original);
+}
+
+BOOST_AUTO_TEST_CASE(cir_denoise_improves_fused_correlation_snr)
+{
+    // A synthetic BPM payload with one unit CIR tap plus RX noise; the fused
+    // kernel then sees a noisy 38-tap template.
+    const SynthBpmPayload in = make_synth_payload(64, 0.0, 1.0f, 424242);
+    std::mt19937 rng(13579);
+    std::normal_distribution<float> nd(0.0f, 0.10f);
+    std::vector<cf> noisy_taps = in.taps; // zeros except h[37] == 1
+    for (auto& h : noisy_taps)
+        h += cf(nd(rng), nd(rng));
+
+    std::vector<cf> denoised(kTap, cf(0.0f, 0.0f));
+    rxfusion::denoise_cir_taps(noisy_taps.data(), noisy_taps.size(),
+                               denoised.data());
+
+    auto snr_for = [&](const std::vector<cf>& taps) {
+        rxfusion::Metrics metrics;
+        rxfusion::Scratch scratch;
+        if (!rxfusion::correlate_payload_fused_cfo(
+                in.rx.data(), in.rx.size(), taps.data(), kTap, in.chip_start,
+                rxfusion::kSamplesPerChip, in.payload_start, in.pn.data(),
+                in.symbols, 1, cf(1.0f, 0.0f), 0.0, metrics, scratch))
+            return 0.0;
+        double sum = 0.0;
+        std::vector<double> values(in.symbols);
+        for (size_t s = 0; s < in.symbols; ++s) {
+            const int hop =
+                (in.pn[s * rxfusion::kChipsPerBurst] < 0) ? 1 : 0;
+            const size_t p = 4 * s + 2 * static_cast<size_t>(hop) +
+                             static_cast<size_t>(in.expect_half[s]);
+            values[s] = static_cast<double>(metrics.signed_value[p]);
+            sum += values[s];
+        }
+        const double mean = sum / static_cast<double>(in.symbols);
+        double var = 0.0;
+        for (double v : values)
+            var += (v - mean) * (v - mean);
+        var /= static_cast<double>(in.symbols);
+        return (var > 0.0) ? std::abs(mean) / std::sqrt(var) : 0.0;
+    };
+
+    const double snr_before = snr_for(noisy_taps);
+    const double snr_after = snr_for(denoised);
+    BOOST_TEST_MESSAGE("fused correlation SNR raw=" << snr_before
+                                                    << " denoised="
+                                                    << snr_after);
+    BOOST_CHECK_GT(snr_before, 0.0);
+    BOOST_CHECK_GE(snr_after, snr_before);
+}
+
+BOOST_AUTO_TEST_CASE(cir_denoise_fail_open_boundaries)
+{
+    auto same_tap = [](const cf& a, const cf& b) {
+        const bool re = (a.real() == b.real()) ||
+                        (std::isnan(a.real()) && std::isnan(b.real()));
+        const bool im = (a.imag() == b.imag()) ||
+                        (std::isnan(a.imag()) && std::isnan(b.imag()));
+        return re && im;
+    };
+
+    // All-zero taps: copied verbatim.
+    {
+        const std::vector<cf> zeros(kTap, cf(0.0f, 0.0f));
+        std::vector<cf> out(kTap, cf(9.0f, 9.0f));
+        rxfusion::denoise_cir_taps(zeros.data(), zeros.size(), out.data());
+        BOOST_CHECK(out == zeros);
+    }
+
+    // A single non-finite tap fails the whole call open (NaN and Inf).
+    {
+        std::vector<cf> base(kTap);
+        std::mt19937 rng(2026);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        for (auto& h : base)
+            h = cf(dist(rng), dist(rng));
+        for (float bad_value :
+             { std::numeric_limits<float>::quiet_NaN(),
+               std::numeric_limits<float>::infinity() }) {
+            std::vector<cf> bad = base;
+            bad[7] = cf(bad_value, 0.5f);
+            std::vector<cf> out(kTap, cf(0.0f, 0.0f));
+            rxfusion::denoise_cir_taps(bad.data(), bad.size(), out.data());
+            for (size_t q = 0; q < bad.size(); ++q)
+                BOOST_CHECK(same_tap(out[q], bad[q]));
+        }
+    }
+
+    // tap_count == 1 (and 0) are copied/no-ops.
+    {
+        const std::vector<cf> one{ cf(1.5f, -2.25f) };
+        std::vector<cf> out(1, cf(0.0f, 0.0f));
+        rxfusion::denoise_cir_taps(one.data(), 1, out.data());
+        BOOST_CHECK(out[0] == one[0]);
+        rxfusion::denoise_cir_taps(nullptr, 0, out.data()); // must not crash
+        BOOST_CHECK(out[0] == one[0]);
+    }
+
+    // Above the fused tap ceiling the input is copied verbatim.
+    {
+        std::vector<cf> big(rxfusion::kMaxTapCount + 1, cf(0.0f, 0.0f));
+        big[0] = cf(1.0f, 0.0f);
+        big.back() = cf(0.5f, 0.25f);
+        std::vector<cf> out(big.size(), cf(0.0f, 0.0f));
+        rxfusion::denoise_cir_taps(big.data(), big.size(), out.data());
+        BOOST_CHECK(out == big);
+    }
 }

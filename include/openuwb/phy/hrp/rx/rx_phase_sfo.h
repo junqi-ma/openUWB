@@ -147,6 +147,13 @@ namespace rxopt {
 struct PhrPhaseRefineResult {
     bool applied = false;
     std::complex<float> rot_at_payload_start{ 1.0f, 0.0f };
+    // Mean-phase-only rotation at the payload start, rot_init * exp(-j*theta_c):
+    // the constant pilot phase WITHOUT the lag-1 CFO slope extrapolation.
+    // Populated on every path where `rot_at_payload_start` is populated
+    // (including every rejection path, where both equal rot_init).  Consumers
+    // can apply this rotation with delta_cfo_w_rad forced to 0 to remove a
+    // static residual phase when the extrapolated CFO is not trustworthy.
+    std::complex<float> rot_mean_phase{ 1.0f, 0.0f };
     double delta_cfo_w_rad = 0.0;
     float coherence = 0.0f;
 };

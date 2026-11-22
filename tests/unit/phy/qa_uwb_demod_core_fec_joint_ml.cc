@@ -621,6 +621,66 @@ BOOST_AUTO_TEST_CASE(test_demod_core_ns_sfd_sparse_sliding_equivalence)
     BOOST_CHECK_GE(res.metric, 0.95f);
 }
 
+BOOST_AUTO_TEST_CASE(test_demod_core_ns_sfd_relative_par_low_snr_and_noise)
+{
+    auto prof = Qm35825Profile::Default();
+    prof.code_index = 10;
+    prof.sfd_mode = "4z2";
+
+    const auto sfd_seq = openuwb::demod::GetSfdSequence(prof.sfd_mode);
+    const size_t total_chips = 80 * kQm35ChipsPerSymbol;
+    const int64_t target_start = 64 * kQm35ChipsPerSymbol - 3;
+
+    core::DemodScratch scratch;
+    scratch.cached_seq.update(prof.code_index, prof.sfd_mode);
+    const auto& sc = scratch.cached_seq.sampled_pcode;
+
+    // 1. Low-SNR SFD whose normalized correlation falls below the legacy 0.30
+    // absolute floor (e.g. ~0.18-0.25) must pass via relative PAR and recover
+    // exact chip alignment and polarity (-1).
+    std::mt19937 rng(20261122u);
+    std::normal_distribution<float> noise(0.0f, 1.5f);
+    std::vector<float> low_snr_chips(total_chips);
+    for (float& v : low_snr_chips)
+        v = noise(rng);
+    for (size_t i = 0; i < sfd_seq.size(); ++i) {
+        const int8_t s = sfd_seq[i];
+        for (size_t j = 0; j < sc.size(); ++j) {
+            low_snr_chips[target_start + i * sc.size() + j] -=
+                static_cast<float>(s * sc[j]);
+        }
+    }
+
+    NsSfdResult low_res;
+    BOOST_REQUIRE(core::stage_ns_sfd(
+        low_snr_chips, prof, sfd_seq, kQm35ChipsPerSymbol, low_res, scratch));
+    BOOST_CHECK(low_res.ok);
+    BOOST_CHECK_EQUAL(low_res.sfd_start_chip, target_start);
+    BOOST_CHECK_EQUAL(low_res.polarity, -1);
+    BOOST_CHECK_LT(low_res.metric, prof.sfd_detection_threshold);
+    BOOST_CHECK_GT(low_res.metric, 0.10f);
+
+    // 2. All-zero stream must be rejected.
+    std::vector<float> zeros(total_chips, 0.0f);
+    NsSfdResult zero_res;
+    BOOST_CHECK(!core::stage_ns_sfd(
+        zeros, prof, sfd_seq, kQm35ChipsPerSymbol, zero_res, scratch));
+
+    // 3. Pure white noise must be overwhelmingly rejected by the PAR gate.
+    size_t false_alarms = 0;
+    constexpr size_t kNoiseTrials = 50;
+    std::vector<float> pure_noise(total_chips);
+    for (size_t t = 0; t < kNoiseTrials; ++t) {
+        for (float& v : pure_noise)
+            v = noise(rng);
+        NsSfdResult nres;
+        if (core::stage_ns_sfd(
+                pure_noise, prof, sfd_seq, kQm35ChipsPerSymbol, nres, scratch))
+            ++false_alarms;
+    }
+    BOOST_CHECK_LE(false_alarms, size_t(5));
+}
+
 BOOST_AUTO_TEST_CASE(test_demod_core_tail_reuse_equivalence_and_fallback)
 {
     std::vector<gr_complex> iq, tmpl;
@@ -2511,4 +2571,402 @@ BOOST_AUTO_TEST_CASE(test_w1_joint_ml_local_flip_and_rescue_phase1)
     PayloadResult guard;
     BOOST_CHECK(!rescue_payload_biorth(m0.data(), m1.data(), total, 0, tr, guard));
     BOOST_CHECK(!rescue_payload_biorth(m0.data(), m1.data(), total, 191, tr, guard));
+}
+
+BOOST_AUTO_TEST_CASE(test_w1_rs_erasures_full_v8_and_over_capacity)
+{
+    using namespace openuwb::demod::core::detail;
+
+    // 330-bit systematic data block -> 378-bit RS(63,55) codeword.
+    std::vector<int8_t> data330(330);
+    std::mt19937 rng(20261124u);
+    for (size_t i = 0; i < data330.size(); ++i)
+        data330[i] = static_cast<int8_t>(rng() & 1u);
+
+    std::vector<int8_t> coded;
+    BOOST_REQUIRE(qa_rs_encode_block(data330, coded));
+    BOOST_REQUIRE_EQUAL(coded.size(), size_t(378));
+
+    // Eight pure erasures: one bit flipped in each of eight distinct 6-bit
+    // symbols (eight symbol errors, zero residual errors).
+    std::vector<int8_t> corrupted = coded;
+    int eras8[8];
+    for (int k = 0; k < 8; ++k) {
+        const int sy = 5 + 7 * k;
+        eras8[k] = sy;
+        corrupted[static_cast<size_t>(sy * 6 + (k % 6))] ^= 1;
+    }
+    int8_t out330[330] = {};
+    BOOST_CHECK(rs_decode_block_erasures(corrupted.data(), eras8, 8, out330));
+    for (size_t i = 0; i < data330.size(); ++i)
+        BOOST_CHECK_EQUAL(int(out330[i]), int(data330[i]));
+
+    // v = 6 on the same word cannot *recover the original data*: 8 symbol
+    // errors exceed the unique-decoding radius with only 6 erasures, so the
+    // decoder may legally miscorrect (return a different valid codeword).
+    // What matters here is that v = 6 cannot reproduce the transmitted block;
+    // the upper layers discard miscorrections via the full-frame CRC-16.
+    int8_t six330[330] = {};
+    const bool six_ok =
+        rs_decode_block_erasures(corrupted.data(), eras8, 6, six330);
+    const bool six_restored =
+        six_ok && std::equal(six330, six330 + 330, data330.begin());
+    BOOST_TEST_MESSAGE("v=6 on 8 erasures: ok=" << six_ok
+                                                << " restored=" << six_restored);
+    BOOST_CHECK(!six_restored);
+
+    // Nine symbol errors exceed the v = 8 + e = 0 budget.  v = 8 still always
+    // solves the 8x8 erasure system and can miscorrect to another valid
+    // codeword; the reliable contract is that it must not reproduce the
+    // original data (again, CRC-16 is the final arbiter).
+    std::vector<int8_t> worse = coded;
+    int eras_first8[8];
+    for (int k = 0; k < 9; ++k) {
+        const int sy = 3 + 6 * k;
+        worse[static_cast<size_t>(sy * 6 + (k % 6))] ^= 1;
+        if (k < 8)
+            eras_first8[k] = sy;
+    }
+    int8_t bad330[330] = {};
+    const bool bad_ok =
+        rs_decode_block_erasures(worse.data(), eras_first8, 8, bad330);
+    const bool bad_restored =
+        bad_ok && std::equal(bad330, bad330 + 330, data330.begin());
+    BOOST_TEST_MESSAGE("v=8 on 9 errors: ok=" << bad_ok
+                                              << " restored=" << bad_restored);
+    BOOST_CHECK(!bad_restored);
+
+    // Out-of-range v falls back to the plain errors-only decoder, which also
+    // cannot repair eight symbol errors.
+    int8_t nine330[330] = {};
+    BOOST_CHECK(!rs_decode_block_erasures(corrupted.data(), eras8, 9, nine330));
+}
+
+BOOST_AUTO_TEST_CASE(test_w1_rescue_phase1_full_v8_erasures)
+{
+    using namespace openuwb::demod::core::detail;
+
+    // 41 bytes -> 328 coded data bits: exactly one shortened RS block with
+    // data_start = 2, so all 63 RS symbols are exercised.
+    QaFrame frame;
+    BOOST_REQUIRE(qa_build_frame(41, 5150u, frame));
+    BOOST_REQUIRE_EQUAL(frame.psdu_bits, size_t(328));
+    BOOST_REQUIRE_EQUAL(frame.payload_symbols, size_t(376));
+    const size_t total = frame.u.size();
+    BOOST_REQUIRE_EQUAL(total, size_t(19 + 376 + 2));
+
+    Cl3TrellisTrace tr;
+    vitdec_cl3_biorth_trace(frame.m0.data(), frame.m1.data(), total, tr);
+    BOOST_REQUIRE_EQUAL(tr.bits.size(), total);
+    tr.bits = frame.u; // exact transmitted information bits
+    for (auto& m : tr.margins)
+        m = 100.0f; // every step initially highly reliable
+
+    const size_t t_b = 19;
+    const size_t data_start = 330 - frame.psdu_bits; // 2
+    const int bad_sym[8] = { 4, 12, 20, 28, 36, 44, 52, 60 };
+    for (int k = 0; k < 8; ++k) {
+        const int sy = bad_sym[k];
+        for (int bit = 0; bit < 6; ++bit) {
+            const size_t pos = static_cast<size_t>(sy * 6 + bit);
+            size_t vt = 0;
+            if (pos >= data_start && pos < 330)
+                vt = t_b + (pos - data_start);
+            else if (pos >= 330)
+                vt = t_b + frame.psdu_bits + (pos - 330);
+            else
+                continue;
+            tr.margins[vt] = 0.01f; // make this symbol one of the eight weakest
+        }
+        // Flip one mapped bit so the symbol value (not just its margin) is
+        // wrong: eight symbol errors, beyond the plain RS t = 4 bound.
+        const size_t pos = static_cast<size_t>(sy * 6 + 3);
+        size_t vt = 0;
+        if (pos >= data_start && pos < 330)
+            vt = t_b + (pos - data_start);
+        else
+            vt = t_b + frame.psdu_bits + (pos - 330);
+        tr.bits[vt] ^= 1;
+    }
+
+    PayloadResult out;
+    BOOST_REQUIRE(rescue_payload_biorth(frame.m0.data(),
+                                        frame.m1.data(),
+                                        total,
+                                        frame.psdu_bits,
+                                        tr,
+                                        out));
+    BOOST_CHECK(out.ok);
+    BOOST_CHECK(out.fcs_pass);
+    BOOST_CHECK(out.bytes == frame.bytes);
+    BOOST_CHECK_EQUAL(out.received_fcs, out.calculated_fcs);
+
+    // Prove the packet really needed the v = 8 attempt: on the same corrupted
+    // codeword v = 6 cannot reproduce the original block while v = 8 does.
+    // With 8 symbol errors and only 6 erasures, v = 6 is outside the unique
+    // decoding radius and is allowed to miscorrect; only the CRC-16 decides
+    // whether a candidate is the real frame.
+    int8_t blk[378];
+    expand_rs_codeword(tr.bits.data() + t_b, frame.psdu_bits, blk);
+    int8_t orig_blk[378];
+    expand_rs_codeword(frame.u.data() + t_b, frame.psdu_bits, orig_blk);
+    int eras[8];
+    for (int k = 0; k < 8; ++k)
+        eras[k] = bad_sym[k];
+    int8_t d330[330] = {};
+    const bool six_ok = rs_decode_block_erasures(blk, eras, 6, d330);
+    const bool six_restored =
+        six_ok && std::equal(d330, d330 + 330, orig_blk);
+    BOOST_TEST_MESSAGE("phase-1 v=6: ok=" << six_ok
+                                          << " restored=" << six_restored);
+    BOOST_CHECK(!six_restored);
+    BOOST_CHECK(rs_decode_block_erasures(blk, eras, 8, d330));
+    BOOST_CHECK(std::equal(d330, d330 + 330, orig_blk));
+}
+
+BOOST_AUTO_TEST_CASE(test_w1_phr_payload_independent_clipping)
+{
+    using namespace openuwb::demod::core::detail;
+
+    QaFrame frame;
+    BOOST_REQUIRE(qa_build_frame(24, 8086u, frame));
+    BOOST_REQUIRE_EQUAL(frame.payload_symbols, size_t(240));
+
+    // PHR metrics are 8x the payload scale (64-chip vs 8-chip symbols).
+    std::vector<float> phr0(frame.m0.begin(), frame.m0.begin() + 21);
+    std::vector<float> phr1(frame.m1.begin(), frame.m1.begin() + 21);
+    for (size_t i = 0; i < 21; ++i) {
+        phr0[i] *= 8.0f;
+        phr1[i] *= 8.0f;
+    }
+    std::vector<float> pay0(frame.m0.begin() + 21, frame.m0.end());
+    std::vector<float> pay1(frame.m1.begin() + 21, frame.m1.end());
+    // Legitimate strong payload pulses at the same positions as the existing
+    // pulse-clipping test.
+    const size_t pulse_pos[5] = { 60, 100, 140, 180, 220 };
+    for (size_t i = 0; i < 5; ++i) {
+        const float amp = (i % 2 == 0) ? 50.0f : -50.0f;
+        pay0[pulse_pos[i]] += amp;
+    }
+
+    PayloadResult out;
+    PayloadDecodeWorkspace ws;
+    BOOST_REQUIRE(decode_payload_biorth_soft(phr0.data(),
+                                             phr1.data(),
+                                             pay0.data(),
+                                             pay1.data(),
+                                             frame.payload_symbols,
+                                             frame.psdu_bits,
+                                             out,
+                                             nullptr,
+                                             &ws,
+                                             false,
+                                             true));
+    BOOST_CHECK(out.fcs_pass);
+    BOOST_CHECK(out.bytes == frame.bytes);
+
+    // Per-field clip contract: the 8x PHR slice is unchanged because its own
+    // 4x median limit is 32, while the payload slice clamps the 50x pulse at
+    // its own 4x limit of 4.
+    std::vector<float> cphr0 = phr0, cphr1 = phr1;
+    clip_biorth_metrics(cphr0.data(), cphr1.data(), 21);
+    for (size_t i = 0; i < 21; ++i) {
+        BOOST_CHECK_SMALL(cphr0[i] - phr0[i], 1e-6f);
+        BOOST_CHECK_SMALL(cphr1[i] - phr1[i], 1e-6f);
+    }
+    std::vector<float> cpay0 = pay0, cpay1 = pay1;
+    clip_biorth_metrics(cpay0.data(), cpay1.data(), pay0.size());
+    BOOST_CHECK_CLOSE(cpay0[pulse_pos[0]], 4.0f, 1e-3);
+
+    // The old unified clip over [PHR|payload] would have attenuated the 8x PHR
+    // to the payload-derived 4x limit; the split path leaves it untouched.
+    std::vector<float> um0 = phr0, um1 = phr1;
+    um0.insert(um0.end(), pay0.begin(), pay0.end());
+    um1.insert(um1.end(), pay1.begin(), pay1.end());
+    clip_biorth_metrics(um0.data(), um1.data(), um0.size());
+    size_t nz = 0;
+    while (nz < 21 && std::abs(phr0[nz]) < 1.0f && std::abs(phr1[nz]) < 1.0f)
+        ++nz;
+    BOOST_REQUIRE_LT(nz, size_t(21));
+    const float before = std::max(std::abs(phr0[nz]), std::abs(phr1[nz]));
+    const float after = std::max(std::abs(um0[nz]), std::abs(um1[nz]));
+    BOOST_CHECK_CLOSE(after, 4.0f, 1e-3);
+    BOOST_CHECK_LT(after, before);
+}
+
+BOOST_AUTO_TEST_CASE(test_w1_rescue_phase2_flip_plus_erasure)
+{
+    using namespace openuwb::demod::core::detail;
+
+    // 41 bytes -> one shortened RS block (328 data bits, data_start = 2).
+    QaFrame frame;
+    BOOST_REQUIRE(qa_build_frame(41, 6174u, frame));
+    const size_t total = frame.u.size();
+    BOOST_REQUIRE_EQUAL(total, size_t(19 + 376 + 2));
+    const size_t t_b = 19;
+    const size_t data_start = 330 - frame.psdu_bits; // 2
+
+    Cl3TrellisTrace tr;
+    vitdec_cl3_biorth_trace(frame.m0.data(), frame.m1.data(), total, tr);
+    BOOST_REQUIRE_EQUAL(tr.bits.size(), total);
+    tr.bits = frame.u; // exact transmitted information bits
+
+    auto vt_of = [&](int sy, int bit) -> size_t {
+        const size_t pos = static_cast<size_t>(sy * 6 + bit);
+        if (pos >= data_start && pos < 330)
+            return t_b + (pos - data_start);
+        return t_b + frame.psdu_bits + (pos - 330);
+    };
+
+    // Six RS symbol errors.  Exactly one (the symbol containing t_win) sits in
+    // the single-node flip window; the other five stay outside it.
+    //
+    // Margin ranking is chosen so Phase 1 cannot close the frame:
+    //   rank 1..9 = E6(s_win), E1, E2, C1, C2, E3, E4, C3, E5
+    //   top-4 has 3 errors (v=4 fails), top-6 has 4 (v=6 fails), top-8 has 5
+    //   (v=8 always solves the 8x8 system and therefore miscorrects).
+    for (auto& m : tr.margins)
+        m = 100.0f;
+
+    const int s_win = 30;
+    const size_t t_win = vt_of(s_win, 3);
+    tr.bits[t_win] ^= 1;
+    tr.margins[t_win] = 0.01f;
+    // Phase 2 forces tr.lose_u[t]; set it to the truly transmitted bit so the
+    // local re-solve restores the original window instead of flipping away.
+    tr.lose_u[t_win] = static_cast<uint8_t>(frame.u[t_win] & 1);
+
+    auto mark = [&](int sy, int bit, float margin, bool error) {
+        const size_t vt = vt_of(sy, bit);
+        tr.margins[vt] = margin;
+        if (error)
+            tr.bits[vt] ^= 1;
+    };
+    mark(4, 0, 0.2f, true);   // E1 rank 2 (erased by the Phase 2 retry)
+    mark(10, 0, 0.3f, true);  // E2 rank 3 (erased by the Phase 2 retry)
+    mark(22, 0, 0.4f, false); // C1 rank 4 (weak but correct)
+    mark(37, 0, 0.5f, false); // C2 rank 5 (weak but correct)
+    mark(16, 0, 0.6f, true);  // E3 rank 6
+    mark(44, 0, 0.7f, true);  // E4 rank 7
+    mark(47, 0, 0.8f, false); // C3 rank 8
+    mark(54, 0, 0.9f, true);  // E5 rank 9 (9th error, outside Phase 1 top-8)
+
+    // Phase 1 alone must miss: plain RS fails, and the v = 4/6/8 erasure
+    // attempts on the un-flipped codeword cannot reproduce the original block
+    // (v = 8 always returns some codeword, but a miscorrected one here).
+    int8_t orig_blk[378];
+    expand_rs_codeword(frame.u.data() + t_b, frame.psdu_bits, orig_blk);
+    int8_t blk0[378];
+    expand_rs_codeword(tr.bits.data() + t_b, frame.psdu_bits, blk0);
+    int8_t d0[330] = {};
+    const int era4[4] = { 30, 4, 10, 22 };
+    const int era6[6] = { 30, 4, 10, 22, 37, 16 };
+    const int era8[8] = { 30, 4, 10, 22, 37, 16, 44, 47 };
+    BOOST_CHECK(!rs_decode_block(blk0, d0));
+    const bool p4_ok = rs_decode_block_erasures(blk0, era4, 4, d0);
+    BOOST_CHECK(!(p4_ok && std::equal(d0, d0 + 330, orig_blk)));
+    const bool p6_ok = rs_decode_block_erasures(blk0, era6, 6, d0);
+    BOOST_CHECK(!(p6_ok && std::equal(d0, d0 + 330, orig_blk)));
+    const bool p8_ok = rs_decode_block_erasures(blk0, era8, 8, d0);
+    BOOST_CHECK(!(p8_ok && std::equal(d0, d0 + 330, orig_blk)));
+
+    // End-to-end: Phase 1 misses, Phase 2 flips the weakest node and the joint
+    // RS erasure retry closes the single block; only the CRC-16 accepts it.
+    PayloadResult out;
+    BOOST_REQUIRE(rescue_payload_biorth(frame.m0.data(),
+                                        frame.m1.data(),
+                                        total,
+                                        frame.psdu_bits,
+                                        tr,
+                                        out));
+    BOOST_CHECK(out.ok);
+    BOOST_CHECK(out.fcs_pass);
+    BOOST_CHECK(out.bytes == frame.bytes);
+    BOOST_CHECK_EQUAL(out.received_fcs, out.calculated_fcs);
+
+    // Deterministic proof of the mechanism: replay the same single-node flip.
+    // Plain RS then sees 5 residual symbol errors (fails), while erasing the
+    // two weakest real-error symbols leaves 3 unknown errors and
+    // 2*3 + 2 = 8, exactly the v = 2 boundary.
+    const size_t lo = (t_win > 12) ? (t_win - 12) : 0;
+    const size_t hi = std::min(total, t_win + 13);
+    std::vector<int8_t> work = tr.bits;
+    const uint8_t fu = tr.lose_u[t_win];
+    local_cl3_trellis_flip_biorth(frame.m0.data(),
+                                  frame.m1.data(),
+                                  lo,
+                                  hi,
+                                  tr.states[lo],
+                                  tr.states[hi],
+                                  &t_win,
+                                  &fu,
+                                  1,
+                                  work);
+
+    int8_t blk[378];
+    expand_rs_codeword(work.data() + t_b, frame.psdu_bits, blk);
+    int8_t d330[330] = {};
+    BOOST_CHECK(!rs_decode_block(blk, d330));
+
+    int eras_join[2] = { 4, 10 };
+    BOOST_CHECK(rs_decode_block_erasures(blk, eras_join, 2, d330));
+    for (size_t i = 0; i < 330; ++i)
+        BOOST_CHECK_EQUAL(int(d330[i]), int(orig_blk[i]));
+}
+
+// WP4 lightweight low-SNR regression guard for the fused PHR/payload chain.
+//
+// The WP1 (RS rescue) and WP3 (-pol retry) improvements live inside the
+// decoder and have no run-time switch, so an in-binary A/B is impossible.
+// This guard instead pins a deterministic baseline: the same 20 fixed seeds,
+// the same fixed unit-variance noise, and the same decoder entry point that
+// the fused kernel uses.  The recorded `kBaselinePasses` below was measured
+// on 2026-11-22 (AVX2, dev-avx2, seed set 1000..1019) after all three work
+// packages landed; any regression makes this test fail, while further
+// improvements can only raise the number.  No loops over noise levels, no
+// Monte-Carlo sweep: 20 frames, well under 0.5 s.
+BOOST_AUTO_TEST_CASE(test_w4_payload_low_snr_deterministic_regression_guard)
+{
+    using namespace openuwb::demod::core::detail;
+
+    constexpr size_t kFrames = 20;
+    constexpr float kSigma = 0.60f; // 8-16/20 FCS passes on this seed set
+    constexpr size_t kBaselinePasses = 15;
+    const auto t0 = std::chrono::steady_clock::now();
+
+    size_t passes = 0;
+    for (size_t k = 0; k < kFrames; ++k) {
+        QaFrame frame;
+        BOOST_REQUIRE(qa_build_frame(24, 1000u + static_cast<uint32_t>(k), frame));
+        BOOST_REQUIRE_EQUAL(frame.payload_symbols, size_t(240));
+
+        std::vector<float> m0 = frame.m0, m1 = frame.m1;
+        std::mt19937 rng(90000u + static_cast<uint32_t>(k));
+        qa_add_noise(m0, m1, kSigma, rng);
+
+        PayloadDecodeWorkspace ws;
+        PayloadResult out;
+        const bool ok = decode_payload_biorth_soft(frame.m0.data(),
+                                                   frame.m1.data(),
+                                                   m0.data() + 21,
+                                                   m1.data() + 21,
+                                                   frame.payload_symbols,
+                                                   frame.psdu_bits,
+                                                   out,
+                                                   nullptr,
+                                                   &ws,
+                                                   /*terminated=*/true,
+                                                   /*enable_clip=*/true);
+        if (ok && out.fcs_pass && out.bytes == frame.bytes)
+            ++passes;
+    }
+
+    const auto t1 = std::chrono::steady_clock::now();
+    const double ms =
+        std::chrono::duration<double, std::milli>(t1 - t0).count();
+    BOOST_TEST_MESSAGE("WP4 low-SNR guard: FCS "
+                       << passes << "/" << kFrames << " at sigma=" << kSigma
+                       << ", " << ms << " ms");
+    BOOST_CHECK_LE(ms, 500.0);
+    BOOST_CHECK_GE(passes, kBaselinePasses);
 }

@@ -942,6 +942,10 @@ PhrPhaseRefineResult refine_phase_cfo_from_phr(
         out.rot_at_payload_start = rot_init;
     else
         out.rot_at_payload_start = std::complex<float>(1.0f, 0.0f);
+    // Every early return must leave the mean-phase rotation at the same value
+    // as `rot_at_payload_start` (i.e. rot_init, or unit when rot_init is
+    // unusable); Pass 2 overrides it with the centre-symbol mean phase.
+    out.rot_mean_phase = out.rot_at_payload_start;
 
     if (phr_z_win == nullptr || phr_g1 == nullptr)
         return out;
@@ -1034,6 +1038,13 @@ PhrPhaseRefineResult refine_phase_cfo_from_phr(
     out.rot_at_payload_start = std::complex<float>(
         static_cast<float>(rr * cr - ri * ci),
         static_cast<float>(ri * cr + rr * ci));
+    // Mean-phase-only companion: the same unit-modulus construction with
+    // theta_payload replaced by theta_c, i.e. no delta*d extrapolation.
+    const double mr = std::cos(-theta_c);
+    const double mi = std::sin(-theta_c);
+    out.rot_mean_phase = std::complex<float>(
+        static_cast<float>(rr * mr - ri * mi),
+        static_cast<float>(ri * mr + rr * mi));
     out.delta_cfo_w_rad = delta;
     out.applied = true;
     return out;

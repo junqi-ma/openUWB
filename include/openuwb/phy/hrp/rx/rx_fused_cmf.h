@@ -840,6 +840,16 @@ inline bool payload_window_bounds(size_t n,
     return true;
 }
 
+// Copies src[0..tap_count) into dst[0..tap_count) and zeroes noise-only taps
+// below an adaptive floor estimated from the weakest half of the taps,
+// always retaining at least `min_keep` strongest taps.  Fail-open: non-finite
+// or all-zero input is copied verbatim.
+void denoise_cir_taps(const std::complex<float>* src,
+                      size_t tap_count,
+                      std::complex<float>* dst,
+                      float sigma_mult = 6.0f,
+                      size_t min_keep = 4);
+
 // Correlate all `symbols` symbols of one field against the fused templates.
 //
 // Inputs:

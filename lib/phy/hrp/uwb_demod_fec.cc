@@ -557,7 +557,7 @@ bool rs_decode_block_erasures(const int8_t* coded378,
                               int v,
                               int8_t* data330)
 {
-    if (v <= 0 || v > 6)
+    if (v <= 0 || v > 8)
         return rs_decode_block(coded378, data330);
     int r[63];
     rs_bits_to_syms(coded378, r);
@@ -584,6 +584,10 @@ bool rs_decode_block_erasures(const int8_t* coded378,
     }
     int C[9] = {};
     const int Le = rs_berlekamp_massey_len(T, rem, C);
+    // Full-erasure (v = 8) leaves no residual parity checks, so the block is
+    // decodable only when Berlekamp-Massey finds no further error locator.
+    if (v == 8 && Le != 0)
+        return false;
     if (2 * Le + v > 8)
         return false;
     int err_pos[4] = {};
@@ -676,7 +680,7 @@ bool rescue_payload_soft(const float* llr0,
         }
         need_flips[b] = 1;
         // Rank the RS symbols (6 bits each) by their least-reliable bit and
-        // erase the worst 2/4/6.  `data_start`-relative bits that fall in the
+        // erase the worst 2/4/6/8.  `data_start`-relative bits that fall in the
         // 48 parity bits map to the parity region of the codeword.
         const size_t data_start = blk_data_start[b];
         const size_t this_data = blk_this_data[b];
@@ -706,10 +710,10 @@ bool rescue_payload_soft(const float* llr0,
                   [](const SymRel& a, const SymRel& c) {
                       return a.min_m < c.min_m;
                   });
-        for (int v : { 2, 4, 6 }) {
+        for (int v : { 2, 4, 6, 8 }) {
             if (static_cast<int>(srel.size()) < v)
                 break;
-            int ep[6];
+            int ep[8];
             for (int k = 0; k < v; ++k)
                 ep[k] = srel[k].sym;
             if (rs_decode_block_erasures(blk, ep, v, d330.data())) {
@@ -1187,10 +1191,10 @@ bool rescue_payload_biorth(const float* m0,
                   [](const SymRel& a, const SymRel& c) {
                       return a.min_m < c.min_m;
                   });
-        for (int v : { 2, 4, 6 }) {
+        for (int v : { 2, 4, 6, 8 }) {
             if (static_cast<int>(srel.size()) < v)
                 break;
-            int ep[6];
+            int ep[8];
             for (int k = 0; k < v; ++k)
                 ep[k] = srel[k].sym;
             if (rs_decode_block_erasures(blk, ep, v, d330.data())) {
@@ -1257,6 +1261,85 @@ bool rescue_payload_biorth(const float* m0,
         std::array<int8_t, 330> d330{};
         const size_t t_b = blk_coded_start[b];
         const size_t t_e = t_b + blk_this_coded[b];
+        const size_t data_start = blk_data_start[b];
+        const size_t this_data = blk_this_data[b];
+        // Same per-RS-symbol reliability ranking as Phase 1 (least-reliable
+        // bit margin per 6-bit symbol), recomputed here because the Phase 1
+        // table is scoped to its loop body.
+        struct SymRel {
+            int sym;
+            float min_m;
+        };
+        // Fixed-capacity stack table: no heap traffic is added on the failure
+        // path (max 63 RS symbols).
+        SymRel srel[63];
+        int nsrel = 0;
+        {
+            const int first_sym = static_cast<int>(data_start / 6);
+            for (int sy = first_sym; sy < 63; ++sy) {
+                float mm = 1e30f;
+                for (int bit = 0; bit < 6; ++bit) {
+                    const size_t pos = static_cast<size_t>(sy * 6 + bit);
+                    size_t vt = 0;
+                    if (pos >= data_start && pos < 330)
+                        vt = t_b + (pos - data_start);
+                    else if (pos >= 330)
+                        vt = t_b + this_data + (pos - 330);
+                    else
+                        continue;
+                    mm = std::min(mm, tr.margins[vt]);
+                }
+                srel[nsrel++] = { sy, mm };
+            }
+            std::sort(srel, srel + nsrel,
+                      [](const SymRel& a, const SymRel& c) {
+                          return a.min_m < c.min_m;
+                      });
+        }
+        // Re-decode the block after one local Trellis-Chase flip.  The plain RS
+        // path stays first; on failure (and only while this block still has
+        // candidate room) retry with a joint RS erasure decode that erases the
+        // four weakest RS symbols *outside* the flipped window [lo, hi), then
+        // the two weakest.  High-SNR packets never reach this loop.
+        auto try_flip_candidate = [&](size_t lo, size_t hi) {
+            extract_block(b, work_bits, blk);
+            if (rs_decode_block(blk, d330.data())) {
+                try_append(b, d330);
+                return;
+            }
+            if (bc[b].cands.size() >= 4)
+                return;
+            int ep[4];
+            int nev = 0;
+            for (int si = 0; si < nsrel; ++si) {
+                const SymRel& sr = srel[si];
+                bool covered = false;
+                for (int bit = 0; bit < 6 && !covered; ++bit) {
+                    const size_t pos = static_cast<size_t>(sr.sym * 6 + bit);
+                    size_t vt = 0;
+                    if (pos >= data_start && pos < 330)
+                        vt = t_b + (pos - data_start);
+                    else if (pos >= 330)
+                        vt = t_b + this_data + (pos - 330);
+                    else
+                        continue;
+                    covered = (vt >= lo && vt < hi);
+                }
+                if (covered)
+                    continue;
+                ep[nev++] = sr.sym;
+                if (nev == 4)
+                    break;
+            }
+            for (int ev : { 4, 2 }) {
+                if (nev < ev)
+                    continue;
+                if (rs_decode_block_erasures(blk, ep, ev, d330.data())) {
+                    try_append(b, d330);
+                    break;
+                }
+            }
+        };
         struct StepM {
             size_t t;
             float m;
@@ -1294,9 +1377,7 @@ bool rescue_payload_biorth(const float* m0,
             const uint8_t fu = tr.lose_u[t];
             local_cl3_trellis_flip_biorth(m0, m1, lo, hi, tr.states[lo],
                                           tr.states[hi], &t, &fu, 1, work_bits);
-            extract_block(b, work_bits, blk);
-            if (rs_decode_block(blk, d330.data()))
-                try_append(b, d330);
+            try_flip_candidate(lo, hi);
         }
         for (size_t i = 0; i < weak.size() && bc[b].cands.size() < 4; ++i) {
             for (size_t j = i + 1;
@@ -1312,9 +1393,7 @@ bool rescue_payload_biorth(const float* m0,
                 local_cl3_trellis_flip_biorth(m0, m1, lo, hi, tr.states[lo],
                                               tr.states[hi], ft, fu, 2,
                                               work_bits);
-                extract_block(b, work_bits, blk);
-                if (rs_decode_block(blk, d330.data()))
-                    try_append(b, d330);
+                try_flip_candidate(lo, hi);
             }
         }
         if (bc[b].cands.empty())
@@ -1357,8 +1436,20 @@ bool decode_payload_biorth_soft(const float* m0p,
         m0j[s + 21] = m0[s];
         m1j[s + 21] = m1[s];
     }
-    if (enable_clip)
-        clip_biorth_metrics(m0j.data(), m1j.data(), total);
+    if (enable_clip) {
+        // PHR (21 x 64-chip symbols) and payload (8-chip symbols) arrive on
+        // different amplitude scales.  Clip each field against its own median
+        // so the stronger PHR metrics are not attenuated to the payload limit
+        // (and vice versa).  Very short payloads keep the original unified
+        // behaviour because clip_biorth_metrics() is a no-op below N = 16.
+        if (payload_symbols >= 16) {
+            clip_biorth_metrics(m0j.data(), m1j.data(), 21);
+            clip_biorth_metrics(m0j.data() + 21, m1j.data() + 21,
+                                payload_symbols);
+        } else {
+            clip_biorth_metrics(m0j.data(), m1j.data(), total);
+        }
+    }
 
     Cl3TrellisTrace tr;
     const auto t_vit = std::chrono::steady_clock::now();

@@ -8,6 +8,7 @@
 #include <openuwb/phy/hrp/rx/demod_payload.h>
 #include <openuwb/phy/hrp/rx/demod_execution.h>
 #include <openuwb/phy/hrp/rx/rx_fused_cmf.h>
+#include <openuwb/phy/hrp/rx/rx_matched_filter.h>
 #include <openuwb/phy/hrp/rx/rx_softchip_opt.h>
 
 #include <algorithm>
@@ -1138,7 +1139,10 @@ bool stage_ns_sfd(const std::vector<float>& soft_chips,
     if (hi < lo)
         return false;
 
+    const size_t lag_count = static_cast<size_t>(hi - lo + 1);
+    std::array<float, 2 * half + 1> lag_powers{};
     float best = -1.0f;
+    size_t best_idx = 0;
     int64_t best_k = lo;
     int pol = 1;
 
@@ -1178,8 +1182,11 @@ bool stage_ns_sfd(const std::vector<float>& soft_chips,
                     corr -= v;
             }
             const float m = std::abs(corr) / (spread_norm * seg_norm + 1e-12f);
+            const size_t lag_idx = static_cast<size_t>(k - lo);
+            lag_powers[lag_idx] = m * m;
             if (m > best) {
                 best = m;
+                best_idx = lag_idx;
                 best_k = k;
                 pol = (corr >= 0.0f) ? 1 : -1;
             }
@@ -1205,15 +1212,21 @@ bool stage_ns_sfd(const std::vector<float>& soft_chips,
             }
             seg_norm = std::sqrt(seg_norm);
             const float m = std::abs(corr) / (spread_norm * seg_norm + 1e-12f);
+            const size_t lag_idx = static_cast<size_t>(k - lo);
+            lag_powers[lag_idx] = m * m;
             if (m > best) {
                 best = m;
+                best_idx = lag_idx;
                 best_k = k;
                 pol = (corr >= 0.0f) ? 1 : -1;
             }
         }
     }
 
-    if (best < profile.sfd_detection_threshold)
+    const rxopt::MatchedFilterPeak peak{best_idx, lag_powers[best_idx], {}};
+    if (!rxopt::raw_lag_par_passes(lag_powers.data(), lag_count, peak,
+                                   kNsSfdParGuard, kNsSfdParMinBackground,
+                                   kNsSfdParFloor))
         return false;
 
     out.ok = true;
@@ -1445,6 +1458,15 @@ bool stage_phr_fused_cmf(const std::complex<float>* rx,
         return false;
     if (tap_count != profile.cir_pre_samples + profile.cir_post_samples)
         return false;
+    // Optional CIR-tap denoise: the original taps stay untouched for the
+    // diagnostics and the legacy fallback; the fused kernel reads `taps`.
+    std::complex<float> denoised_taps[rxfusion::kMaxTapCount];
+    const std::complex<float>* taps = cir.cir_filter_taps.data();
+    if (profile.rx_cir_tap_denoise) {
+        rxfusion::denoise_cir_taps(cir.cir_filter_taps.data(), tap_count,
+                                   denoised_taps);
+        taps = denoised_taps;
+    }
     if (!profile.rx_fused_sfo_track &&
         !integer_chip_grid_at(cir.samples_per_chip,
                               rxfusion::kSamplesPerChip,
@@ -1493,7 +1515,7 @@ bool stage_phr_fused_cmf(const std::complex<float>* rx,
         // same phase basis as Metrics::complex_value, ready for the pilot
         // refinement below.
         if (!rxfusion::correlate_phr_known_hop(
-                scratch.derotated.data(), n, cir.cir_filter_taps.data(),
+                scratch.derotated.data(), n, taps,
                 tap_count, phr_chip_start, rxfusion::kSamplesPerChip, phr_start,
                 scratch.fused_phr.pn.data(), pol, scratch.softchip.rot, pm,
                 scratch.fused_phr.kernel, &timings))
@@ -1501,7 +1523,7 @@ bool stage_phr_fused_cmf(const std::complex<float>* rx,
         scratch.fused_phr.metrics2_valid = true;
     } else {
         if (!rxfusion::correlate_phr(
-                scratch.derotated.data(), n, cir.cir_filter_taps.data(),
+                scratch.derotated.data(), n, taps,
                 tap_count, phr_chip_start, rxfusion::kSamplesPerChip, phr_start,
                 scratch.fused_phr.pn.data(), pol, scratch.softchip.rot,
                 scratch.fused_phr.metrics, scratch.fused_phr.kernel,
@@ -1598,14 +1620,31 @@ bool stage_phr_fused_cmf(const std::complex<float>* rx,
             prod_abs += std::abs(p);
         }
         const double prod = (prod_abs > 0.0) ? prod_re / prod_abs : 0.0;
-        double prod_gate = 0.997;
+        // Two independent gates.  The extrapolated lag-1 CFO slope is only
+        // trusted when the adjacent products are nearly collinear (0.997);
+        // a marginal pilot in [0.90, 0.997) still supports the constant
+        // mean-phase rotation, whose error does not scale with d.  Both gates
+        // are env-overridable for ablation; the defaults keep the production
+        // (rx_phr_phase_refine off) behaviour untouched.
+        double cfo_prod_gate = 0.997;
         if (const char* g = std::getenv("UWB_BPM_REFINE_PROD"))
-            prod_gate = std::atof(g);
-        if (prod < prod_gate) {
+            cfo_prod_gate = std::atof(g);
+        double phase_prod_gate = 0.90;
+        if (const char* g = std::getenv("UWB_BPM_REFINE_PHASE_PROD"))
+            phase_prod_gate = std::atof(g);
+        if (prod < phase_prod_gate) {
             scratch.phr_refine.applied = false;
             scratch.phr_refine.rot_at_payload_start = scratch.softchip.rot;
             scratch.phr_refine.delta_cfo_w_rad = 0.0;
+        } else if (prod < cfo_prod_gate) {
+            // Mean-phase-only refinement: apply the centre-symbol constant
+            // phase and disable the noisy CFO extrapolation.
+            scratch.phr_refine.applied = true;
+            scratch.phr_refine.rot_at_payload_start =
+                scratch.phr_refine.rot_mean_phase;
+            scratch.phr_refine.delta_cfo_w_rad = 0.0;
         }
+        // prod >= cfo_prod_gate: keep the full helper result (phase + CFO).
         if (scratch.phr_refine.applied) {
             // Re-express the 21 PHR metrics in the refined payload phase so
             // the joint ML Viterbi sees one consistent frame.
@@ -1902,6 +1941,17 @@ bool stage_payload_fused_cmf(const std::complex<float>* rx,
         return false;
     if (tap_count != profile.cir_pre_samples + profile.cir_post_samples)
         return false;
+    // Optional CIR-tap denoise: the original taps stay untouched for the
+    // diagnostics and the safety-net fallback; every fused kernel below reads
+    // `taps` with the unchanged `tap_count` (so the fixed 38-tap fast path is
+    // still selected).
+    std::complex<float> denoised_taps[rxfusion::kMaxTapCount];
+    const std::complex<float>* taps = cir.cir_filter_taps.data();
+    if (profile.rx_cir_tap_denoise) {
+        rxfusion::denoise_cir_taps(cir.cir_filter_taps.data(), tap_count,
+                                   denoised_taps);
+        taps = denoised_taps;
+    }
     const bool known_hop = profile.rx_bpm_known_hop;
     const bool joint_ml = profile.rx_bpm_joint_ml;
     const bool terminated = profile.rx_bpm_terminated_viterbi;
@@ -1997,7 +2047,7 @@ bool stage_payload_fused_cmf(const std::complex<float>* rx,
                 bins = rxopt::kSfoPhaseBins;
                 scratch.frac_cir_bank.resize(bins * tap_count);
                 if (!rxopt::build_fractional_cir_bank(
-                        cir.cir_filter_taps.data(), tap_count, bins,
+                        taps, tap_count, bins,
                         scratch.frac_cir_bank.data()))
                     return false;
                 bank = scratch.frac_cir_bank.data();
@@ -2005,7 +2055,7 @@ bool stage_payload_fused_cmf(const std::complex<float>* rx,
             rxfusion::DdPllConfig pll;
             pll.enable = profile.rx_bpm_ddpll;
             if (!rxfusion::correlate_payload_known_hop_fused_cfo(
-                    rx, n, cir.cir_filter_taps.data(), tap_count, chip_start,
+                    rx, n, taps, tap_count, chip_start,
                     sfo_track
                         ? cir.samples_per_chip
                         : static_cast<double>(rxfusion::kSamplesPerChip),
@@ -2023,7 +2073,7 @@ bool stage_payload_fused_cmf(const std::complex<float>* rx,
                     return false;
         } else {
             if (!rxfusion::correlate_payload_fused_cfo(
-                    rx, n, cir.cir_filter_taps.data(), tap_count, chip_start,
+                    rx, n, taps, tap_count, chip_start,
                     rxfusion::kSamplesPerChip, payload_start,
                     scratch.fused.pn.data(), symbols, pol, rot, cfo_eff,
                     scratch.fused.metrics, scratch.fused.kernel, &timings,
@@ -2131,6 +2181,56 @@ bool stage_payload_fused_cmf(const std::complex<float>* rx,
             psdu_bits, out, sub, &scratch.fused.decode, terminated,
             /*enable_clip=*/true);
         if (ml_decoded && out.fcs_pass) {
+            stamp_decode();
+            return true;
+        }
+    }
+
+    // Attempt 2b — failure-path-only `-pol` retry.  A polarity slip negates
+    // every signed metric, so the exact same observations with their sign
+    // removed are a correct-polarity decode attempt: no complex correlation is
+    // redone, no PHR is re-demodulated, and the only added work is one Viterbi
+    // pass (~10 us).  This is visible ONLY after Attempts 1 and 2 both failed;
+    // a high-SNR packet that passes on Attempt 1 never reaches it.  Failure
+    // here falls through to the unchanged Attempt 3 / safety net, so the switch
+    // cannot lose a packet the old path could decode.
+    if (joint_ml && scratch.fused_phr.metrics2_valid &&
+        scratch.fused_phr.metrics2.m0.size() == 21) {
+        auto& v0 = scratch.fused.biorth_m0;
+        auto& v1 = scratch.fused.biorth_m1;
+        v0.resize(symbols);
+        v1.resize(symbols);
+        if (known_hop) {
+            const auto& a = scratch.fused.metrics2.m0;
+            const auto& b = scratch.fused.metrics2.m1;
+            for (size_t s = 0; s < symbols; ++s) {
+                v0[s] = -a[s];
+                v1[s] = -b[s];
+            }
+        } else {
+            const auto& sv = scratch.fused.metrics.signed_value;
+            for (size_t s = 0; s < symbols; ++s) {
+                const float h0 = std::max(std::abs(sv[4 * s + 0]),
+                                          std::abs(sv[4 * s + 1]));
+                const float h1 = std::max(std::abs(sv[4 * s + 2]),
+                                          std::abs(sv[4 * s + 3]));
+                const size_t h = (h1 > h0) ? 1 : 0;
+                v0[s] = -sv[4 * s + 2 * h + 0];
+                v1[s] = -sv[4 * s + 2 * h + 1];
+            }
+        }
+        // PHR side stays local on the stack so the cached metrics2 (used only
+        // here as the negated reference) is never modified in place.
+        float np0[rxfusion::kPhrSymbols];
+        float np1[rxfusion::kPhrSymbols];
+        for (size_t s = 0; s < rxfusion::kPhrSymbols; ++s) {
+            np0[s] = -scratch.fused_phr.metrics2.m0[s];
+            np1[s] = -scratch.fused_phr.metrics2.m1[s];
+        }
+        const bool pol_decoded = detail::decode_payload_biorth_soft(
+            np0, np1, v0.data(), v1.data(), symbols, psdu_bits, out, sub,
+            &scratch.fused.decode, terminated, /*enable_clip=*/true);
+        if (pol_decoded && out.fcs_pass) {
             stamp_decode();
             return true;
         }
@@ -3137,6 +3237,82 @@ bool correlate_phr_known_hop(const std::complex<float>* rx,
                 .count());
     }
     return true;
+}
+
+void denoise_cir_taps(const std::complex<float>* src,
+                      size_t tap_count,
+                      std::complex<float>* dst,
+                      float sigma_mult,
+                      size_t min_keep)
+{
+    if (!src || !dst || tap_count == 0)
+        return;
+    // The stack buffers below are sized for the fused kernels' tap ceiling.
+    if (tap_count > kMaxTapCount) {
+        std::copy(src, src + tap_count, dst);
+        return;
+    }
+
+    float power[kMaxTapCount];
+    float total = 0.0f;
+    for (size_t q = 0; q < tap_count; ++q) {
+        if (!std::isfinite(src[q].real()) || !std::isfinite(src[q].imag())) {
+            std::copy(src, src + tap_count, dst);
+            return;
+        }
+        const float p =
+            src[q].real() * src[q].real() + src[q].imag() * src[q].imag();
+        power[q] = p;
+        total += p;
+    }
+    // All-zero input (or a degenerate single tap) is copied verbatim.
+    if (!(total > 0.0f) || !std::isfinite(total) || tap_count < 2) {
+        std::copy(src, src + tap_count, dst);
+        return;
+    }
+
+    float sorted_p[kMaxTapCount];
+    std::copy(power, power + tap_count, sorted_p);
+    std::sort(sorted_p, sorted_p + tap_count);
+
+    // Average the weakest half as a robust noise-power estimate; true multipath
+    // taps sort into the upper half and never bias the floor upwards.
+    const size_t half = tap_count / 2;
+    float noise2 = 0.0f;
+    for (size_t q = 0; q < half; ++q)
+        noise2 += sorted_p[q];
+    noise2 /= static_cast<float>(half);
+
+    size_t keep = (min_keep == 0) ? 1 : min_keep;
+    if (keep > tap_count)
+        keep = tap_count;
+
+    // Mark the `keep` strongest taps explicitly so the threshold can never
+    // delete the main path(s) even when the whole CIR is noise.
+    bool retained[kMaxTapCount] = {};
+    for (size_t k = 0; k < keep; ++k) {
+        size_t best = tap_count;
+        float best_p = -1.0f;
+        for (size_t q = 0; q < tap_count; ++q) {
+            if (retained[q])
+                continue;
+            if (power[q] > best_p) {
+                best_p = power[q];
+                best = q;
+            }
+        }
+        if (best == tap_count)
+            break;
+        retained[best] = true;
+    }
+
+    const float threshold = sigma_mult * noise2;
+    for (size_t q = 0; q < tap_count; ++q) {
+        if (!retained[q] && power[q] < threshold)
+            dst[q] = std::complex<float>(0.0f, 0.0f);
+        else
+            dst[q] = src[q];
+    }
 }
 
 } // namespace openuwb::demod::rxfusion

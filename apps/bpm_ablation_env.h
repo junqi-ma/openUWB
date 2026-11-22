@@ -9,9 +9,11 @@
 //   M2  + joint bi-orthogonal ML Viterbi (+ terminated tail)
 //   M3  + PHR pilot phase refine + symbol DD-PLL
 //   M4  + fused fractional-phase SFO tracking
+//   (opt-in via UWB_BPM_CIR_DENOISE=1: adaptive CIR-tap noise-floor shrinkage)
 //
-// Set UWB_BPM_LEVEL=0..4 in the environment of the app.  Unset keeps the
-// app's own defaults (i.e. production behaviour is unchanged).
+// Set UWB_BPM_LEVEL=0..4 in the environment of the app.  When unset, the app
+// runs the recommended low-SNR payload profile (M4 with the PHR pilot refine
+// off); UWB_BPM_LEVEL=0 still restores the previous M0 behaviour for A/B.
 #pragma once
 
 #include <gnuradio/uwb/uwb_phy_profile.h>
@@ -20,12 +22,23 @@
 
 namespace openuwb::apps {
 
-inline int bpm_ablation_level()
+// Production default for the live receiver: M4 (known-hop + joint bi-orthogonal
+// ML Viterbi + terminated tail + fused SFO tracking).  The PHR pilot refine is
+// kept off because it costs ~40 us/packet with no measured FER gain; enable it
+// with UWB_BPM_LEVEL=3/4 plus UWB_BPM_PHR_REFINE=1 when running the M3 ablation.
+inline constexpr int kDefaultBpmAblationLevel = 4;
+
+inline bool bpm_ablation_level_explicit()
 {
     const char* v = std::getenv("UWB_BPM_LEVEL");
-    if (!v || !*v)
-        return -1;
-    return std::atoi(v);
+    return v && *v;
+}
+
+inline int bpm_ablation_level()
+{
+    if (!bpm_ablation_level_explicit())
+        return kDefaultBpmAblationLevel;
+    return std::atoi(std::getenv("UWB_BPM_LEVEL"));
 }
 
 inline bool env_flag(const char* name, bool dflt)
@@ -36,14 +49,15 @@ inline bool env_flag(const char* name, bool dflt)
     return std::atoi(v) != 0;
 }
 
-// `fused_baseline` forces the previous-round fused path on, so M0 is the
-// 2d8f49b fused behaviour rather than the app's own default.
+// `fused_baseline` forces the previous-round fused path on, so an explicitly
+// selected M0 is the 2d8f49b fused behaviour rather than the app's own default.
+// The default production profile must respect the app's --fused/--ondemand
+// flags, so the forcing only applies when UWB_BPM_LEVEL was set explicitly.
 inline void apply_bpm_ablation(demod::Qm35825Profile& p, bool fused_baseline)
 {
+    const bool level_explicit = bpm_ablation_level_explicit();
     const int level = bpm_ablation_level();
-    if (level < 0)
-        return;
-    if (fused_baseline) {
+    if (fused_baseline && level_explicit) {
         p.rx_softchip_on_demand = true;
         p.rx_fused_payload_cmf = true;
         p.rx_fused_phr_cmf = true;
@@ -55,8 +69,17 @@ inline void apply_bpm_ablation(demod::Qm35825Profile& p, bool fused_baseline)
     // 1208-symbol kernel and gave no FER gain on the 6x40 fixtures or the
     // -13 dB sweep, so it stays opt-in (UWB_BPM_DDPLL=1).
     p.rx_bpm_ddpll = false;
-    p.rx_phr_phase_refine = level >= 3;
+    // The PHR pilot refine is part of the M3 ablation, but has no measured FER
+    // gain.  Keep it off on the default (unset) path; an explicit
+    // UWB_BPM_LEVEL=3/4 or UWB_BPM_PHR_REFINE=1 can still turn it on.
+    p.rx_phr_phase_refine = level_explicit && level >= 3;
     p.rx_fused_sfo_track = level >= 4;
+    // Adaptive CIR-tap noise-floor shrinkage for the fused PHR/payload kernels.
+    // TODO(openuwb-cir-denoise): A/B validate UWB_BPM_CIR_DENOISE=1 vs 0 on
+    // real-capture and dense-multipath recordings (confirm no regression when
+    // multipath energy spans > 50% of the 38-tap window) before enabling by
+    // default.
+    p.rx_cir_tap_denoise = env_flag("UWB_BPM_CIR_DENOISE", false);
     // Per-switch overrides for switch isolation during the ablation.
     p.rx_bpm_known_hop = env_flag("UWB_BPM_KNOWN_HOP", p.rx_bpm_known_hop);
     p.rx_bpm_joint_ml = env_flag("UWB_BPM_JOINT_ML", p.rx_bpm_joint_ml);

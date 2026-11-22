@@ -371,6 +371,134 @@ BOOST_AUTO_TEST_CASE(phr_phase_refine_guards)
 }
 
 // ---------------------------------------------------------------------------
+// 1b) Mean-phase-only companion (`rot_mean_phase`): a constant pilot phase is
+//     removed without the lag-1 CFO extrapolation, while a true CFO ramp is
+//     split exactly into the centre-symbol mean phase and the delta*d term.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(phr_phase_refine_mean_phase_decoupling)
+{
+    const double bias_rad = 25.0 / kRadToDeg;
+    const cf rot_init(1.0f, 0.0f);
+
+    // (a) Constant 25 deg bias plus small noise: rot_mean_phase must remove
+    // the bias and coincide with the full rotation (delta ~ 0).
+    {
+        const double sigma = 0.002;
+        std::mt19937 rng(4242);
+        std::normal_distribution<double> nd(0.0, sigma);
+        std::vector<int8_t> g1(kPhrSymbolsQa);
+        std::vector<cf> z(kPhrSymbolsQa);
+        for (size_t k = 0; k < g1.size(); ++k)
+            g1[k] = static_cast<int8_t>((k * 5 + 1) & 1u);
+        for (size_t k = 0; k < z.size(); ++k) {
+            const double sgn = static_cast<double>(1 - 2 * int(g1[k]));
+            const cd v = std::polar(1.0, bias_rad) * sgn +
+                         cd(nd(rng), nd(rng));
+            z[k] = cf(static_cast<float>(v.real()),
+                      static_cast<float>(v.imag()));
+        }
+        const PhrPhaseRefineResult r = refine_phase_cfo_from_phr(
+            z.data(), z.size(), g1.data(), 1, rot_init, kPhrSymbolSamplesQa,
+            kLastToPayloadQa);
+        BOOST_REQUIRE(r.applied);
+        const double mean_err_deg =
+            std::abs(wrap_rad(std::arg(cd(r.rot_mean_phase) / cd(rot_init)) +
+                              bias_rad)) *
+            kRadToDeg;
+        const double split_rad = std::abs(wrap_rad(std::arg(
+            cd(r.rot_at_payload_start) * std::conj(cd(r.rot_mean_phase)))));
+        BOOST_TEST_MESSAGE("mean-phase constant bias: err=" << mean_err_deg
+                           << " deg, |arg(rot/rot_mean)|=" << split_rad
+                           << " rad, delta=" << r.delta_cfo_w_rad);
+        BOOST_CHECK_LT(mean_err_deg, 3.0);
+        BOOST_CHECK_LT(split_rad, 0.02);
+    }
+
+    // (b) True linear CFO ramp: the two rotations differ by exactly -delta*d,
+    // where d is the sample distance from the centre symbol to payload s=0.
+    {
+        const double bias = 0.3;
+        const double w = 2.0e-5; // rad/sample, below the 2.5e-5 clamp
+        std::vector<int8_t> g1(kPhrSymbolsQa);
+        std::vector<cf> z(kPhrSymbolsQa);
+        for (size_t k = 0; k < g1.size(); ++k) {
+            g1[k] = static_cast<int8_t>((k * 3 + 2) & 1u);
+            const double ph =
+                bias + w * static_cast<double>(k) * kPhrSymbolSamplesQa;
+            const cd v = std::polar(1.0, ph) *
+                         static_cast<double>(1 - 2 * int(g1[k]));
+            z[k] = cf(static_cast<float>(v.real()),
+                      static_cast<float>(v.imag()));
+        }
+        const PhrPhaseRefineResult r = refine_phase_cfo_from_phr(
+            z.data(), z.size(), g1.data(), 1, rot_init, kPhrSymbolSamplesQa,
+            kLastToPayloadQa);
+        BOOST_REQUIRE(r.applied);
+        const double kc = 0.5 * static_cast<double>(kPhrSymbolsQa - 1);
+        const double d =
+            kLastToPayloadQa +
+            (static_cast<double>(kPhrSymbolsQa - 1) - kc) * kPhrSymbolSamplesQa;
+        const double split = std::arg(cd(r.rot_at_payload_start) *
+                                      std::conj(cd(r.rot_mean_phase)));
+        const double split_err =
+            std::abs(wrap_rad(split + r.delta_cfo_w_rad * d));
+        // rot_mean_phase is the CENTRE-SYMBOL mean phase (bias + delta*kc*S),
+        // not the payload phase; it must still be free of the delta*d term.
+        const double theta_c_expected =
+            bias + r.delta_cfo_w_rad * kc * kPhrSymbolSamplesQa;
+        const double mean_err =
+            std::abs(wrap_rad(std::arg(cd(r.rot_mean_phase) / cd(rot_init)) +
+                              theta_c_expected));
+        BOOST_TEST_MESSAGE("mean-phase CFO ramp: d=" << d
+                           << " delta=" << r.delta_cfo_w_rad
+                           << " split=" << split << " rad, split_err="
+                           << split_err << " rad, mean_err=" << mean_err
+                           << " rad");
+        BOOST_CHECK_GT(std::abs(r.delta_cfo_w_rad), 0.0);
+        BOOST_CHECK_LT(split_err, 1e-3);
+        BOOST_CHECK_LT(mean_err, 1e-4);
+        BOOST_CHECK_GT(std::abs(split), 0.2);
+    }
+
+    // (c) Every rejection path leaves rot_mean_phase == rot_at_payload_start
+    //     (rot_init, or the unit fallback when rot_init is unusable).
+    {
+        std::vector<cf> z(kPhrSymbolsQa, cf(1.0f, 0.0f));
+        std::vector<int8_t> g1(kPhrSymbolsQa, 0);
+        const cf rot(0.6f, 0.8f);
+        auto rejected = [&](const PhrPhaseRefineResult& r, const cf& expect) {
+            return !r.applied && r.rot_mean_phase == expect &&
+                   r.rot_at_payload_start == expect;
+        };
+        BOOST_CHECK(rejected(refine_phase_cfo_from_phr(
+                                 nullptr, z.size(), g1.data(), 1, rot,
+                                 kPhrSymbolSamplesQa, kLastToPayloadQa),
+                             rot));
+        BOOST_CHECK(rejected(refine_phase_cfo_from_phr(
+                                 z.data(), z.size(), nullptr, 1, rot,
+                                 kPhrSymbolSamplesQa, kLastToPayloadQa),
+                             rot));
+        for (size_t n : { size_t(0), size_t(1), size_t(2), size_t(3) })
+            BOOST_CHECK(rejected(refine_phase_cfo_from_phr(
+                                     z.data(), n, g1.data(), 1, rot,
+                                     kPhrSymbolSamplesQa, kLastToPayloadQa),
+                                 rot));
+        z[5] = cf(std::numeric_limits<float>::infinity(), 0.0f);
+        BOOST_CHECK(rejected(refine_phase_cfo_from_phr(
+                                 z.data(), z.size(), g1.data(), 1, rot,
+                                 kPhrSymbolSamplesQa, kLastToPayloadQa),
+                             rot));
+        const cf unit(1.0f, 0.0f);
+        BOOST_CHECK(rejected(refine_phase_cfo_from_phr(
+                                 z.data(), z.size(), g1.data(), 1,
+                                 cf(std::numeric_limits<float>::quiet_NaN(),
+                                    0.0f),
+                                 kPhrSymbolSamplesQa, kLastToPayloadQa),
+                             unit));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 2) Fractional-delay CIR bank.
 // ---------------------------------------------------------------------------
 BOOST_AUTO_TEST_CASE(fractional_cir_bank_bin0_identity_and_energy)

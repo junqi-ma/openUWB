@@ -27,6 +27,9 @@
 #include <gnuradio/uwb/uwb_hrp_mod_core.h>
 #include <gnuradio/uwb/uwb_rx_fused_cmf.h>
 
+#include <openuwb/phy/hrp/rx/demod_payload.h>
+#include <openuwb/phy/hrp/rx/demod_pipeline.h>
+
 #include <algorithm>
 #include <cmath>
 #include <complex>
@@ -977,4 +980,112 @@ BOOST_AUTO_TEST_CASE(sync_phase_without_chip_fir_matches_reference)
         taps.data(), taps.size(), spread, 32, sum, gain));
     BOOST_CHECK(!rxopt::sync_phase_gain(iq.data(), exact-1, 17,
         taps.data(), taps.size(), spread, 32, sum, gain));
+}
+
+// ---------------------------------------------------------------------------
+// 12. Failure-path-only `-pol` retry in stage_payload_fused_cmf().
+//
+// A correctly decoded packet is replayed through the fused payload stage with
+// (i) the NS-SFD polarity sign flipped and (ii) the cached 21-symbol PHR
+// metrics negated in place, which is exactly the metric state a wrong-polarity
+// correlation would have produced.  Attempts 1 (hard) and 2 (joint ML) must
+// fail on the wrong polarity; the 2b sign-retry has to recover the packet from
+// the same observations without any new complex correlation.  The control run
+// disables `rx_bpm_joint_ml`, which gates the retry off, and must stay failed
+// (proving the recovery came from 2b and not from another fallback).
+// ---------------------------------------------------------------------------
+namespace {
+
+struct PolFlipRun {
+    demod::DemodResult res;
+    bool ok = false;
+    demod::PayloadResult out;
+    uint64_t template_us = 0, correlate_us = 0, decode_us = 0, decode_ns = 0;
+    size_t symbols_out = 0;
+    bool phr_metrics_valid = false;
+    size_t phr_metrics_size = 0;
+};
+
+PolFlipRun neg_polarity_run(const Packet& packet, bool joint_ml)
+{
+    demod::Qm35825Profile profile = demod::Qm35825Profile::Default();
+    profile.code_index = 9;
+    profile.timing_search_margin = 256;
+    profile.timing_coarse_stride = 1;
+    profile.rx_softchip_on_demand = true;
+    profile.rx_fused_payload_cmf = true;
+    profile.rx_fused_phr_cmf = true;
+    profile.rx_bpm_known_hop = true;
+    profile.rx_bpm_joint_ml = joint_ml;
+    profile.rx_bpm_terminated_viterbi = true;
+    profile.rx_fused_sfo_track = true;
+
+    PolFlipRun run;
+    demod::core::DemodScratch scratch;
+    scratch.reserve(packet.iq.size());
+    run.res = demod::core::demodulate_one(
+        packet.iq.data(), packet.iq.size(), profile, 91, Packet::seed, 0,
+        packet.sync, scratch);
+    run.phr_metrics_valid = scratch.fused_phr.metrics2_valid;
+    run.phr_metrics_size = scratch.fused_phr.metrics2.m0.size();
+    if (run.res.status != demod::DemodStatus::Success)
+        return run;
+    if (!run.res.payload.fcs_pass || !run.res.ns_sfd.ok || !run.res.phr.ok)
+        return run;
+
+    // Simulate a whole-packet polarity slip: the payload correlation now uses
+    // the wrong pol, and the cached PHR metrics carry the same sign error.
+    demod::NsSfdResult flipped = run.res.ns_sfd;
+    flipped.polarity = -flipped.polarity;
+    for (auto& v : scratch.fused_phr.metrics2.m0)
+        v = -v;
+    for (auto& v : scratch.fused_phr.metrics2.m1)
+        v = -v;
+
+    // The fused PHR decisions are the ones the PHR stage decoded; only the
+    // payload side observes the flipped polarity here (see the reachability
+    // note in the task report).
+    run.ok = demod::core::stage_payload_fused_cmf(
+        packet.iq.data(), packet.iq.size(), profile, run.res.timing,
+        run.res.cir, scratch.soft_chips, flipped, run.res.phr, run.out,
+        scratch, run.template_us, run.correlate_us, run.decode_us,
+        run.decode_ns, run.symbols_out, &scratch.fused_phr.g0,
+        &scratch.fused_phr.g1, nullptr, nullptr, nullptr, 0.0);
+    return run;
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(fused_payload_neg_polarity_retry_recovers)
+{
+    Packet packet(127, 9);
+
+    const PolFlipRun retry = neg_polarity_run(packet, /*joint_ml=*/true);
+    BOOST_REQUIRE_EQUAL(int(retry.res.status),
+                        int(demod::DemodStatus::Success));
+    BOOST_REQUIRE(retry.res.payload.fcs_pass);
+    BOOST_REQUIRE(retry.phr_metrics_valid);
+    BOOST_REQUIRE_EQUAL(retry.phr_metrics_size, size_t(21));
+    BOOST_TEST_MESSAGE("neg-pol retry: ok=" << retry.ok
+                       << " fcs=" << retry.out.fcs_pass
+                       << " bytes=" << retry.out.bytes.size()
+                       << " symbols=" << retry.symbols_out
+                       << " template_us=" << retry.template_us
+                       << " correlate_us=" << retry.correlate_us
+                       << " decode_us=" << retry.decode_us
+                       << " decode_ns=" << retry.decode_ns);
+    BOOST_CHECK(retry.ok);
+    BOOST_CHECK(retry.out.fcs_pass);
+    BOOST_CHECK(retry.out.bytes == packet.wire);
+
+    // Control: identical flipped metrics, but the 2b retry is gated off.
+    const PolFlipRun control = neg_polarity_run(packet, /*joint_ml=*/false);
+    BOOST_REQUIRE_EQUAL(int(control.res.status),
+                        int(demod::DemodStatus::Success));
+    BOOST_REQUIRE(control.res.payload.fcs_pass);
+    BOOST_TEST_MESSAGE("neg-pol control (joint_ml off): ok=" << control.ok
+                       << " fcs=" << control.out.fcs_pass
+                       << " bytes=" << control.out.bytes.size());
+    BOOST_CHECK(!control.ok);
+    BOOST_CHECK(!control.out.fcs_pass);
 }

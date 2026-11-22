@@ -220,6 +220,7 @@ struct Qm35825Profile {
     bool rx_bpm_ddpll = false;            // symbol-level DD-PLL phase track
     bool rx_phr_phase_refine = false;     // PHR 21-symbol pilot refine
     bool rx_fused_sfo_track = false;      // fractional CIR bank SFO tracking
+    bool rx_cir_tap_denoise = false;      // adaptive noise-floor shrinkage for fused taps
     // Admission tolerance for the integer chip grid, in ppm of the sample
     // clock.  Both the AVX2 soft-chip kernel and the fused CMF index samples
     // on an exact kSamplesPerChip grid, so a clock offset that accumulates more

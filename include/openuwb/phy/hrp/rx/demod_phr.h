@@ -10,8 +10,10 @@ namespace openuwb::demod::core {
 // Stage 5 — NS-SFD location in the soft-chip stream (R3).
 // Matches MATLAB locateNsSfd: spread = kron(sfd_sequence, spread_code), search
 // a +/-8-chip window around expected = preamble_repetitions*chips_per_symbol
-// for the best normalized correlation.  Golden: start_chip=32512,
-// end_chip=36575, polarity=1, correlation=1.0 (chip coordinates, 0-based).
+// for the best normalized correlation, and gate acceptance by relative peak-to-
+// average power ratio (PAR) outside the mainlobe guard instead of a fixed
+// absolute threshold.  Golden: start_chip=32512, end_chip=36575, polarity=1,
+// correlation=1.0 (chip coordinates, 0-based).
 // ---------------------------------------------------------------------------
 bool stage_ns_sfd(const std::vector<float>& soft_chips,
                   const Qm35825Profile& profile,

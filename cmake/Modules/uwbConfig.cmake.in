@@ -22,9 +22,10 @@ find_dependency(Volk)
 set(OPENUWB_UHD_DEP_OK TRUE)
 # Only a UHD-enabled build carries the UHD dependency; on a no-UHD build the
 # exported targets reference no UHD::UHD, so requiring UHD here made the legacy
-# package report not-found on every machine without UHD.  Mirrors the primary
-# OpenUWBConfig.cmake (same @OPENUWB_CONFIG_UHD_DEP@ substitution).
-@OPENUWB_CONFIG_UHD_DEP@
+# package report not-found on every machine without UHD.  The injected include
+# points at ../OpenUWB/, because this config is installed in a sibling
+# directory (cmake/uwb) and does not carry its own copy of the dependency file.
+@UWB_CONFIG_UHD_DEP@
 if(NOT OPENUWB_UHD_DEP_OK)
     set(uwb_FOUND FALSE)
     set(uwb_NOT_FOUND_MESSAGE "${OpenUWB_NOT_FOUND_MESSAGE}")

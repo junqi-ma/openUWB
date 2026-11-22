@@ -319,8 +319,13 @@ if(UWB_HAVE_UHD)
     # \${...} escapes keep the consumer-time ${CMAKE_CURRENT_LIST_DIR} literal.
     set(OPENUWB_CONFIG_UHD_DEP
         "include(\"\${CMAKE_CURRENT_LIST_DIR}/OpenUWBConfigUhdDep.cmake\")")
+    # The legacy package lives in a sibling directory (cmake/uwb vs
+    # cmake/OpenUWB), so it must reach across instead of looking beside itself.
+    set(UWB_CONFIG_UHD_DEP
+        "include(\"\${CMAKE_CURRENT_LIST_DIR}/../OpenUWB/OpenUWBConfigUhdDep.cmake\")")
 else()
     set(OPENUWB_CONFIG_UHD_DEP "# this build has no UHD dependency")
+    set(UWB_CONFIG_UHD_DEP "# this build has no UHD dependency")
 endif()
 
 

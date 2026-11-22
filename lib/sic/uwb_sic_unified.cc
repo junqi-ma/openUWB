@@ -940,6 +940,288 @@ void compute_roi_energies(
 
 namespace {
 
+/** Verify that the visible complex prefix contains only finite float32 samples. */
+bool scan_prefix_finite(const std::complex<float>* y, size_t n_cplx)
+{
+    if (!y || n_cplx == 0) {
+        return true;
+    }
+    const float* data = reinterpret_cast<const float*>(y);
+    const size_t count = 2 * n_cplx;
+    size_t i = 0;
+#if defined(__AVX2__)
+    const __m256i exp_mask = _mm256_set1_epi32(0x7F800000);
+    __m256i or_acc = _mm256_setzero_si256();
+    const size_t limit32 = (count >= 32) ? (count - 31) : 0;
+    for (; i < limit32; i += 32) {
+        const __m256i v0 = _mm256_castps_si256(_mm256_loadu_ps(data + i));
+        const __m256i v1 = _mm256_castps_si256(_mm256_loadu_ps(data + i + 8));
+        const __m256i v2 = _mm256_castps_si256(_mm256_loadu_ps(data + i + 16));
+        const __m256i v3 = _mm256_castps_si256(_mm256_loadu_ps(data + i + 24));
+        const __m256i m0 = _mm256_cmpeq_epi32(_mm256_and_si256(v0, exp_mask), exp_mask);
+        const __m256i m1 = _mm256_cmpeq_epi32(_mm256_and_si256(v1, exp_mask), exp_mask);
+        const __m256i m2 = _mm256_cmpeq_epi32(_mm256_and_si256(v2, exp_mask), exp_mask);
+        const __m256i m3 = _mm256_cmpeq_epi32(_mm256_and_si256(v3, exp_mask), exp_mask);
+        or_acc = _mm256_or_si256(
+            or_acc, _mm256_or_si256(_mm256_or_si256(m0, m1), _mm256_or_si256(m2, m3)));
+    }
+    const size_t limit8 = (count >= 8) ? (count - 7) : 0;
+    for (; i < limit8; i += 8) {
+        const __m256i v = _mm256_castps_si256(_mm256_loadu_ps(data + i));
+        or_acc = _mm256_or_si256(
+            or_acc, _mm256_cmpeq_epi32(_mm256_and_si256(v, exp_mask), exp_mask));
+    }
+    if (!_mm256_testz_si256(or_acc, or_acc)) {
+        return false;
+    }
+#endif
+    for (; i < count; ++i) {
+        if (!std::isfinite(data[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#if defined(__AVX2__) && defined(__FMA__)
+inline double hsum256_ps(__m256 v)
+{
+    const __m128 lo = _mm256_castps256_ps128(v);
+    const __m128 hi = _mm256_extractf128_ps(v, 1);
+    const __m128 s4 = _mm_add_ps(lo, hi);
+    const __m128 s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+    const __m128 s1 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 0x55));
+    return static_cast<double>(_mm_cvtss_f32(s1));
+}
+#endif
+
+/** Accumulate dst[k] += (ar + j*ai) * pk[k] for interleaved complex floats. */
+inline void accum_rotated_symbol(
+    const float* __restrict pk,
+    float ar,
+    float ai,
+    float* __restrict dst,
+    size_t n_cplx)
+{
+    size_t i = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+    const __m256 var = _mm256_set1_ps(ar);
+    const __m256 vai = _mm256_setr_ps(-ai, ai, -ai, ai, -ai, ai, -ai, ai);
+    for (; i + 8 <= n_cplx; i += 8) {
+        const __m256 x0 = _mm256_loadu_ps(pk + 2 * i);
+        const __m256 x1 = _mm256_loadu_ps(pk + 2 * i + 8);
+        const __m256 d0 = _mm256_loadu_ps(dst + 2 * i);
+        const __m256 d1 = _mm256_loadu_ps(dst + 2 * i + 8);
+        const __m256 x0s = _mm256_permute_ps(x0, 0xB1);
+        const __m256 x1s = _mm256_permute_ps(x1, 0xB1);
+        const __m256 r0 = _mm256_fmadd_ps(x0s, vai, _mm256_mul_ps(x0, var));
+        const __m256 r1 = _mm256_fmadd_ps(x1s, vai, _mm256_mul_ps(x1, var));
+        _mm256_storeu_ps(dst + 2 * i, _mm256_add_ps(d0, r0));
+        _mm256_storeu_ps(dst + 2 * i + 8, _mm256_add_ps(d1, r1));
+    }
+    if (i + 4 <= n_cplx) {
+        const __m256 x0 = _mm256_loadu_ps(pk + 2 * i);
+        const __m256 d0 = _mm256_loadu_ps(dst + 2 * i);
+        const __m256 x0s = _mm256_permute_ps(x0, 0xB1);
+        const __m256 r0 = _mm256_fmadd_ps(x0s, vai, _mm256_mul_ps(x0, var));
+        _mm256_storeu_ps(dst + 2 * i, _mm256_add_ps(d0, r0));
+        i += 4;
+    }
+#endif
+    for (; i < n_cplx; ++i) {
+        const float xr = pk[2 * i];
+        const float xi = pk[2 * i + 1];
+        dst[2 * i] += xr * ar - xi * ai;
+        dst[2 * i + 1] += xi * ar + xr * ai;
+    }
+}
+
+/** Compute sum_i a[i] * conj(b[i]) over interleaved complex floats. */
+inline void complex_dot_conj(
+    const float* __restrict a,
+    const float* __restrict b,
+    size_t n_cplx,
+    double& dre_out,
+    double& dim_out)
+{
+    size_t i = 0;
+    double dre = 0.0;
+    double dim = 0.0;
+#if defined(__AVX2__) && defined(__FMA__)
+    const __m256 sign_even = _mm256_setr_ps(-0.0f, 0.0f, -0.0f, 0.0f, -0.0f, 0.0f, -0.0f, 0.0f);
+    __m256 re0 = _mm256_setzero_ps();
+    __m256 re1 = _mm256_setzero_ps();
+    __m256 im0 = _mm256_setzero_ps();
+    __m256 im1 = _mm256_setzero_ps();
+    for (; i + 8 <= n_cplx; i += 8) {
+        const __m256 va0 = _mm256_loadu_ps(a + 2 * i);
+        const __m256 vb0 = _mm256_loadu_ps(b + 2 * i);
+        const __m256 va1 = _mm256_loadu_ps(a + 2 * i + 8);
+        const __m256 vb1 = _mm256_loadu_ps(b + 2 * i + 8);
+        const __m256 vb0r = _mm256_xor_ps(_mm256_permute_ps(vb0, 0xB1), sign_even);
+        const __m256 vb1r = _mm256_xor_ps(_mm256_permute_ps(vb1, 0xB1), sign_even);
+        re0 = _mm256_fmadd_ps(va0, vb0, re0);
+        re1 = _mm256_fmadd_ps(va1, vb1, re1);
+        im0 = _mm256_fmadd_ps(va0, vb0r, im0);
+        im1 = _mm256_fmadd_ps(va1, vb1r, im1);
+    }
+    if (i + 4 <= n_cplx) {
+        const __m256 va0 = _mm256_loadu_ps(a + 2 * i);
+        const __m256 vb0 = _mm256_loadu_ps(b + 2 * i);
+        const __m256 vb0r = _mm256_xor_ps(_mm256_permute_ps(vb0, 0xB1), sign_even);
+        re0 = _mm256_fmadd_ps(va0, vb0, re0);
+        im0 = _mm256_fmadd_ps(va0, vb0r, im0);
+        i += 4;
+    }
+    dre = hsum256_ps(_mm256_add_ps(re0, re1));
+    dim = hsum256_ps(_mm256_add_ps(im0, im1));
+#endif
+    for (; i < n_cplx; ++i) {
+        const double ar = static_cast<double>(a[2 * i]);
+        const double ai = static_cast<double>(a[2 * i + 1]);
+        const double br = static_cast<double>(b[2 * i]);
+        const double bi = static_cast<double>(b[2 * i + 1]);
+        dre += ar * br + ai * bi;
+        dim += ai * br - ar * bi;
+    }
+    dre_out = dre;
+    dim_out = dim;
+}
+
+/** Measure ||y||^2 and sum y * conj(s_ref) on a symbol segment in one AVX2+FMA pass. */
+inline void measure_symbol_energy_and_dot(
+    const float* pyf,
+    const float* __restrict psf,
+    size_t len,
+    double& ey_out,
+    double& dot_re_out,
+    double& dot_im_out)
+{
+    size_t j = 0;
+    double ey = 0.0;
+    double dre = 0.0;
+    double dim = 0.0;
+#if defined(__AVX2__) && defined(__FMA__)
+    const __m256 sign_even = _mm256_setr_ps(-0.0f, 0.0f, -0.0f, 0.0f, -0.0f, 0.0f, -0.0f, 0.0f);
+    __m256 ey0 = _mm256_setzero_ps();
+    __m256 ey1 = _mm256_setzero_ps();
+    __m256 re0 = _mm256_setzero_ps();
+    __m256 re1 = _mm256_setzero_ps();
+    __m256 im0 = _mm256_setzero_ps();
+    __m256 im1 = _mm256_setzero_ps();
+    for (; j + 8 <= len; j += 8) {
+        const __m256 vy0 = _mm256_loadu_ps(pyf + 2 * j);
+        const __m256 vs0 = _mm256_loadu_ps(psf + 2 * j);
+        const __m256 vy1 = _mm256_loadu_ps(pyf + 2 * j + 8);
+        const __m256 vs1 = _mm256_loadu_ps(psf + 2 * j + 8);
+        const __m256 vs0r = _mm256_xor_ps(_mm256_permute_ps(vs0, 0xB1), sign_even);
+        const __m256 vs1r = _mm256_xor_ps(_mm256_permute_ps(vs1, 0xB1), sign_even);
+        ey0 = _mm256_fmadd_ps(vy0, vy0, ey0);
+        ey1 = _mm256_fmadd_ps(vy1, vy1, ey1);
+        re0 = _mm256_fmadd_ps(vy0, vs0, re0);
+        re1 = _mm256_fmadd_ps(vy1, vs1, re1);
+        im0 = _mm256_fmadd_ps(vy0, vs0r, im0);
+        im1 = _mm256_fmadd_ps(vy1, vs1r, im1);
+    }
+    if (j + 4 <= len) {
+        const __m256 vy0 = _mm256_loadu_ps(pyf + 2 * j);
+        const __m256 vs0 = _mm256_loadu_ps(psf + 2 * j);
+        const __m256 vs0r = _mm256_xor_ps(_mm256_permute_ps(vs0, 0xB1), sign_even);
+        ey0 = _mm256_fmadd_ps(vy0, vy0, ey0);
+        re0 = _mm256_fmadd_ps(vy0, vs0, re0);
+        im0 = _mm256_fmadd_ps(vy0, vs0r, im0);
+        j += 4;
+    }
+    ey = hsum256_ps(_mm256_add_ps(ey0, ey1));
+    dre = hsum256_ps(_mm256_add_ps(re0, re1));
+    dim = hsum256_ps(_mm256_add_ps(im0, im1));
+#endif
+    for (; j < len; ++j) {
+        const double yr = static_cast<double>(pyf[2 * j]);
+        const double yi = static_cast<double>(pyf[2 * j + 1]);
+        const double sr = static_cast<double>(psf[2 * j]);
+        const double si = static_cast<double>(psf[2 * j + 1]);
+        ey += yr * yr + yi * yi;
+        dre += yr * sr + yi * si;
+        dim += yi * sr - yr * si;
+    }
+    ey_out = ey;
+    dot_re_out = dre;
+    dot_im_out = dim;
+}
+
+/** Subtract (kr + j*ki) * s_ref from y, optionally emit i_hat, and measure ||out||^2. */
+template <bool WriteIHat>
+inline double subtract_scaled_symbol_impl(
+    const float* pyf,
+    const float* __restrict psf,
+    float kr,
+    float ki,
+    size_t len,
+    float* poutf,
+    float* __restrict pihatf)
+{
+    size_t j = 0;
+    double eout = 0.0;
+#if defined(__AVX2__) && defined(__FMA__)
+    const __m256 vkr = _mm256_set1_ps(kr);
+    const __m256 vki = _mm256_setr_ps(-ki, ki, -ki, ki, -ki, ki, -ki, ki);
+    __m256 eo0 = _mm256_setzero_ps();
+    __m256 eo1 = _mm256_setzero_ps();
+    for (; j + 8 <= len; j += 8) {
+        const __m256 vs0 = _mm256_loadu_ps(psf + 2 * j);
+        const __m256 vs1 = _mm256_loadu_ps(psf + 2 * j + 8);
+        const __m256 vy0 = _mm256_loadu_ps(pyf + 2 * j);
+        const __m256 vy1 = _mm256_loadu_ps(pyf + 2 * j + 8);
+        const __m256 vs0s = _mm256_permute_ps(vs0, 0xB1);
+        const __m256 vs1s = _mm256_permute_ps(vs1, 0xB1);
+        const __m256 vi0 = _mm256_fmadd_ps(vs0s, vki, _mm256_mul_ps(vs0, vkr));
+        const __m256 vi1 = _mm256_fmadd_ps(vs1s, vki, _mm256_mul_ps(vs1, vkr));
+        const __m256 vo0 = _mm256_sub_ps(vy0, vi0);
+        const __m256 vo1 = _mm256_sub_ps(vy1, vi1);
+        eo0 = _mm256_fmadd_ps(vo0, vo0, eo0);
+        eo1 = _mm256_fmadd_ps(vo1, vo1, eo1);
+        if constexpr (WriteIHat) {
+            _mm256_storeu_ps(pihatf + 2 * j, vi0);
+            _mm256_storeu_ps(pihatf + 2 * j + 8, vi1);
+        }
+        _mm256_storeu_ps(poutf + 2 * j, vo0);
+        _mm256_storeu_ps(poutf + 2 * j + 8, vo1);
+    }
+    if (j + 4 <= len) {
+        const __m256 vs0 = _mm256_loadu_ps(psf + 2 * j);
+        const __m256 vy0 = _mm256_loadu_ps(pyf + 2 * j);
+        const __m256 vs0s = _mm256_permute_ps(vs0, 0xB1);
+        const __m256 vi0 = _mm256_fmadd_ps(vs0s, vki, _mm256_mul_ps(vs0, vkr));
+        const __m256 vo0 = _mm256_sub_ps(vy0, vi0);
+        eo0 = _mm256_fmadd_ps(vo0, vo0, eo0);
+        if constexpr (WriteIHat) {
+            _mm256_storeu_ps(pihatf + 2 * j, vi0);
+        }
+        _mm256_storeu_ps(poutf + 2 * j, vo0);
+        j += 4;
+    }
+    eout = hsum256_ps(_mm256_add_ps(eo0, eo1));
+#endif
+    for (; j < len; ++j) {
+        const float sr = psf[2 * j];
+        const float si = psf[2 * j + 1];
+        const float ir = kr * sr - ki * si;
+        const float ii = kr * si + ki * sr;
+        const float or_ = pyf[2 * j] - ir;
+        const float oi_ = pyf[2 * j + 1] - ii;
+        if constexpr (WriteIHat) {
+            pihatf[2 * j] = ir;
+            pihatf[2 * j + 1] = ii;
+        }
+        poutf[2 * j] = or_;
+        poutf[2 * j + 1] = oi_;
+        eout += static_cast<double>(or_) * static_cast<double>(or_) +
+                static_cast<double>(oi_) * static_cast<double>(oi_);
+    }
+    return eout;
+}
+
 // Empirical steady-state SYNC template + long-baseline CFO + per-symbol phase
 // tracking for L1 Preamble+SFD cancellation.  Bypasses pulse-shaping model
 // mismatch (~1.3 dB) and suppresses both startup TX turn-on phase/amplitude
@@ -1015,26 +1297,14 @@ bool reconstruct_and_subtract_empirical_l1(
                 const float ar = static_cast<float>(std::cos(ph));
                 const float ai = static_cast<float>(std::sin(ph));
                 const float* __restrict pk = reinterpret_cast<const float*>(y + q + k * kSps);
-#pragma GCC ivdep
-                for (size_t i = 0; i < kSps; ++i) {
-                    const float xr = pk[2 * i];
-                    const float xi = pk[2 * i + 1];
-                    dst[2 * i] += xr * ar - xi * ai;
-                    dst[2 * i + 1] += xi * ar + xr * ai;
-                }
+                accum_rotated_symbol(pk, ar, ai, dst, kSps);
             }
         };
         accum_block(blk0, b0.data());
         accum_block(blk1, b1.data());
-        float dre = 0.0f, dim = 0.0f;
-#pragma GCC ivdep
-        for (size_t i = 0; i < kSps; ++i) {
-            const float a0 = b0[2 * i], c0 = b0[2 * i + 1];
-            const float a1 = b1[2 * i], c1 = b1[2 * i + 1];
-            dre += a1 * a0 + c1 * c0;
-            dim += c1 * a0 - a1 * c0;
-        }
-        const cd cross(static_cast<double>(dre), static_cast<double>(dim));
+        double dre = 0.0, dim = 0.0;
+        complex_dot_conj(b1.data(), b0.data(), kSps, dre, dim);
+        const cd cross(dre, dim);
         if (std::norm(cross) > 1e-24) {
             const double dt_s = static_cast<double>((blk1 - blk0) * kSps) / cfg.sample_rate;
             const double delta_cfo = std::arg(cross) / (kTwoPi * dt_s);
@@ -1053,14 +1323,7 @@ bool reconstruct_and_subtract_empirical_l1(
         const float ar = static_cast<float>(std::cos(ph));
         const float ai = static_cast<float>(std::sin(ph));
         const float* __restrict pk = reinterpret_cast<const float*>(y + q + k * kSps);
-        float* __restrict dst = s_acc.data();
-#pragma GCC ivdep
-        for (size_t i = 0; i < kSps; ++i) {
-            const float xr = pk[2 * i];
-            const float xi = pk[2 * i + 1];
-            dst[2 * i] += xr * ar - xi * ai;
-            dst[2 * i + 1] += xi * ar + xr * ai;
-        }
+        accum_rotated_symbol(pk, ar, ai, s_acc.data(), kSps);
     }
     const float inv_cnt_f = static_cast<float>(1.0 / static_cast<double>(k_train_end - k_skip));
     double e_ref = 0.0;
@@ -1132,32 +1395,22 @@ bool reconstruct_and_subtract_empirical_l1(
 
         const cd sym_rot = sym_rot_base * static_cast<double>(sgn);
 
-        float ey_sym_f = 0.0f;
-        float dot_re_f = 0.0f;
-        float dot_im_f = 0.0f;
+        double ey_sym = 0.0;
+        double dot_re = 0.0;
+        double dot_im = 0.0;
         const float* pyf = reinterpret_cast<const float*>(y + a);
         const float* __restrict psf = reinterpret_cast<const float*>(s_ref_cf.data() + off0);
-#pragma GCC ivdep
-        for (size_t j = 0; j < len; ++j) {
-            const float yr = pyf[2 * j];
-            const float yi = pyf[2 * j + 1];
-            const float sr = psf[2 * j];
-            const float si = psf[2 * j + 1];
-            ey_sym_f += yr * yr + yi * yi;
-            dot_re_f += yr * sr + yi * si;
-            dot_im_f += yi * sr - yr * si;
-        }
-        const double ey_sym = static_cast<double>(ey_sym_f);
+        measure_symbol_energy_and_dot(pyf, psf, len, ey_sym, dot_re, dot_im);
 
         const double e_seg = (len == kSps) ? e_ref : [&]() {
-            float es = 0.0f;
+            double es = 0.0;
             for (size_t j = 0; j < len; ++j) {
                 es += std::norm(s_ref_cf[off0 + j]);
             }
-            return static_cast<double>(es);
+            return es;
         }();
 
-        const cd dot_raw(static_cast<double>(dot_re_f), static_cast<double>(dot_im_f));
+        const cd dot_raw(dot_re, dot_im);
         const cd dot = dot_raw * std::conj(sym_rot);
         cd beta(1.0, 0.0);
         if (len >= 256 && e_seg > 0.0) {
@@ -1191,37 +1444,13 @@ bool reconstruct_and_subtract_empirical_l1(
         const float kr = static_cast<float>(scale_cd.real());
         const float ki = static_cast<float>(scale_cd.imag());
         float* poutf = reinterpret_cast<float*>(out + a);
-        float eout_sym_f = 0.0f;
-        if (i_hat) {
-            float* __restrict pihatf = reinterpret_cast<float*>(i_hat + a);
-#pragma GCC ivdep
-            for (size_t j = 0; j < len; ++j) {
-                const float sr = psf[2 * j];
-                const float si = psf[2 * j + 1];
-                const float ir = kr * sr - ki * si;
-                const float ii = kr * si + ki * sr;
-                const float or_ = pyf[2 * j] - ir;
-                const float oi_ = pyf[2 * j + 1] - ii;
-                pihatf[2 * j] = ir;
-                pihatf[2 * j + 1] = ii;
-                poutf[2 * j] = or_;
-                poutf[2 * j + 1] = oi_;
-                eout_sym_f += or_ * or_ + oi_ * oi_;
-            }
-        } else {
-#pragma GCC ivdep
-            for (size_t j = 0; j < len; ++j) {
-                const float sr = psf[2 * j];
-                const float si = psf[2 * j + 1];
-                const float or_ = pyf[2 * j] - (kr * sr - ki * si);
-                const float oi_ = pyf[2 * j + 1] - (kr * si + ki * sr);
-                poutf[2 * j] = or_;
-                poutf[2 * j + 1] = oi_;
-                eout_sym_f += or_ * or_ + oi_ * oi_;
-            }
-        }
+        const double eout_sym = i_hat
+            ? subtract_scaled_symbol_impl<true>(
+                  pyf, psf, kr, ki, len, poutf, reinterpret_cast<float*>(i_hat + a))
+            : subtract_scaled_symbol_impl<false>(
+                  pyf, psf, kr, ki, len, poutf, nullptr);
         e_y_tot += ey_sym;
-        e_out_tot += static_cast<double>(eout_sym_f);
+        e_out_tot += eout_sym;
         any_subtracted = true;
     }
 
@@ -1332,6 +1561,7 @@ bool sic_process_unified(
 
     SicUnifiedChannel channel;
 
+    bool empirical_done = false;
     if (cfg.backend == SicEstimatorBackend::Ipatov) {
         // Unified Ipatov path: run standard demodulate_one FIRST for blind
         // timing (AVX-512 16-lag), CFO, SFD and optional PHR/payload, then
@@ -1426,44 +1656,86 @@ bool sic_process_unified(
             }
         }
 
-        if (target_level == SicCancellationLevel::L1_Preamble) {
-            if (scratch.preamble_cache_valid && !scratch.cached_preamble_waveform.empty()) {
-                s_known_ptr = scratch.cached_preamble_waveform.data();
-                s_known_len = scratch.cached_preamble_waveform.size();
-            } else {
-                mod::HrpModConfig modcfg = cfg.to_hrp_mod_config();
-                size_t n_prefix = 0;
-                if (mod::modulate_prefix_waveform(modcfg, scratch.modulator,
-                                                  scratch.work_waveform.data(),
-                                                  scratch.work_waveform.size(),
-                                                  n_prefix) && n_prefix > 0) {
-                    s_known_ptr = scratch.work_waveform.data();
-                    s_known_len = n_prefix;
-                }
+        const bool try_empirical_l1 =
+            cfg.enable_empirical_phase_tracking &&
+            target_level == SicCancellationLevel::L1_Preamble &&
+            cfg.samples_per_symbol == 1016;
+
+        // Empirical L1 cancels directly from the steady-state per-symbol SYNC
+        // stack without building a sparse discrete CIR or theoretical fit_check.
+        // Fall through to full discrete CIR estimation if preconditions or
+        // empirical subtraction fail.
+        if (try_empirical_l1 && q_det >= 0 && obs > q_det && std::isfinite(decoded.cfo.cfo_hz)) {
+            const auto t_est = Clock::now();
+            if (!scan_prefix_finite(y, static_cast<size_t>(obs))) {
+                result.timings.estimate_us = us(t_est);
+                return fail_closed_before_recon("nonfinite_input");
             }
+            const size_t avail_sync = std::min<size_t>(
+                cfg.sync_reps, static_cast<size_t>((obs - q_det) / 1016));
+            const size_t k_skip = std::max<size_t>(1, cfg.fit_skip_reps);
+            const size_t k_train_end = std::min(avail_sync, cfg.fit_reps);
+            channel.valid = true;
+            channel.backend = cfg.backend;
+            channel.status = "estimated";
+            channel.q = q_det;
+            channel.cfo_hz = decoded.cfo.cfo_hz;
+            channel.phase_reference_sample = q_det;
+            channel.observed_end_sample = obs;
+            channel.impulse_template = true;
+            channel.repeats_confirmed = avail_sync;
+            if (k_train_end > k_skip) {
+                channel.training_lo = q_det + static_cast<int64_t>(k_skip * 1016);
+                channel.training_hi = q_det + static_cast<int64_t>(k_train_end * 1016);
+                channel.cir_repetitions = k_train_end - k_skip;
+            }
+            result.channel = channel;
+            result.timings.estimate_us = us(t_est);
+
+            empirical_done = reconstruct_and_subtract_empirical_l1(
+                y, n, obs, channel, cfg, scratch, result.out, result.i_hat, result);
         }
 
-        const auto t_est = Clock::now();
-        DiscreteCirModel dm;
-        DiscreteCirTimings dt;
-        DiscreteCirConfig dc = cfg.to_discrete_cir_config();
-        dc.known_q = decoded.timing.preamble_start_sample;
-        dc.known_cfo_hz = decoded.cfo.cfo_hz;
-        dc.has_known_cfo = true;
-        DiscreteCirTemplates dtemp = templates.to_discrete_cir_templates();
-        const bool est_ok = estimate_discrete_cir(
-            y, n, obs, dtemp, dc, scratch.discrete, dm, &dt);
-        channel.from_discrete_cir(dm);
-        result.channel = channel;
-        result.timings.estimate_us = us(t_est);
-        result.timings.est_detect_us = dt.detect_us;
-        result.timings.est_cfo_us = dt.cfo_us;
-        result.timings.est_cir_us = dt.support_us;
-        result.timings.est_solve_us = dt.projection_us + dt.solve_us;
-        result.timings.est_fit_check_us = dt.fit_check_us;
+        if (!empirical_done) {
+            if (target_level == SicCancellationLevel::L1_Preamble) {
+                if (scratch.preamble_cache_valid && !scratch.cached_preamble_waveform.empty()) {
+                    s_known_ptr = scratch.cached_preamble_waveform.data();
+                    s_known_len = scratch.cached_preamble_waveform.size();
+                } else {
+                    mod::HrpModConfig modcfg = cfg.to_hrp_mod_config();
+                    size_t n_prefix = 0;
+                    if (mod::modulate_prefix_waveform(modcfg, scratch.modulator,
+                                                      scratch.work_waveform.data(),
+                                                      scratch.work_waveform.size(),
+                                                      n_prefix) && n_prefix > 0) {
+                        s_known_ptr = scratch.work_waveform.data();
+                        s_known_len = n_prefix;
+                    }
+                }
+            }
 
-        if (!est_ok || !channel.valid) {
-            return fail_closed_before_recon(channel.reason ? channel.reason : channel.status);
+            const auto t_est = Clock::now();
+            DiscreteCirModel dm;
+            DiscreteCirTimings dt;
+            DiscreteCirConfig dc = cfg.to_discrete_cir_config();
+            dc.known_q = decoded.timing.preamble_start_sample;
+            dc.known_cfo_hz = decoded.cfo.cfo_hz;
+            dc.has_known_cfo = true;
+            DiscreteCirTemplates dtemp = templates.to_discrete_cir_templates();
+            const bool est_ok = estimate_discrete_cir(
+                y, n, obs, dtemp, dc, scratch.discrete, dm, &dt);
+            channel.from_discrete_cir(dm);
+            result.channel = channel;
+            result.timings.estimate_us = us(t_est);
+            result.timings.est_detect_us = dt.detect_us;
+            result.timings.est_cfo_us = dt.cfo_us;
+            result.timings.est_cir_us = dt.support_us;
+            result.timings.est_solve_us = dt.projection_us + dt.solve_us;
+            result.timings.est_fit_check_us = dt.fit_check_us;
+
+            if (!est_ok || !channel.valid) {
+                return fail_closed_before_recon(channel.reason ? channel.reason : channel.status);
+            }
         }
     } else {
         // 1. Strict-prefix Channel Estimation (DiscreteCir / PathFractional)
@@ -1585,8 +1857,8 @@ bool sic_process_unified(
     }
 
     // 3. Reconstruction and Subtraction
-    bool ok = false;
-    if (cfg.enable_empirical_phase_tracking &&
+    bool ok = empirical_done;
+    if (!ok && cfg.enable_empirical_phase_tracking &&
         cfg.backend == SicEstimatorBackend::Ipatov &&
         target_level == SicCancellationLevel::L1_Preamble &&
         cfg.samples_per_symbol == 1016) {

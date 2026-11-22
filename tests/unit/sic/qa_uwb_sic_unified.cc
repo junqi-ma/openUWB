@@ -17,6 +17,7 @@
 #include <complex>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -1125,6 +1126,54 @@ BOOST_AUTO_TEST_CASE(test_ipatov_clipped_sfd_rescues_visible_syncs)
     BOOST_REQUIRE(sic_process_unified(y.data(), n, t, cfg, scratch, res));
     BOOST_REQUIRE(res.committed);
     BOOST_CHECK_GT(res.suppression_db, 20.0);
+}
+
+BOOST_AUTO_TEST_CASE(test_ipatov_empirical_nonfinite_input_fails_closed_inplace)
+{
+    TestPacket p(9, 32, 128);
+    auto t = make_templates(p);
+    const size_t q = 300;
+    const size_t n = p.wave.size() + 1000;
+    std::vector<cf> y(n, cf(0.f, 0.f));
+    std::copy(p.wave.begin(), p.wave.end(), y.begin() + q);
+    // Place NaN past the SFD inside the visible window so demodulation reaches
+    // the empirical L1 fast path and exercises fail-closed nonfinite rejection.
+    y[n - 10] = cf(std::numeric_limits<float>::quiet_NaN(), 0.f);
+
+    SicUnifiedConfig cfg;
+    cfg.policy = SicPolicy::PreambleOnly;
+    cfg.backend = SicEstimatorBackend::Ipatov;
+    cfg.comm_code = 9;
+    cfg.sync_reps = 128;
+    cfg.samples_per_symbol = kSps;
+    cfg.sample_rate = kFs;
+    cfg.fit_skip_reps = 16;
+    cfg.fit_reps = 80;
+    cfg.allow_partial_window_clip = true;
+    cfg.enable_empirical_phase_tracking = true;
+    cfg.roi_lo = q - 32;
+    cfg.roi_hi = q + 32;
+    cfg.sub_roi_lo = 0;
+    cfg.sub_roi_hi = static_cast<int64_t>(n);
+    cfg.max_window_samples = n;
+    cfg.max_packet_samples = n;
+
+    SicUnifiedScratch scratch;
+    BOOST_REQUIRE(prepare_sic_unified(cfg, t, scratch));
+
+    std::vector<cf> y_copy = y;
+    SicUnifiedResult res;
+    res.out = y_copy.data();
+    res.i_hat = nullptr;
+    res.copy_out_on_bypass = false;
+
+    BOOST_REQUIRE(sic_process_unified(y_copy.data(), n, t, cfg, scratch, res));
+    BOOST_CHECK(!res.committed);
+    BOOST_CHECK_EQUAL(static_cast<uint8_t>(res.level),
+                      static_cast<uint8_t>(SicCancellationLevel::L0_Bypass));
+    BOOST_REQUIRE(res.reason != nullptr);
+    BOOST_CHECK_EQUAL(std::string(res.reason), "nonfinite_input");
+    BOOST_CHECK_EQUAL(std::memcmp(y_copy.data(), y.data(), n * sizeof(cf)), 0);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

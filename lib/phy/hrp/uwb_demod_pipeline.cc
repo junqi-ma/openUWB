@@ -85,8 +85,15 @@ bool search_sfd_with_wide_rescue(
     return stage_sfd(
         scratch.derotated.data(), n, profile, res.timing, sfd_seq, template_wf,
         res.sfd, scratch, [&]() {
-            const SampleRange wide_range = compute_sfd_window_range(
+            SampleRange wide_range = compute_sfd_window_range(
                 n, res.timing, profile.preamble_repetitions, sfd_len, true);
+            if (profile.sync_strategy != SyncStrategy::LockedBounded &&
+                res.timing.preamble_start_sample >= 0) {
+                const size_t pre_lo =
+                    static_cast<size_t>(res.timing.preamble_start_sample);
+                if (pre_lo < wide_range.lo)
+                    wide_range.lo = pre_lo;
+            }
             (void)rotate_window_range(
                 rx, n, profile, res.cfo.cfo_hz, wide_range, 2u, scratch, res);
         });

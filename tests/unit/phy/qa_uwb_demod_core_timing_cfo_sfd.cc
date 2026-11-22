@@ -1168,5 +1168,38 @@ BOOST_AUTO_TEST_CASE(test_demod_core_r3_sfd_child_subtimers_are_consistent)
     BOOST_CHECK_EQUAL(res.stage_total_us, parent_sum);
 }
 
+BOOST_AUTO_TEST_CASE(test_demod_core_sfd_late_acquisition_backward_rescue)
+{
+    std::vector<gr_complex> iq, tmpl;
+    BOOST_REQUIRE(load_cf32(golden_dir() + "/window.cfile", iq));
+    BOOST_REQUIRE(load_cf32("../../../testdata/reference_preamble.bin", tmpl));
+
+    core::DemodScratch scratch;
+    scratch.reserve(iq.size());
+    auto prof = Qm35825Profile::Default();
+    TimingResult tr;
+    BOOST_REQUIRE(
+        core::stage_timing(iq.data(), iq.size(), prof, tmpl, 9984, tr, scratch));
+
+    // Shift the detected preamble start 45 symbols late (beyond the +/-36
+    // discrete grid) as happens when burst interference buries the leading
+    // SYNCs during acquire.
+    tr.preamble_start_sample += static_cast<int64_t>(45 * kQm35SamplesPerSymbol);
+    const auto sfd_seq = GetSfdSequence("ieee");
+    SfdResult sr;
+    BOOST_REQUIRE(
+        core::stage_sfd(iq.data(), iq.size(), prof, tr, sfd_seq, tmpl, sr, scratch));
+    BOOST_CHECK_EQUAL(sr.sfd_start_sample, int64_t(75008));
+    BOOST_CHECK_GE(sr.metric, 0.95f);
+
+    // LockedBounded keeps the +/-36 bound and does not scan further backward.
+    auto bounded = prof;
+    bounded.sync_strategy = SyncStrategy::LockedBounded;
+    SfdResult sr_bounded;
+    BOOST_CHECK(!core::stage_sfd(
+        iq.data(), iq.size(), bounded, tr, sfd_seq, tmpl, sr_bounded, scratch));
+}
+
+
 // ---------------------------------------------------------------------------
 // SFD-anchored CFO refit policy (single-pass rotation).

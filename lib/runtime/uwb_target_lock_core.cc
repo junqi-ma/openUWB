@@ -353,8 +353,15 @@ bool TargetLockCore::apply_observation(const TargetObservation& obs)
     const double pred =
         t0_exact_ + static_cast<double>(slot) * period_samples_;
     const double resid = static_cast<double>(origin) - pred;
-    if (state_ == TargetLockState::Locked ||
-        state_ == TargetLockState::Holdover) {
+    if (state_ == TargetLockState::Verify) {
+        // Reject off-grid observations (such as in-flight acquisition windows
+        // from a faster emitter) before they occupy a slot and bias the fit.
+        if (std::abs(resid) > cfg_.residual_limit_samples) {
+            ++stats_.residual_outliers;
+            return false;
+        }
+    } else if (state_ == TargetLockState::Locked ||
+               state_ == TargetLockState::Holdover) {
         if (std::abs(resid) > cfg_.residual_limit_samples) {
             ++stats_.residual_outliers;
             ++consecutive_residual_outliers_;

@@ -746,3 +746,41 @@ BOOST_AUTO_TEST_CASE(association_window_is_not_narrowed_by_guard_shrink)
     BOOST_CHECK_EQUAL(static_cast<int>(lock.classify_candidate(far).cls),
                       static_cast<int>(CandidateClass::Unknown));
 }
+
+// ===========================================================================
+// 19. Off-grid acquire packet in VERIFY must not hijack slot 1 or bias t0
+// ===========================================================================
+BOOST_AUTO_TEST_CASE(verify_rejects_off_grid_acquire_observation)
+{
+    TargetLockCore lock(make_config());
+    // Seed slot 0 from acquisition.
+    auto seed = good_obs(lock, 0, true_origin(0));
+    seed.slot_index = std::numeric_limits<uint64_t>::max();
+    seed.from_target_window = false;
+    feed(lock, seed);
+    BOOST_REQUIRE_EQUAL(static_cast<int>(lock.state()),
+                        static_cast<int>(TargetLockState::Verify));
+
+    // In-flight 1 ms TX packet at +3 ms (0.6 * 5 ms) rounds to slot 1 via
+    // slot_for(), but is 2 ms off the 5 ms prediction.  VERIFY must reject it
+    // without polluting slot 1 or triggering reacquire.
+    const int64_t three_ms_samples = static_cast<int64_t>(std::llround(3.0e-3 * kFs));
+    auto rogue = good_obs(lock, 0, true_origin(0) + three_ms_samples);
+    rogue.packet_id = 4;
+    rogue.slot_index = std::numeric_limits<uint64_t>::max();
+    rogue.from_target_window = false;
+    feed(lock, rogue);
+    BOOST_CHECK_EQUAL(static_cast<int>(lock.state()),
+                      static_cast<int>(TargetLockState::Verify));
+    BOOST_CHECK_GT(lock.stats().residual_outliers, 0u);
+
+    // Real target slot 1 and slot 2 complete VERIFY -> LOCKED cleanly.
+    feed(lock, good_obs(lock, 1, true_origin(1)));
+    feed(lock, good_obs(lock, 2, true_origin(2)));
+    BOOST_REQUIRE_EQUAL(static_cast<int>(lock.state()),
+                        static_cast<int>(TargetLockState::Locked));
+    BOOST_CHECK_LE(std::abs(std::llround(lock.t0_exact()) - true_origin(0)), 1);
+    BOOST_CHECK_LE(std::abs(lock.predicted(3) - true_origin(3)), 1);
+    BOOST_CHECK_EQUAL(lock.stats().duplicate_observations, 0u);
+    BOOST_CHECK_EQUAL(lock.stats().reacquire_entries, 0u);
+}

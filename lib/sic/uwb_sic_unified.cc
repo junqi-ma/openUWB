@@ -11,6 +11,7 @@
 #include <openuwb/sic/sic_unified.h>
 #include <openuwb/support/timing.h>
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -285,6 +286,8 @@ uint64_t compute_unified_config_hash(const SicUnifiedConfig& cfg)
     hash_u64(h, cfg.sparse_pulse_reconstruct ? 1ull : 0ull);
     hash_u64(h, static_cast<uint64_t>(cfg.fit_reps));
     hash_u64(h, static_cast<uint64_t>(cfg.fit_skip_reps));
+    hash_u64(h, cfg.allow_partial_window_clip ? 1ull : 0ull);
+    hash_u64(h, cfg.enable_empirical_phase_tracking ? 1ull : 0ull);
     hash_u64(h, static_cast<uint64_t>(cfg.lag_lo));
     hash_u64(h, static_cast<uint64_t>(cfg.tap_count));
     hash_u64(h, static_cast<uint64_t>(cfg.k_paths));
@@ -378,6 +381,8 @@ void SicUnifiedScratch::invalidate_cache()
     cached_preamble_waveform.clear();
     cached_preamble_events.clear();
     cached_preamble_unit_waveform.clear();
+    cached_sfd_signs.fill(0);
+    cached_sfd_len = 0;
     config_hash = 0;
     template_hash = 0;
     prepared = false;
@@ -492,6 +497,12 @@ bool prepare_sic_unified(
         }
         if (!ok)
             scratch.cached_preamble_unit_waveform.clear();
+    }
+
+    const auto sfd_seq = demod::GetSfdSequence(cfg.sfd_mode ? cfg.sfd_mode : "4z2");
+    scratch.cached_sfd_len = std::min(sfd_seq.size(), scratch.cached_sfd_signs.size());
+    for (size_t i = 0; i < scratch.cached_sfd_len; ++i) {
+        scratch.cached_sfd_signs[i] = sfd_seq[i];
     }
 
     scratch.config_hash = compute_unified_config_hash(cfg);
@@ -927,6 +938,318 @@ void compute_roi_energies(
 #endif
 }
 
+namespace {
+
+// Empirical steady-state SYNC template + long-baseline CFO + per-symbol phase
+// tracking for L1 Preamble+SFD cancellation.  Bypasses pulse-shaping model
+// mismatch (~1.3 dB) and suppresses both startup TX turn-on phase/amplitude
+// transients (k < fit_skip_reps) and symbol-to-symbol phase noise while
+// preserving the zero-allocation, fail-closed, in-place contract.
+bool reconstruct_and_subtract_empirical_l1(
+    const std::complex<float>* y,
+    size_t n,
+    int64_t obs,
+    const SicUnifiedChannel& channel,
+    const SicUnifiedConfig& cfg,
+    const SicUnifiedScratch& scratch,
+    std::complex<float>* out,
+    std::complex<float>* i_hat,
+    SicUnifiedResult& result)
+{
+    using cf = std::complex<float>;
+    using cd = std::complex<double>;
+    constexpr size_t kSps = 1016;
+    constexpr double kTwoPi = 6.283185307179586476925286766559;
+
+    if (!y || !out || n == 0 || !channel.valid || cfg.samples_per_symbol != kSps ||
+        channel.q < 0 || cfg.sample_rate <= 0.0 || cfg.sync_reps == 0) {
+        return false;
+    }
+
+    const int64_t q = channel.q;
+    const int64_t vis_end = (obs > 0) ? std::min<int64_t>(int64_t(n), obs) : int64_t(n);
+    if (vis_end <= q) {
+        return false;
+    }
+    const size_t avail_sync = std::min<size_t>(
+        cfg.sync_reps, static_cast<size_t>((vis_end - q) / static_cast<int64_t>(kSps)));
+    const size_t k_skip = std::max<size_t>(1, cfg.fit_skip_reps);
+    const size_t k_train_end = std::min(avail_sync, cfg.fit_reps);
+    if (k_train_end < k_skip + 4) {
+        return false;
+    }
+
+    const int64_t roi_lo = std::max<int64_t>(0, cfg.sub_roi_lo);
+    const int64_t roi_hi = (cfg.sub_roi_hi <= 0)
+        ? static_cast<int64_t>(n)
+        : std::min<int64_t>(static_cast<int64_t>(n), cfg.sub_roi_hi);
+    const size_t sfd_len = scratch.cached_sfd_len;
+    const size_t total_syms = cfg.sync_reps + sfd_len;
+    const int64_t supp_lo = q;
+    const int64_t supp_hi = q + static_cast<int64_t>(total_syms * kSps);
+    const int64_t sub_lo = std::max<int64_t>(roi_lo, std::max<int64_t>(0, supp_lo));
+    const int64_t sub_hi = std::min<int64_t>(roi_hi, std::min<int64_t>(static_cast<int64_t>(n), supp_hi));
+    if (sub_hi <= sub_lo) {
+        return false;
+    }
+    if (!cfg.allow_partial_window_clip && (supp_lo < 0 || supp_hi > static_cast<int64_t>(n))) {
+        return false;
+    }
+
+    const auto t_recon0 = Clock::now();
+
+    // 1. Steady-state residual CFO refinement using two 16-symbol coherent blocks
+    // separated across the visible steady-state SYNC span.  Averaging 16 symbols
+    // at each end suppresses per-symbol phase jitter by 4x without endpoint
+    // telescoping and costs only 32 symbol accumulations.
+    double cfo_hz = channel.cfo_hz;
+    if (avail_sync >= k_skip + 32) {
+        constexpr size_t kBlk = 16;
+        const size_t blk0 = k_skip;
+        const size_t blk1 = avail_sync - kBlk;
+        const double omega0 = kTwoPi * channel.cfo_hz / cfg.sample_rate;
+        alignas(32) std::array<float, 2 * kSps> b0{}, b1{};
+        auto accum_block = [&](size_t start_k, float* __restrict dst) {
+            for (size_t k = start_k; k < start_k + kBlk; ++k) {
+                const double ph = -omega0 * static_cast<double>(k * kSps);
+                const float ar = static_cast<float>(std::cos(ph));
+                const float ai = static_cast<float>(std::sin(ph));
+                const float* __restrict pk = reinterpret_cast<const float*>(y + q + k * kSps);
+#pragma GCC ivdep
+                for (size_t i = 0; i < kSps; ++i) {
+                    const float xr = pk[2 * i];
+                    const float xi = pk[2 * i + 1];
+                    dst[2 * i] += xr * ar - xi * ai;
+                    dst[2 * i + 1] += xi * ar + xr * ai;
+                }
+            }
+        };
+        accum_block(blk0, b0.data());
+        accum_block(blk1, b1.data());
+        float dre = 0.0f, dim = 0.0f;
+#pragma GCC ivdep
+        for (size_t i = 0; i < kSps; ++i) {
+            const float a0 = b0[2 * i], c0 = b0[2 * i + 1];
+            const float a1 = b1[2 * i], c1 = b1[2 * i + 1];
+            dre += a1 * a0 + c1 * c0;
+            dim += c1 * a0 - a1 * c0;
+        }
+        const cd cross(static_cast<double>(dre), static_cast<double>(dim));
+        if (std::norm(cross) > 1e-24) {
+            const double dt_s = static_cast<double>((blk1 - blk0) * kSps) / cfg.sample_rate;
+            const double delta_cfo = std::arg(cross) / (kTwoPi * dt_s);
+            if (std::isfinite(delta_cfo) && std::abs(delta_cfo) < 5000.0) {
+                cfo_hz += delta_cfo;
+            }
+        }
+    }
+
+    const double omega = kTwoPi * cfo_hz / cfg.sample_rate;
+
+    // 2. Build 1016-sample steady-state template s_bar[0..1015] * exp(+j*w*i).
+    alignas(32) std::array<float, 2 * kSps> s_acc{};
+    for (size_t k = k_skip; k < k_train_end; ++k) {
+        const double ph = -omega * static_cast<double>(k * kSps);
+        const float ar = static_cast<float>(std::cos(ph));
+        const float ai = static_cast<float>(std::sin(ph));
+        const float* __restrict pk = reinterpret_cast<const float*>(y + q + k * kSps);
+        float* __restrict dst = s_acc.data();
+#pragma GCC ivdep
+        for (size_t i = 0; i < kSps; ++i) {
+            const float xr = pk[2 * i];
+            const float xi = pk[2 * i + 1];
+            dst[2 * i] += xr * ar - xi * ai;
+            dst[2 * i + 1] += xi * ar + xr * ai;
+        }
+    }
+    const float inv_cnt_f = static_cast<float>(1.0 / static_cast<double>(k_train_end - k_skip));
+    double e_ref = 0.0;
+    alignas(32) std::array<cf, kSps> s_ref_cf{};
+    for (size_t i = 0; i < kSps; ++i) {
+        const float vr = s_acc[2 * i] * inv_cnt_f;
+        const float vi = s_acc[2 * i + 1] * inv_cnt_f;
+        s_ref_cf[i] = cf(vr, vi);
+        e_ref += static_cast<double>(vr) * vr + static_cast<double>(vi) * vi;
+    }
+    if (!std::isfinite(e_ref) || e_ref <= 0.0) {
+        return false;
+    }
+
+    const auto t_sub0 = Clock::now();
+
+    if (out != y) {
+        if (sub_lo > 0) {
+            std::copy(y, y + sub_lo, out);
+        }
+        if (sub_hi < static_cast<int64_t>(n)) {
+            std::copy(y + sub_hi, y + n, out + sub_hi);
+        }
+    }
+    if (i_hat && i_hat != y && i_hat != out) {
+        std::fill(i_hat, i_hat + n, cf(0.f, 0.f));
+    }
+
+    double e_y_tot = 0.0;
+    double e_out_tot = 0.0;
+    bool any_subtracted = false;
+
+    const double csym = std::cos(omega * static_cast<double>(kSps));
+    const double ssym = std::sin(omega * static_cast<double>(kSps));
+    double sym_r = 1.0;
+    double sym_i = 0.0;
+
+    for (size_t k = 0; k < total_syms; ++k) {
+        const cd sym_rot_base(sym_r, sym_i);
+        const double nr = sym_r * csym - sym_i * ssym;
+        const double ni = sym_r * ssym + sym_i * csym;
+        sym_r = nr;
+        sym_i = ni;
+
+        const int8_t sgn = (k < cfg.sync_reps) ? int8_t(1) : scratch.cached_sfd_signs[k - cfg.sync_reps];
+        const int64_t sym_lo = q + static_cast<int64_t>(k * kSps);
+        const int64_t sym_hi = sym_lo + static_cast<int64_t>(kSps);
+        const int64_t a = std::max(sym_lo, sub_lo);
+        const int64_t b = std::min(sym_hi, sub_hi);
+        if (b <= a) {
+            continue;
+        }
+        const size_t off0 = static_cast<size_t>(a - sym_lo);
+        const size_t len = static_cast<size_t>(b - a);
+
+        if (sgn == 0) {
+            double ey = 0.0;
+            for (size_t j = 0; j < len; ++j) {
+                const cf yv = y[a + j];
+                if (out != y) {
+                    out[a + j] = yv;
+                }
+                ey += std::norm(yv);
+            }
+            e_y_tot += ey;
+            e_out_tot += ey;
+            continue;
+        }
+
+        const cd sym_rot = sym_rot_base * static_cast<double>(sgn);
+
+        float ey_sym_f = 0.0f;
+        float dot_re_f = 0.0f;
+        float dot_im_f = 0.0f;
+        const float* pyf = reinterpret_cast<const float*>(y + a);
+        const float* __restrict psf = reinterpret_cast<const float*>(s_ref_cf.data() + off0);
+#pragma GCC ivdep
+        for (size_t j = 0; j < len; ++j) {
+            const float yr = pyf[2 * j];
+            const float yi = pyf[2 * j + 1];
+            const float sr = psf[2 * j];
+            const float si = psf[2 * j + 1];
+            ey_sym_f += yr * yr + yi * yi;
+            dot_re_f += yr * sr + yi * si;
+            dot_im_f += yi * sr - yr * si;
+        }
+        const double ey_sym = static_cast<double>(ey_sym_f);
+
+        const double e_seg = (len == kSps) ? e_ref : [&]() {
+            float es = 0.0f;
+            for (size_t j = 0; j < len; ++j) {
+                es += std::norm(s_ref_cf[off0 + j]);
+            }
+            return static_cast<double>(es);
+        }();
+
+        const cd dot_raw(static_cast<double>(dot_re_f), static_cast<double>(dot_im_f));
+        const cd dot = dot_raw * std::conj(sym_rot);
+        cd beta(1.0, 0.0);
+        if (len >= 256 && e_seg > 0.0) {
+            if (k < k_skip) {
+                beta = dot / e_seg;
+                const double mag = std::abs(beta);
+                if (mag > 1.5) {
+                    beta *= (1.5 / mag);
+                }
+            } else {
+                const double mag = std::abs(dot);
+                if (mag > 0.0) {
+                    beta = dot / mag;
+                }
+            }
+        }
+
+        const double delta_e = -2.0 * (beta.real() * dot.real() + beta.imag() * dot.imag()) +
+                               std::norm(beta) * e_seg;
+        const cd scale_cd = beta * sym_rot;
+        if (!std::isfinite(delta_e) || !std::isfinite(scale_cd.real()) ||
+            !std::isfinite(scale_cd.imag()) || delta_e >= 0.0) {
+            if (out != y) {
+                std::copy(y + a, y + a + len, out + a);
+            }
+            e_y_tot += ey_sym;
+            e_out_tot += ey_sym;
+            continue;
+        }
+
+        const float kr = static_cast<float>(scale_cd.real());
+        const float ki = static_cast<float>(scale_cd.imag());
+        float* poutf = reinterpret_cast<float*>(out + a);
+        float eout_sym_f = 0.0f;
+        if (i_hat) {
+            float* __restrict pihatf = reinterpret_cast<float*>(i_hat + a);
+#pragma GCC ivdep
+            for (size_t j = 0; j < len; ++j) {
+                const float sr = psf[2 * j];
+                const float si = psf[2 * j + 1];
+                const float ir = kr * sr - ki * si;
+                const float ii = kr * si + ki * sr;
+                const float or_ = pyf[2 * j] - ir;
+                const float oi_ = pyf[2 * j + 1] - ii;
+                pihatf[2 * j] = ir;
+                pihatf[2 * j + 1] = ii;
+                poutf[2 * j] = or_;
+                poutf[2 * j + 1] = oi_;
+                eout_sym_f += or_ * or_ + oi_ * oi_;
+            }
+        } else {
+#pragma GCC ivdep
+            for (size_t j = 0; j < len; ++j) {
+                const float sr = psf[2 * j];
+                const float si = psf[2 * j + 1];
+                const float or_ = pyf[2 * j] - (kr * sr - ki * si);
+                const float oi_ = pyf[2 * j + 1] - (kr * si + ki * sr);
+                poutf[2 * j] = or_;
+                poutf[2 * j + 1] = oi_;
+                eout_sym_f += or_ * or_ + oi_ * oi_;
+            }
+        }
+        e_y_tot += ey_sym;
+        e_out_tot += static_cast<double>(eout_sym_f);
+        any_subtracted = true;
+    }
+
+    if (!any_subtracted || !std::isfinite(e_y_tot) || !std::isfinite(e_out_tot) ||
+        !(e_y_tot > 0.0) || !(e_out_tot > 0.0)) {
+        return false;
+    }
+
+    result.committed = true;
+    result.reason = "committed_preamble_empirical_phase";
+    result.level = SicCancellationLevel::L1_Preamble;
+    result.cancelled_fields = SicKnownFields::PreambleSfd;
+    result.support_lo = supp_lo;
+    result.support_hi = supp_hi;
+    result.sub_lo = sub_lo;
+    result.sub_hi = sub_hi;
+    result.sub_overlap = sub_hi - sub_lo;
+    result.waveform_scale = 1.0;
+    result.suppression_energy_valid = true;
+    result.suppression_db = 10.0 * std::log10(e_y_tot / e_out_tot);
+    result.channel.cfo_hz = cfo_hz;
+    result.timings.reconstruct_us = std::chrono::duration<double, std::micro>(t_sub0 - t_recon0).count();
+    result.timings.subtract_us = us(t_sub0);
+    return true;
+}
+
+} // namespace
+
 // ---------------------------------------------------------------------------
 // sic_process_unified
 // ---------------------------------------------------------------------------
@@ -1049,9 +1372,21 @@ bool sic_process_unified(
         result.comm_detected = (decoded.status != demod::DemodStatus::TimingFailed &&
                                 decoded.status != demod::DemodStatus::InvalidInput);
         const bool sfd_ok = decoded.sfd.ok && result.comm_detected;
+        const int64_t q_det = decoded.timing.preamble_start_sample;
+        const size_t sfd_syms = (scratch.cached_sfd_len > 0) ? scratch.cached_sfd_len : 8;
+        const size_t grid_reps = std::max(decoded.timing.detected_peaks,
+                                          decoded.timing.cir_grid_repetitions);
+        const bool clipped_sfd_l1_ok =
+            cfg.allow_partial_window_clip && result.comm_detected &&
+            decoded.timing.ok && !sfd_ok && q_det >= 0 && decoded.cfo.ok &&
+            decoded.timing.metric >= cfg.detect_threshold &&
+            grid_reps >= std::min<size_t>(16, cfg.sync_reps / 4) &&
+            (q_det + static_cast<int64_t>((cfg.sync_reps + sfd_syms) * cfg.samples_per_symbol) >
+             static_cast<int64_t>(demod_len));
 
         if (preamble_only) {
-            if (!(decoded.status == demod::DemodStatus::Success && decoded.sfd.ok)) {
+            if (!((decoded.status == demod::DemodStatus::Success && decoded.sfd.ok) ||
+                  clipped_sfd_l1_ok)) {
                 return fail_closed_before_recon("sfd_detect_failed");
             }
             target_level = SicCancellationLevel::L1_Preamble;
@@ -1082,7 +1417,7 @@ bool sic_process_unified(
                                : (!result.comm_phr_pass ? "comm_phr_failed"
                                : (!result.comm_fcs_pass ? "comm_fcs_failed"
                                : "comm_demod_failed"));
-                if (cfg.policy == SicPolicy::FullPacket || !sfd_ok) {
+                if (cfg.policy == SicPolicy::FullPacket || (!sfd_ok && !clipped_sfd_l1_ok)) {
                     return fail_closed_before_recon(fb);
                 }
                 result.fallback_reason = fb;
@@ -1250,10 +1585,20 @@ bool sic_process_unified(
     }
 
     // 3. Reconstruction and Subtraction
-    bool ok = reconstruct_and_subtract_unified(
-        y, n, channel, target_level, target_fields,
-        s_known_ptr, s_known_len,
-        templates, cfg, scratch, result.out, result.i_hat, result);
+    bool ok = false;
+    if (cfg.enable_empirical_phase_tracking &&
+        cfg.backend == SicEstimatorBackend::Ipatov &&
+        target_level == SicCancellationLevel::L1_Preamble &&
+        cfg.samples_per_symbol == 1016) {
+        ok = reconstruct_and_subtract_empirical_l1(
+            y, n, obs, channel, cfg, scratch, result.out, result.i_hat, result);
+    }
+    if (!ok) {
+        ok = reconstruct_and_subtract_unified(
+            y, n, channel, target_level, target_fields,
+            s_known_ptr, s_known_len,
+            templates, cfg, scratch, result.out, result.i_hat, result);
+    }
 
     // 3b. AutoFallback: a full-packet transaction whose support leaves the
     // window (edge interferer / pulse tail past the last sample) fails closed

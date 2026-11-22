@@ -1026,4 +1026,105 @@ BOOST_AUTO_TEST_CASE(test_ipatov_fit_skip_reps_recovers_steady_state_under_trans
     BOOST_CHECK_GT(res.suppression_db, 20.0);
 }
 
+BOOST_AUTO_TEST_CASE(test_ipatov_empirical_phase_tracking_handles_transient_and_jitter)
+{
+    TestPacket p(9, 32, 128);
+    auto t = make_templates(p);
+    const size_t q = 300;
+    const size_t n = p.wave.size() + 1000;
+    std::vector<cf> y(n, cf(0.f, 0.f));
+
+    // Synthesize: +45 deg startup transient + 0.58x k=0 ramp + ±6 deg per-symbol
+    // phase jitter + 2200 Hz CFO across 128 SYNC + 8 SFD symbols.
+    const double cfo_hz = 2200.0;
+    const double omega = 2.0 * M_PI * cfo_hz / kFs;
+    const size_t total_prefix = (128 + 8) * kSps;
+    uint32_t rng = 0x12345678u;
+    for (size_t k = 0; k < 128 + 8; ++k) {
+        rng = rng * 1664525u + 1013904223u;
+        const double jitter_deg = ((static_cast<double>((rng >> 16) & 0xffffu) / 65535.0) - 0.5) * 12.0;
+        const double extra_deg = (k < 16) ? (45.0 * (16.0 - k) / 16.0) : jitter_deg;
+        const double amp = (k == 0) ? 0.58 : 1.0;
+        const auto sym_rot = static_cast<float>(amp) * std::polar(1.0f, float(extra_deg * M_PI / 180.0));
+        for (size_t i = 0; i < kSps; ++i) {
+            const size_t idx = k * kSps + i;
+            if (idx >= total_prefix || idx >= p.wave.size()) break;
+            const auto cfo_rot = std::polar(1.0f, float(omega * double(idx)));
+            y[q + idx] = p.wave[idx] * sym_rot * cfo_rot;
+        }
+    }
+
+    SicUnifiedConfig cfg;
+    cfg.policy = SicPolicy::PreambleOnly;
+    cfg.backend = SicEstimatorBackend::Ipatov;
+    cfg.comm_code = 9;
+    cfg.sync_reps = 128;
+    cfg.samples_per_symbol = kSps;
+    cfg.sample_rate = kFs;
+    cfg.fit_skip_reps = 16;
+    cfg.fit_reps = 80;
+    cfg.enable_empirical_phase_tracking = true;
+    cfg.roi_lo = q - 32;
+    cfg.roi_hi = q + 32;
+    cfg.sub_roi_lo = q;
+    cfg.sub_roi_hi = q + total_prefix;
+    cfg.max_window_samples = n;
+    cfg.max_packet_samples = n;
+
+    SicUnifiedScratch scratch;
+    std::string err;
+    BOOST_REQUIRE_MESSAGE(prepare_sic_unified(cfg, t, scratch, &err), err);
+
+    std::vector<cf> out(n), i_hat(n);
+    SicUnifiedResult res;
+    res.out = out.data();
+    res.i_hat = i_hat.data();
+    BOOST_REQUIRE(sic_process_unified(y.data(), n, t, cfg, scratch, res));
+    BOOST_REQUIRE(res.committed);
+    BOOST_CHECK_EQUAL(std::string(res.reason), "committed_preamble_empirical_phase");
+    BOOST_CHECK_GT(res.suppression_db, 22.0);
+    BOOST_CHECK_LT(std::abs(res.channel.cfo_hz - cfo_hz), 100.0);
+}
+
+BOOST_AUTO_TEST_CASE(test_ipatov_clipped_sfd_rescues_visible_syncs)
+{
+    TestPacket p(9, 32, 128);
+    auto t = make_templates(p);
+    // Truncate the window inside the last 4 symbols of SYNC (SFD falls past n).
+    const size_t q = 300;
+    const size_t n = q + 124 * kSps;
+    std::vector<cf> y(n, cf(0.f, 0.f));
+    std::copy(p.wave.begin(), p.wave.begin() + (n - q), y.begin() + q);
+
+    SicUnifiedConfig cfg;
+    cfg.policy = SicPolicy::PreambleOnly;
+    cfg.backend = SicEstimatorBackend::Ipatov;
+    cfg.comm_code = 9;
+    cfg.sync_reps = 128;
+    cfg.samples_per_symbol = kSps;
+    cfg.sample_rate = kFs;
+    cfg.fit_skip_reps = 16;
+    cfg.fit_reps = 80;
+    cfg.allow_partial_window_clip = true;
+    cfg.enable_empirical_phase_tracking = true;
+    cfg.roi_lo = q - 32;
+    cfg.roi_hi = q + 32;
+    cfg.sub_roi_lo = 0;
+    cfg.sub_roi_hi = static_cast<int64_t>(n);
+    cfg.max_window_samples = n;
+    cfg.max_packet_samples = p.wave.size() + 256;
+
+    SicUnifiedScratch scratch;
+    std::string err;
+    BOOST_REQUIRE_MESSAGE(prepare_sic_unified(cfg, t, scratch, &err), err);
+
+    std::vector<cf> out(n), i_hat(n);
+    SicUnifiedResult res;
+    res.out = out.data();
+    res.i_hat = i_hat.data();
+    BOOST_REQUIRE(sic_process_unified(y.data(), n, t, cfg, scratch, res));
+    BOOST_REQUIRE(res.committed);
+    BOOST_CHECK_GT(res.suppression_db, 20.0);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

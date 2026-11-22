@@ -183,6 +183,8 @@ struct Workers {
                 sc.sfd_mode = o.sic_sfd.c_str();
                 sc.fit_skip_reps = (o.sic_reps >= 64) ? 16 : 1;
                 sc.fit_reps = std::min<size_t>(o.sic_reps, sc.fit_skip_reps + 64);
+                sc.allow_partial_window_clip = (o.sic == "preamble" || o.sic == "auto");
+                sc.enable_empirical_phase_tracking = (o.sic_backend == "ipatov");
                 // Blind search over the whole window; the worker overrides the
                 // subtraction ROI with its own work capacity in the constructor.
                 sc.roi_lo = 0;

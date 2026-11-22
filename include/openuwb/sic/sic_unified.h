@@ -256,6 +256,7 @@ struct SicUnifiedConfig {
 
     // Robustness / validation options
     bool allow_partial_window_clip = false; ///< Clip edge interferers to [0, n) instead of context_truncated
+    bool enable_empirical_phase_tracking = false; ///< L1 Ipatov: empirical steady-state SYNC template + per-symbol phase tracking
     double validate_threshold = 0.25;       ///< Forwarded to PathFractional SicConfig::validate_threshold
 
     // Path Fractional Backend Specific Options
@@ -465,6 +466,8 @@ struct SicUnifiedScratch {
     // unit reference SYNC and its taps already contain the pulse shaping, so
     // the reconstruction input must be this waveform, never the shaped one.
     std::vector<std::complex<float>> cached_preamble_unit_waveform;
+    std::array<int8_t, 64> cached_sfd_signs{};
+    size_t cached_sfd_len = 0;
 
     /**
      * @brief Preallocates all scratch buffers to handle windows up to max_window_samples

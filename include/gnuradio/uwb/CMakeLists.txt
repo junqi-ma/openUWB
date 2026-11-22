@@ -31,6 +31,13 @@ install(FILES
     ${PROJECT_BINARY_DIR}/include/openuwb/support/simd_config.h
     DESTINATION include/openuwb/support
 )
+# Same rule for the generated openuwb::timing default (UWB_ENABLE_TIMING):
+# the installed consumer must see the identical compile-time default the
+# library was built with, or ScopedNs<> would disagree across TUs.
+install(FILES
+    ${PROJECT_BINARY_DIR}/include/openuwb/support/timing_config.h
+    DESTINATION include/openuwb/support
+)
 # TODO(openuwb-compat-removal): legacy location of the generated header, for
 # consumers that include <gnuradio/uwb/uwb_simd_config.h> directly.
 install(FILES

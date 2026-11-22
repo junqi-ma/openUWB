@@ -28,6 +28,7 @@
  */
 
 #include <gnuradio/uwb/uwb_uhd_sc16_pipeline.h>
+#include <openuwb/support/timing.h>
 
 #include "pipeline_bench_setup.h"
 #include "pipeline_result_json.h"
@@ -281,7 +282,7 @@ public:
     bool is_eof() const override { return eof_; }
 
 private:
-    using Clock = std::chrono::steady_clock;
+    using Clock = openuwb::timing::Clock;
 
     void maybe_wait_for_flow()
     {

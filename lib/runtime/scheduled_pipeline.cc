@@ -14,6 +14,7 @@
 #include <openuwb/dsp/resample_window.h>
 #include <openuwb/support/defaults.h>
 #include <openuwb/support/log.h>
+#include <openuwb/support/timing.h>
 #include <volk/volk.h>
 
 #include <algorithm>
@@ -164,12 +165,11 @@ std::vector<float> load_resampler_taps(const std::string& dir,
     return taps;
 }
 
-inline uint64_t elapsed_ns(std::chrono::steady_clock::time_point a,
-                           std::chrono::steady_clock::time_point b)
-{
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
-}
+// openuwb::timing::elapsed_ns is the single library-wide implementation now
+// (identical duration_cast<nanoseconds> truncation to the historical local
+// helper it replaces); re-expose it here so the accumulator call sites below
+// keep their exact spelling.
+using openuwb::timing::elapsed_ns;
 
 // Measures how long a mutex acquisition actually blocked and accumulates it as
 // nanoseconds.  With wait_ns == nullptr this is a plain std::lock_guard, so the

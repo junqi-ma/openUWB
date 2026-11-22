@@ -57,6 +57,7 @@
 #include <openuwb/phy/hrp/common/hrp_codec.h>
 #include <openuwb/support/kernel_backend.h>
 #include <openuwb/support/simd_config.h>
+#include <openuwb/support/timing.h>
 #include <chrono>
 #include <cmath>
 #include <complex>
@@ -92,7 +93,7 @@ namespace {
 
 using cf = std::complex<float>;
 using cd = std::complex<double>;
-using Clock = std::chrono::steady_clock;
+using Clock = openuwb::timing::Clock;
 
 constexpr double kPi = 3.14159265358979323846;
 // Full-packet coordinates are frozen on the 998.4 MS/s work grid.  The frozen

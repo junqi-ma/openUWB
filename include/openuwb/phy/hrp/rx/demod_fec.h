@@ -2,6 +2,7 @@
 #pragma once
 #include <openuwb/phy/hrp/rx/demod_result.h>
 #include <openuwb/phy/hrp/rx/rx_bpm.h>
+#include <openuwb/support/timing.h>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -41,12 +42,11 @@ inline uint64_t payload_sub_total(const PayloadSubTimers& s)
 }
 
 // Elapsed microseconds since `t0`, truncated exactly like the parent laps.
+// Delegates to the support-layer primitive (openuwb::timing::elapsed_us_since,
+// same monotonic clock, same duration_cast truncation).
 inline uint64_t payload_elapsed_us(std::chrono::steady_clock::time_point t0)
 {
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - t0)
-            .count());
+    return openuwb::timing::elapsed_us_since(t0);
 }
 
 class PayloadSubTimer

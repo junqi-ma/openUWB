@@ -9,6 +9,7 @@
  */
 
 #include <openuwb/sic/sic_unified.h>
+#include <openuwb/support/timing.h>
 
 #include <chrono>
 #include <cmath>
@@ -24,7 +25,7 @@ namespace sic {
 
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock = openuwb::timing::Clock;
 
 double us(Clock::time_point t)
 {

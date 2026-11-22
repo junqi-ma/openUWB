@@ -3,6 +3,7 @@
 #include <gnuradio/uwb/uwb_discrete_cir_sic.h>
 #include <gnuradio/uwb/fullpacket_rx_pipeline.h>
 #include <gnuradio/uwb/uwb_radar_cir_core.h>
+#include <openuwb/support/timing.h>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <algorithm>
@@ -21,9 +22,9 @@
 #include <array>
 using namespace openuwb;
 using C = std::complex<float>;
-using Clock = std::chrono::steady_clock;
+using Clock = openuwb::timing::Clock;
 namespace fs = std::filesystem;
-double cpu_us() { timespec t{}; clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t);return t.tv_sec*1e6+t.tv_nsec/1e3; }
+double cpu_us() { return static_cast<double>(openuwb::timing::thread_cpu_ns())/1e3; }
 double us(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double,std::micro>(b-a).count(); }
 std::vector<C> read_iq(const fs::path& p) {
  std::ifstream f(p,std::ios::binary|std::ios::ate); if(!f) throw std::runtime_error("read "+p.string());

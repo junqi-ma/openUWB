@@ -223,6 +223,27 @@ configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/include/openuwb/support/simd_config.h.in
     ${CMAKE_CURRENT_BINARY_DIR}/include/openuwb/support/simd_config.h
     @ONLY)
+
+########################################################################
+# openuwb::timing (support layer): the wall-clock measurement primitives.
+#
+# The instrumentation RAII scopes default to ON, which is the historical,
+# always-on behaviour of the stage-boundary telemetry.  OFF compiles only
+# ScopedNs<false> by default (a TU can still opt in with ScopedNs<true>);
+# the plain elapsed_ns/elapsed_us/thread_cpu helpers are never compiled out
+# because the stage-boundary contracts quote their values verbatim.
+########################################################################
+option(UWB_ENABLE_TIMING
+    "Compile the openuwb::timing RAII scopes enabled by default" ON)
+set(UWB_TIMING_ENABLED_DEFAULT 1)
+if(NOT UWB_ENABLE_TIMING)
+    set(UWB_TIMING_ENABLED_DEFAULT 0)
+endif()
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/openuwb/support/timing_config.h.in
+    ${CMAKE_CURRENT_BINARY_DIR}/include/openuwb/support/timing_config.h
+    @ONLY)
+
 # The generated header must be visible to every subdirectory (and to the
 # installed consumer, which gets the same file from the install rule).
 include_directories(${CMAKE_CURRENT_BINARY_DIR}/include)

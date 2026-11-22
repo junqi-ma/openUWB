@@ -297,6 +297,9 @@ set(UWB_UNIT_QA_SOURCES
     # SIC live processor QA. Appended last so the historical test numbering
     # above is untouched.
     ${UWB_UNIT_DIR}/runtime/qa_uwb_live_packet_processor_sic.cc
+    # Timing refactor (2026-11-21): the support-layer wall-clock primitives.
+    # Appended after the historical numbering for the same reason.
+    ${UWB_UNIT_DIR}/support/qa_uwb_timing.cc
 )
 
 set(UWB_SHARDED_QA_BINARIES

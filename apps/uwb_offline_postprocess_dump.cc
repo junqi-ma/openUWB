@@ -19,6 +19,7 @@
 #include <gnuradio/uwb/uwb_scheduled_dump_io.h>
 #include <gnuradio/uwb/uwb_tone_canceller.h>
 #include <gnuradio/uwb/uwb_window_crop_core.h>
+#include <openuwb/support/timing.h>
 
 #include <algorithm>
 #include <atomic>
@@ -695,7 +696,7 @@ int main(int argc, char** argv)
         return 2;
     }
 
-    using Clock = std::chrono::steady_clock;
+    using Clock = openuwb::timing::Clock;
     const auto t_read0 = Clock::now();
 
     std::vector<WindowJob> jobs(selected.size());

@@ -63,7 +63,7 @@ using Clock = openuwb::timing::Clock;
 constexpr double kPi = 3.14159265358979323846;
 constexpr size_t kMinSps = 64;
 constexpr size_t kMaxSps = 4096;
-constexpr size_t kMaxFitReps = 64;
+constexpr size_t kMaxFitReps = 128;
 constexpr size_t kMaxTaps = kDiscreteCirMaxTaps;
 constexpr size_t kMaxActive = 64; // unchanged legacy LS solve bound
 constexpr size_t kFactorCacheSlots = 16;
@@ -235,6 +235,7 @@ uint64_t config_identity(const DiscreteCirConfig& cfg)
     hash_u64(h, static_cast<uint64_t>(cfg.samples_per_symbol));
     hash_double(h, cfg.sample_rate);
     hash_u64(h, static_cast<uint64_t>(cfg.fit_reps));
+    hash_u64(h, static_cast<uint64_t>(cfg.fit_skip_reps));
     hash_i64(h, cfg.lag_lo);
     hash_u64(h, static_cast<uint64_t>(cfg.tap_count));
     hash_double(h, cfg.peak_floor);
@@ -482,7 +483,9 @@ bool prepare_discrete_cir(const DiscreteCirConfig& cfg,
     if (templates.sync_len != cfg.samples_per_symbol)
         return fail("sync_len != samples_per_symbol");
     if (cfg.fit_reps == 0 || cfg.fit_reps > kMaxFitReps)
-        return fail("fit_reps outside [1,64]");
+        return fail("fit_reps outside [1,128]");
+    if (cfg.fit_skip_reps >= cfg.fit_reps)
+        return fail("fit_skip_reps >= fit_reps");
     if (cfg.sync_reps == 0)
         return fail("sync_reps == 0");
     if (!(cfg.sample_rate > 0.0) || !std::isfinite(cfg.sample_rate))
@@ -1142,7 +1145,8 @@ bool estimate_discrete_cir(const std::complex<float>* y,
             build_cfo_rotation(cfo, fs, width, scratch.cfo_rot);
         }
 
-        for (size_t k = 1; k < cfg.fit_reps; ++k) {
+        const size_t k_skip = std::max<size_t>(1, cfg.fit_skip_reps);
+        for (size_t k = k_skip; k < cfg.fit_reps; ++k) {
             const int64_t lo = q + int64_t(k * sps) + cfg.lag_lo;
             if (lo < 0 || lo + int64_t(width) > training_end) continue;
             const int64_t rel_lo = lo - q;
@@ -1189,14 +1193,18 @@ bool estimate_discrete_cir(const std::complex<float>* y,
         model.lag_lo=cfg.lag_lo;
         model.tap_count=model.active_count=taps;
         model.support_source="ipatov_correlation";
-        model.training_lo=q;
-        model.training_hi=training_end;
+        const auto t_fit=Clock::now();
+        const size_t rows=size_t(training_end-q);
+        const size_t eval_lo =
+            (cfg.fit_skip_reps > 1 && cfg.fit_skip_reps * sps < rows)
+                ? (cfg.fit_skip_reps * sps)
+                : 0;
+        model.training_lo = q + static_cast<int64_t>(eval_lo);
+        model.training_hi = training_end;
         if (timings) timings->support_us=us_since(t_support);
 
         // Validate the frozen float response against UNIT impulse training.
         // No projection, Gram solve or re-fit. Keep physical amplitude/phase.
-        const auto t_fit=Clock::now();
-        const size_t rows=size_t(training_end-q);
         if (scratch.z.size()<rows) return finish("failed","scratch_capacity");
 
         bool use_periodic = (sps == 1016 && rows == cfg.fit_reps * sps && cfg.fit_reps >= 2);
@@ -1276,8 +1284,8 @@ bool estimate_discrete_cir(const std::complex<float>* y,
         if (cfo == 0.0) {
             double num0 = 0.0, num1 = 0.0, num2 = 0.0, num3 = 0.0;
             double den0 = 0.0, den1 = 0.0, den2 = 0.0, den3 = 0.0;
-            size_t m = 0;
-            const size_t limit = (rows >= 4) ? (rows - 3) : 0;
+            size_t m = eval_lo;
+            const size_t limit = (rows >= eval_lo + 4) ? (rows - 3) : eval_lo;
             for (; m < limit; m += 4) {
                 const cd obs0(y[size_t(q) + m]);
                 const cd obs1(y[size_t(q) + m + 1]);
@@ -1308,8 +1316,8 @@ bool estimate_discrete_cir(const std::complex<float>* y,
             const cd* const rot = scratch.cfo_rot.data();
             double num0 = 0.0, num1 = 0.0, num2 = 0.0, num3 = 0.0;
             double den0 = 0.0, den1 = 0.0, den2 = 0.0, den3 = 0.0;
-            size_t m = 0;
-            const size_t limit = (rows >= 4) ? (rows - 3) : 0;
+            size_t m = eval_lo;
+            const size_t limit = (rows >= eval_lo + 4) ? (rows - 3) : eval_lo;
             for (; m < limit; m += 4) {
                 const cd obs0(y[size_t(q) + m]);
                 const cd obs1(y[size_t(q) + m + 1]);

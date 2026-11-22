@@ -1181,3 +1181,72 @@ BOOST_AUTO_TEST_CASE(test_discrete_cir_negative_cfo)
         BOOST_CHECK_LT(std::abs(cd(m.taps[d]) - ref_tap), 2e-5);
     }
 }
+
+BOOST_AUTO_TEST_CASE(test_discrete_cir_ipatov_fit_skip_reps_excludes_transient)
+{
+    Packet p(9, 32);
+    const size_t q = 350;
+    const size_t n = q + 128 * kSps + 512;
+    const int64_t observed_end = static_cast<int64_t>(q + 80 * kSps);
+
+    // Steady-state waveform, plus a strong +45 deg phase/amplitude turn-on
+    // transient on k=0..15 matching DW3000 startup behaviour.
+    std::vector<cf> y(n, cf{});
+    const cd transient_rot = std::polar(1.0, 45.0 * kPi / 180.0);
+    for (size_t k = 0; k < 80; ++k) {
+        for (size_t i = 0; i < kSps; ++i) {
+            const cf base = p.sync[i];
+            y[q + k * kSps + i] = (k < 16) ? cf(cd(base) * transient_rot) : base;
+        }
+    }
+
+    auto cfg = make_cfg(n, q, 20);
+    cfg.comm_code = 9;
+    cfg.sync_reps = 128;
+    cfg.ipatov_correlation = true;
+    cfg.known_q = static_cast<int64_t>(q);
+    cfg.known_cfo_hz = 0.0;
+    cfg.has_known_cfo = true;
+    cfg.fit_skip_reps = 16;
+    cfg.fit_reps = 80;
+
+    // Build templates matching fit_reps = 80.
+    std::vector<cf> train80;
+    train80.reserve(80 * kSps);
+    for (size_t k = 0; k < 80; ++k)
+        train80.insert(train80.end(), p.sync.begin(), p.sync.end());
+    sic::DiscreteCirTemplates tmpl{p.sync.data(), p.sync.size(),
+                                   train80.data(), train80.size()};
+
+    sic::DiscreteCirScratch s;
+    std::string err;
+    BOOST_REQUIRE_MESSAGE(sic::prepare_discrete_cir(cfg, tmpl, s, &err), err);
+
+    sic::DiscreteCirModel m;
+    BOOST_REQUIRE(sic::estimate_discrete_cir(
+        y.data(), n, observed_end, tmpl, cfg, s, m));
+    BOOST_REQUIRE(m.valid);
+    BOOST_CHECK_GE(m.cir_repetitions, size_t(62));
+    BOOST_CHECK_EQUAL(m.training_lo, static_cast<int64_t>(q + 16 * kSps));
+    BOOST_CHECK_LT(m.fit_residual, 0.02);
+
+    // Verify estimated taps match an uncorrupted steady-state reference run
+    // (only the 4 negative-lag samples overlapping the tail of k=15 differ, < 2e-4).
+    std::vector<cf> y_clean(n, cf{});
+    for (size_t k = 0; k < 80; ++k) {
+        std::copy(p.sync.begin(), p.sync.end(), y_clean.begin() + q + k * kSps);
+    }
+    sic::DiscreteCirModel m_clean;
+    BOOST_REQUIRE(sic::estimate_discrete_cir(
+        y_clean.data(), n, observed_end, tmpl, cfg, s, m_clean));
+    BOOST_REQUIRE(m_clean.valid);
+    for (size_t d = 0; d < cfg.tap_count; ++d) {
+        BOOST_CHECK_LT(std::abs(cd(m.taps[d]) - cd(m_clean.taps[d])), 2e-4);
+    }
+
+    // Fail-closed when fit_skip_reps >= fit_reps.
+    auto bad = cfg;
+    bad.fit_skip_reps = bad.fit_reps;
+    BOOST_CHECK(!sic::prepare_discrete_cir(bad, tmpl, s, &err));
+    BOOST_CHECK_EQUAL(err, "fit_skip_reps >= fit_reps");
+}

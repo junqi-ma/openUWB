@@ -212,6 +212,7 @@ DiscreteCirConfig SicUnifiedConfig::to_discrete_cir_config() const
     c.sfd_mode = sfd_mode;
     c.sample_rate = sample_rate;
     c.fit_reps = fit_reps;
+    c.fit_skip_reps = fit_skip_reps;
     c.roi_lo = roi_lo;
     c.roi_hi = roi_hi;
     c.lag_lo = lag_lo;
@@ -283,6 +284,7 @@ uint64_t compute_unified_config_hash(const SicUnifiedConfig& cfg)
     hash_u64(h, static_cast<uint64_t>(cfg.backend));
     hash_u64(h, cfg.sparse_pulse_reconstruct ? 1ull : 0ull);
     hash_u64(h, static_cast<uint64_t>(cfg.fit_reps));
+    hash_u64(h, static_cast<uint64_t>(cfg.fit_skip_reps));
     hash_u64(h, static_cast<uint64_t>(cfg.lag_lo));
     hash_u64(h, static_cast<uint64_t>(cfg.tap_count));
     hash_u64(h, static_cast<uint64_t>(cfg.k_paths));

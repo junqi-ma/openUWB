@@ -181,7 +181,8 @@ struct Workers {
                 sc.samples_per_symbol = 1016;
                 sc.sample_rate = work_fs;
                 sc.sfd_mode = o.sic_sfd.c_str();
-                sc.fit_reps = std::min<size_t>(8, o.sic_reps);
+                sc.fit_skip_reps = (o.sic_reps >= 64) ? 16 : 1;
+                sc.fit_reps = std::min<size_t>(o.sic_reps, sc.fit_skip_reps + 64);
                 // Blind search over the whole window; the worker overrides the
                 // subtraction ROI with its own work capacity in the constructor.
                 sc.roi_lo = 0;

@@ -83,6 +83,7 @@ struct DiscreteCirConfig {
     const char* sfd_mode = "4z2";
     double sample_rate = 998.4e6;
     size_t fit_reps = 8;             // training symbols, strictly visible prefix
+    size_t fit_skip_reps = 1;        // initial SYNC symbols skipped before fitting (TX turn-on transient)
     int64_t roi_lo = 0, roi_hi = 0;  // public coarse candidate search ROI
 
     // Finite discrete support.  lag_lo is the LOWEST integer lag.  tap_count

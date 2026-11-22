@@ -978,4 +978,52 @@ BOOST_AUTO_TEST_CASE(test_path_fractional_validate_threshold_forwarded)
     BOOST_CHECK_EQUAL(std::string(uncal.reason), "uncalibrated_validate_threshold");
 }
 
+BOOST_AUTO_TEST_CASE(test_ipatov_fit_skip_reps_recovers_steady_state_under_transient)
+{
+    TestPacket p(9, 32, 128);
+    auto t = make_templates(p);
+    const size_t q = 300;
+    const size_t n = p.wave.size() + 1000;
+    std::vector<cf> y(n, cf(0.f, 0.f));
+    const auto transient_rot = std::polar(1.0f, float(45.0 * M_PI / 180.0));
+    for (size_t i = 0; i < p.wave.size(); ++i) {
+        y[q + i] = (i < 16 * kSps) ? (p.wave[i] * transient_rot) : p.wave[i];
+    }
+
+    SicUnifiedConfig cfg;
+    cfg.policy = SicPolicy::PreambleOnly;
+    cfg.backend = SicEstimatorBackend::Ipatov;
+    cfg.comm_code = 9;
+    cfg.sync_reps = 128;
+    cfg.samples_per_symbol = kSps;
+    cfg.sample_rate = kFs;
+    cfg.fit_skip_reps = 16;
+    cfg.fit_reps = 80;
+    cfg.roi_lo = q - 32;
+    cfg.roi_hi = q + 32;
+    cfg.sub_roi_lo = q + 16 * kSps;
+    cfg.sub_roi_hi = q + 128 * kSps;
+    cfg.max_window_samples = n;
+    cfg.max_packet_samples = n;
+
+    SicUnifiedScratch scratch;
+    std::string err;
+    BOOST_REQUIRE_MESSAGE(prepare_sic_unified(cfg, t, scratch, &err), err);
+    BOOST_CHECK(scratch.cache_matches(cfg, t));
+
+    // Changing fit_skip_reps must invalidate the cache.
+    auto other = cfg;
+    other.fit_skip_reps = 8;
+    BOOST_CHECK(!scratch.cache_matches(other, t));
+
+    std::vector<cf> out(n), i_hat(n);
+    SicUnifiedResult res;
+    res.out = out.data();
+    res.i_hat = i_hat.data();
+    BOOST_REQUIRE(sic_process_unified(y.data(), n, t, cfg, scratch, res));
+    BOOST_REQUIRE(res.committed);
+    BOOST_CHECK_GE(res.channel.cir_repetitions, size_t(62));
+    BOOST_CHECK_GT(res.suppression_db, 20.0);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

@@ -239,6 +239,7 @@ struct SicUnifiedConfig {
 
     // Estimation Thresholds and Strides
     size_t fit_reps = 8;                  ///< SYNC symbols used for training (strictly inside prefix)
+    size_t fit_skip_reps = 1;             ///< Initial SYNC symbols skipped before training (TX turn-on transient)
     size_t coarse_stride = 1;             ///< Acquisition coarse stride
     double detect_threshold = 0.40;       ///< Detection metric threshold
     double fit_residual_max = 0.80;       ///< Commit ceiling on normalized training residual

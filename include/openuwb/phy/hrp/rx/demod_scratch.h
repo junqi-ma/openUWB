@@ -81,6 +81,12 @@ struct DemodScratch {
     // Cached pre-duplicated real SYNC template for AVX2 fast dot.
     rxopt::RealSyncTemplate real_sync_template;
 
+    // ML CFO estimator zero-allocation scratch buffers.
+    std::vector<std::complex<float>> cfo_sym_z;    // full-preamble symbols
+    std::vector<std::complex<float>> cfo_coarse_z; // coarse centre window
+    std::vector<std::complex<double>> cfo_fft_buf; // zero-padded radix-2 FFT
+    std::vector<float> cfo_mag_buf;                // |z| for median clipping
+
     // Cached sequence data for fixed preamble code and SFD mode (Task B2).
     struct CachedSequenceState {
         size_t code_index = std::numeric_limits<size_t>::max();
@@ -262,6 +268,10 @@ struct DemodScratch {
         peak_values.reserve(256);
         fold_buf.reserve(16384);
         fold_sup_buf.reserve(2048);
+        cfo_sym_z.reserve(512);
+        cfo_coarse_z.reserve(128);
+        cfo_fft_buf.reserve(1024);
+        cfo_mag_buf.reserve(512);
         cir_avg_tail.reserve(2048);
         cir_phase_rot.reserve(2048);
         sfd_template.reserve(8 * kQm35SamplesPerSymbol);

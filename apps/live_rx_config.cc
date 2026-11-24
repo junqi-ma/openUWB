@@ -180,8 +180,11 @@ void validate_live_rx_config(LiveRxConfig& o)
     if (o.print!="packets" && o.print!="summary")
         throw std::runtime_error("--print must be packets or summary");
     if (o.taps!="quality" && o.taps!="eq32" && o.taps!="realtime" &&
-        o.taps!="eq16")
-        throw std::runtime_error("--taps must be quality, eq32, realtime or eq16");
+        o.taps!="eq16" && o.taps!="ch250_eq16" && o.taps!="ch250_eq24" &&
+        o.taps!="ch250_eq32" && o.taps!="ch250_eq48")
+        throw std::runtime_error(
+            "--taps must be quality, eq32, realtime, eq16, ch250_eq16, "
+            "ch250_eq24, ch250_eq32 or ch250_eq48");
     if (o.sync!="acquire" && o.sync!="locked")
         throw std::runtime_error("--sync must be acquire or locked");
     if (o.par_only!="off" && o.par_only!="sync" && o.par_only!="sfd" &&

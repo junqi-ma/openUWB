@@ -22,6 +22,8 @@
  * Coverage:
  *   - 65/48 shipped taps: eq16 (H=16), realtime (H=21), eq32 (H=32),
  *     quality (H=42) -> exercises H not a multiple of 8;
+ *   - 65/48 ch250 taps: ch250_eq16, ch250_eq24, ch250_eq32, ch250_eq48
+ *     (H = 16/24/32/48, T = 65*H - 1, i.e. a one-tap-short last arm);
  *   - 65/32 shipped taps: realtime (H=17), quality (H=42);
  *   - lengths 0, 1, 7, 47, 48, 49, 65, 128, 1024, 4096, 56000 and the
  *     production 450000 window;
@@ -382,6 +384,18 @@ BOOST_AUTO_TEST_CASE(test_transposed_65_48_all_profiles)
         real_taps("resampler_65_48/taps_quality_eq32.txt"), "65/48 eq32");
     check_tap_set<TransposedResampler65_48, 65, 48>(
         real_taps("resampler_65_48/taps_quality_minorder.txt"), "65/48 quality");
+
+    // 250 MHz channelised redesign (T = 65*H - 1; the last polyphase arm is
+    // one tap short of a full arm).  Same H_pad classes as the shipped set,
+    // independent upfirdn reference and the same 1e-5 contract.
+    check_tap_set<TransposedResampler65_48, 65, 48>(
+        real_taps("resampler_65_48/taps_ch250_eq16.txt"), "65/48 ch250_eq16");
+    check_tap_set<TransposedResampler65_48, 65, 48>(
+        real_taps("resampler_65_48/taps_ch250_eq24.txt"), "65/48 ch250_eq24");
+    check_tap_set<TransposedResampler65_48, 65, 48>(
+        real_taps("resampler_65_48/taps_ch250_eq32.txt"), "65/48 ch250_eq32");
+    check_tap_set<TransposedResampler65_48, 65, 48>(
+        real_taps("resampler_65_48/taps_ch250_eq48.txt"), "65/48 ch250_eq48");
 }
 
 BOOST_AUTO_TEST_CASE(test_transposed_65_32_all_profiles)
@@ -412,6 +426,19 @@ BOOST_AUTO_TEST_CASE(test_transposed_core_integration)
         real_taps("resampler_65_48/taps_realtime_minorder.txt"), "65/48 rt");
     check_core_integration<RationalResampler65_48Core, 65, 48>(
         real_taps("resampler_65_48/taps_quality_minorder.txt"), "65/48 q");
+
+    // 250 MHz channelised profiles: the core's set_kernel("transposed") path
+    // must stay memcmp-identical to the standalone kernel for the
+    // one-tap-short last arm as well.
+    check_core_integration<RationalResampler65_48Core, 65, 48>(
+        real_taps("resampler_65_48/taps_ch250_eq16.txt"), "65/48 ch250_eq16");
+    check_core_integration<RationalResampler65_48Core, 65, 48>(
+        real_taps("resampler_65_48/taps_ch250_eq24.txt"), "65/48 ch250_eq24");
+    check_core_integration<RationalResampler65_48Core, 65, 48>(
+        real_taps("resampler_65_48/taps_ch250_eq32.txt"), "65/48 ch250_eq32");
+    check_core_integration<RationalResampler65_48Core, 65, 48>(
+        real_taps("resampler_65_48/taps_ch250_eq48.txt"), "65/48 ch250_eq48");
+
     check_core_integration<RationalResampler65_32Core, 65, 32>(
         real_taps("resampler_65_32/taps_realtime_minorder.txt"), "65/32 rt");
 }

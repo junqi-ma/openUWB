@@ -50,6 +50,15 @@ struct LiveRxConfig {
     //   eq32     T=2079 Hpad=32  ripple 0.0849 dB  stopband -76.03 dB  (equiripple)
     //   realtime T=1319 Hpad=24  ripple 0.0053 dB  stopband -70.07 dB  (Kaiser)
     //   eq16     T=1039 Hpad=16  ripple 0.0868 dB  stopband -74.56 dB  (equiripple)
+    // The `ch250_*` sets are the 250 MHz channelized redesigns: three-band
+    // Parks-McClellan (passband [0, 250] MHz, OOB stopband [f_oob, 368.64] MHz,
+    // anti-image stopband from 487.28 MHz) instead of the legacy 290/330 MHz
+    // anti-image-only passband, so the -322..-276 MHz OOB burst is attenuated.
+    // They fill the same Hpad budgets, so kernel cost is unchanged:
+    //   ch250_eq16 T=1039 Hpad=16   ch250_eq24 T=1559 Hpad=24
+    //   ch250_eq32 T=2079 Hpad=32   ch250_eq48 T=3119 Hpad=48
+    // These are opt-in (`--taps ch250_*`); the default below is still `eq16`
+    // until the full ABBA replay matrix justifies switching it.
     // Default is `eq16`: 3x fewer multiply-adds than `quality` (Hpad 48 -> 16).
     // Measured on the X410 1 s capture (5 ms, W=1): resample 1925.9 -> 958.9 us
     // (-50.2%), demod 1024.5 -> 1011.1 us (unchanged), FCS 203/204 identical,

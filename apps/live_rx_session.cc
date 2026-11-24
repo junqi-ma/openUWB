@@ -704,11 +704,19 @@ int run_live_rx(const LiveRxConfig& o)
 {
     std::signal(SIGINT,on_signal); std::signal(SIGTERM,on_signal);
     const std::string res_root = resolve_res_dir(o);
-    const std::string taps_file =
-        (o.taps == "quality")  ? "taps_quality_minorder.txt"
-        : (o.taps == "eq32")   ? "taps_quality_eq32.txt"
-        : (o.taps == "realtime") ? "taps_realtime_minorder.txt"
-                                 : "taps_realtime_eq16.txt";
+    const std::string taps_file = [&o]() -> std::string {
+        if (o.taps == "quality")    return "taps_quality_minorder.txt";
+        if (o.taps == "eq32")       return "taps_quality_eq32.txt";
+        if (o.taps == "realtime")   return "taps_realtime_minorder.txt";
+        if (o.taps == "eq16")       return "taps_realtime_eq16.txt";
+        if (o.taps == "ch250_eq16") return "taps_ch250_eq16.txt";
+        if (o.taps == "ch250_eq24") return "taps_ch250_eq24.txt";
+        if (o.taps == "ch250_eq32") return "taps_ch250_eq32.txt";
+        if (o.taps == "ch250_eq48") return "taps_ch250_eq48.txt";
+        // validate_live_rx_config already rejected anything else; throw rather
+        // than silently falling back to a different tap set.
+        throw std::runtime_error("--taps " + o.taps + " is not a known tap set");
+    }();
     const auto taps = load<float>(res_root + "/resampler_65_48/" + taps_file);
     const auto tmpl=load<std::complex<float>>(res_root+"/reference_preamble_code10_998p4.cf32");
 

@@ -82,9 +82,14 @@ constexpr float kScalarTolAbs = 1e-4f;
 
 // --------------------------------------------------------------- test data --
 
-/** The four shipped taps files and the H_pad each one produces (T/65 rounded
+/** The shipped taps files and the H_pad each one produces (T/65 rounded
  *  up to a multiple of 8).  Asserted against arm_length_pad() below, so a
- *  renamed or regenerated taps file cannot silently change the coverage. */
+ *  renamed or regenerated taps file cannot silently change the coverage.
+ *
+ *  The four ch250_eq{16,24,32,48} files are the 250 MHz channelised redesign
+ *  (T = 65*H_pad - 1, i.e. the last polyphase arm is one tap short of a full
+ *  arm); they land on exactly the same H_pad classes, so every matrix below
+ *  also pins the T < H_pad*Interp zero-padding path of the kernels. */
 struct TapCase {
     const char* rel;
     size_t hpad;
@@ -97,6 +102,10 @@ const std::vector<TapCase>& tap_cases()
         { "resampler_65_48/taps_realtime_minorder.txt", 24 },
         { "resampler_65_48/taps_quality_eq32.txt", 32 },
         { "resampler_65_48/taps_quality_minorder.txt", 48 },
+        { "resampler_65_48/taps_ch250_eq16.txt", 16 },
+        { "resampler_65_48/taps_ch250_eq24.txt", 24 },
+        { "resampler_65_48/taps_ch250_eq32.txt", 32 },
+        { "resampler_65_48/taps_ch250_eq48.txt", 48 },
     };
     return v;
 }

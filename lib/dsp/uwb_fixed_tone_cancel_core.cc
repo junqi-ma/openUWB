@@ -62,6 +62,124 @@ __attribute__((target("avx2"))) void subtract_sat_avx2(const int16_t* src,
         dst[k] = static_cast<int16_t>(v < -32768 ? -32768 : (v > 32767 ? 32767 : v));
     }
 }
+
+// Whole-region AVX2 kernel: the entire "walk one period at a time" loop lives
+// inside a single target("avx2") function, so copy_cancel() pays ONE indirect
+// call per call instead of one per 288-sample period (a 2 s stream at
+// 737.28 MS/s used to make ~5.1 million indirect calls).
+//
+// The periodic body is 4x unrolled (4 * 32 B = 128 B per step = 32 complex
+// samples), with the load / saturating subtract / store of each 32 B vector
+// interleaved.  A "four loads then four stores" grouping was measured 3-6%
+// SLOWER on the 2 s replay, so the interleaved order is intentional: it keeps
+// the store stream starting one vector earlier.  Measured on
+// benchmark_fixed_tone_cancel: 16384 samples 1.73 -> 1.44 us, 65536
+// 6.51 -> 5.4 us, one whole 20 ms period 6.83 -> 5.07 ms.  The full 2 s
+// replay only moves 1-3.5% (clean_ch0 cancel_us 373 -> 370 ms, jam688
+// 404 -> 390 ms) because the streaming path is DRAM-bandwidth bound; the
+// indirect-call removal and the unroll both matter only once the destination
+// stops being the bottleneck.
+//
+// Bit-exactness: identical saturating int16 subtract per element, identical
+// per-element tone index (period walk), only the loop nesting changed.
+__attribute__((target("avx2"))) void copy_cancel_loop_avx2(const int16_t* src,
+                                                           int16_t* dst,
+                                                           size_t n,
+                                                           const int16_t* lut,
+                                                           size_t period,
+                                                           size_t lut_pos)
+{
+    size_t pos = 0;
+    // Leading partial period (misaligned phase or a period-boundary remainder).
+    if (lut_pos != 0) {
+        const size_t cnt = std::min(n, period - lut_pos);
+        const size_t bytes = 2 * cnt;
+        size_t k = 0;
+        for (; k + 16 <= bytes; k += 16) {
+            const __m256i x =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + k));
+            const __m256i t = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(lut + 2 * lut_pos + k));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + k),
+                                _mm256_subs_epi16(x, t));
+        }
+        for (; k < bytes; ++k) {
+            const int v = int(src[k]) - int(lut[2 * lut_pos + k]);
+            dst[k] = static_cast<int16_t>(v < -32768 ? -32768 : (v > 32767 ? 32767 : v));
+        }
+        pos = cnt;
+        if (pos == n) {
+            return;
+        }
+    }
+    // Whole periods from LUT index 0.
+    const size_t total = 2 * period;
+    while (pos < n && n - pos >= period) {
+        const int16_t* s = src + 2 * pos;
+        int16_t* d = dst + 2 * pos;
+        size_t k = 0;
+        // 4x unrolled, interleaved load/sub/store (128 B per step).  Grouping
+        // four loads before four stores was measured slower on the streaming
+        // replay; interleaving keeps the write stream starting one vector
+        // earlier and was the only ordering that matched or beat the
+        // per-period kernel.
+        for (; k + 64 <= total; k += 64) {
+            const __m256i x0 =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + k));
+            const __m256i t0 =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(lut + k));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + k),
+                                _mm256_subs_epi16(x0, t0));
+            const __m256i x1 =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + k + 16));
+            const __m256i t1 =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(lut + k + 16));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + k + 16),
+                                _mm256_subs_epi16(x1, t1));
+            const __m256i x2 =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + k + 32));
+            const __m256i t2 =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(lut + k + 32));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + k + 32),
+                                _mm256_subs_epi16(x2, t2));
+            const __m256i x3 =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + k + 48));
+            const __m256i t3 =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(lut + k + 48));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + k + 48),
+                                _mm256_subs_epi16(x3, t3));
+        }
+        for (; k + 16 <= total; k += 16) {
+            const __m256i x =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + k));
+            const __m256i t =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(lut + k));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + k),
+                                _mm256_subs_epi16(x, t));
+        }
+        pos += period;
+    }
+    // Trailing partial period.
+    if (pos < n) {
+        const size_t cnt = n - pos;
+        const size_t bytes = 2 * cnt;
+        const int16_t* s = src + 2 * pos;
+        int16_t* d = dst + 2 * pos;
+        size_t k = 0;
+        for (; k + 16 <= bytes; k += 16) {
+            const __m256i x =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + k));
+            const __m256i t = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(lut + k));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + k),
+                                _mm256_subs_epi16(x, t));
+        }
+        for (; k < bytes; ++k) {
+            const int v = int(s[k]) - int(lut[k]);
+            d[k] = static_cast<int16_t>(v < -32768 ? -32768 : (v > 32767 ? 32767 : v));
+        }
+    }
+}
 #endif
 
 using SubtractSatFn = void (*)(const int16_t*, int16_t*, size_t, const int16_t*);
@@ -562,8 +680,9 @@ FixedToneProcessCounts FixedToneCancelCore::copy_cancel(const int16_t* src,
         return counts;
     }
 
+    const int kernel_kind = active_kernel();
     const SubtractSatFn kernel =
-        (active_kernel() == 2) ? avx2_kernel() : scalar_kernel();
+        (kernel_kind == 2) ? avx2_kernel() : scalar_kernel();
 
     size_t pos = 0;
     size_t lut_pos = static_cast<size_t>(rel % static_cast<int64_t>(period_));
@@ -575,12 +694,29 @@ FixedToneProcessCounts FixedToneCancelCore::copy_cancel(const int16_t* src,
         counts.cancelled += cnt;
         lut_pos = (lut_pos + cnt) % period_;
     }
-    while (pos < n) {
-        const size_t cnt = std::min(n - pos, period_ - lut_pos);
-        kernel(src + 2 * pos, dst + 2 * pos, cnt, lut_.data() + 2 * lut_pos);
-        pos += cnt;
-        counts.cancelled += cnt;
-        lut_pos = 0;
+    if (pos < n) {
+#if UWB_FIXED_TONE_X86
+        if (kernel_kind == 2) {
+            // One call for the whole periodic region: the period walk (and its
+            // 4x-unrolled body) runs inside the AVX2 function, so there is no
+            // per-288-sample indirect call.
+            copy_cancel_loop_avx2(src + 2 * pos,
+                                  dst + 2 * pos,
+                                  n - pos,
+                                  lut_.data(),
+                                  period_,
+                                  lut_pos);
+            counts.cancelled += n - pos;
+            return counts;
+        }
+#endif
+        while (pos < n) {
+            const size_t cnt = std::min(n - pos, period_ - lut_pos);
+            kernel(src + 2 * pos, dst + 2 * pos, cnt, lut_.data() + 2 * lut_pos);
+            pos += cnt;
+            counts.cancelled += cnt;
+            lut_pos = 0;
+        }
     }
     return counts;
 }

@@ -458,6 +458,70 @@ BOOST_AUTO_TEST_CASE(test_scalar_and_avx2_kernels_are_bit_identical)
     BOOST_CHECK_EQUAL(core.active_kernel(), have_avx2 ? 2 : 1);
 }
 
+BOOST_AUTO_TEST_CASE(test_whole_loop_avx2_is_bit_identical_for_all_shapes)
+{
+    FixedToneCancelCore core;
+    std::string err;
+    // 256-sample cross-fade so the leading blend segment is exercised too.
+    BOOST_REQUIRE_MESSAGE(core.prepare(short_config(288 * 4, 256), &err), err);
+    const double omega = core.omega_radians();
+    // Two models: the second one installs a cross-fade against the first, so
+    // copy_cancel() has to walk blend -> partial period -> whole periods ->
+    // trailing partial exactly like the scalar reference.
+    train_and_require_ok(core, 0, make_tone_samples(288 * 4, 20000.0, 0.2, omega, 5, 0),
+                         288);
+    train_and_require_ok(core, 288, make_tone_samples(288 * 4, 17000.0, -0.4, omega, 9, 0),
+                         288);
+    const bool have_avx2 = core.avx2_available();
+    const size_t lut_period = core.period_samples();
+    BOOST_REQUIRE_EQUAL(lut_period, kPeriod);
+    const int64_t epoch = core.model().epoch;
+
+    std::mt19937 gen(4242);
+    const size_t max_n = 65536;
+    std::vector<int16_t> src(2 * max_n);
+    for (auto& v : src) {
+        v = static_cast<int16_t>(gen());
+    }
+    // Int16 extremes so saturation is part of the comparison.
+    for (size_t k = 0; k < src.size(); k += 257) {
+        src[k] = (k % 2 == 0) ? int16_t(-32768) : int16_t(32767);
+    }
+
+    // Offsets chosen to land inside the cross-fade, exactly on the LUT origin,
+    // mid-period (lut_pos != 0) and at the last LUT entry.
+    const int64_t offsets[] = { 0, 1, 7, 8, 100, 255, 256, 257, 288, 575, 576 };
+    const size_t lengths[] = { 1,  7,  8,   15,  16,  17,  31,   32,   63,
+                               64, 287, 288, 289, 575, 576, 577, 1000, 4095,
+                               4096, 4097, 65535, 65536 };
+    for (size_t n : lengths) {
+        for (int64_t off : offsets) {
+            std::vector<int16_t> expect(2 * n, 0);
+            std::vector<int16_t> got(2 * n, 0);
+            BOOST_REQUIRE_LE(n, max_n);
+            std::copy(src.begin(), src.begin() + 2 * n, expect.begin());
+            std::copy(src.begin(), src.begin() + 2 * n, got.begin());
+            core.set_kernel_mode_for_testing(1);
+            core.copy_cancel(expect.data(), expect.data(), n, epoch + off);
+            core.set_kernel_mode_for_testing(2);
+            core.copy_cancel(got.data(), got.data(), n, epoch + off);
+            BOOST_CHECK_MESSAGE(
+                got == expect,
+                "whole-loop AVX2 diverged from scalar at n=" << n << " offset=" << off);
+            // Out-of-place must produce the same bytes as in-place.
+            std::vector<int16_t> oop(2 * n, 12345);
+            core.copy_cancel(src.data(), oop.data(), n, epoch + off);
+            BOOST_CHECK_MESSAGE(oop == got,
+                                "AVX2 in-place and out-of-place differ at n="
+                                    << n << " offset=" << off);
+        }
+    }
+    core.set_kernel_mode_for_testing(0);
+    if (!have_avx2) {
+        BOOST_TEST_MESSAGE("AVX2 unavailable on this CPU: scalar fallback compared with itself");
+    }
+}
+
 BOOST_AUTO_TEST_CASE(test_int16_saturation)
 {
     FixedToneCancelCore core;

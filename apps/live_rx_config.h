@@ -156,6 +156,18 @@ struct LiveRxConfig {
     size_t acq_persist = 12000;
     double acq_low = 0.00015;
     double acq_peak = 0.00030;
+    // Streaming acquisition frontend selection.  `autocorr` (default) keeps
+    // the legacy delayed-autocorrelation scan exactly as it shipped; `xcorr`
+    // selects the folded preamble cross-correlation frontend (immune to the
+    // measured tonal residue but opt-in until the replay ABBA matrix accepts
+    // it).  The `acq_xcorr_*` fields below only take effect in `xcorr` mode.
+    std::string acq_mode = "autocorr"; // autocorr | xcorr
+    size_t acq_xcorr_k_coh = 4;       // coherent fold symbols (CFO budget)
+    size_t acq_xcorr_g_fast = 6;      // Stage-1 early-exit groups
+    size_t acq_xcorr_g_full = 16;     // Stage-2 confirmation groups
+    size_t acq_xcorr_hop = 128;       // scan step in symbols (0 = auto)
+    double acq_xcorr_par_fast = 4.5;  // Stage-1 PAR gate
+    double acq_xcorr_par = 6.5;       // Stage-2 PAR gate
     // Locked-state autocorrelation policy.  "scan" (default) keeps the legacy
     // behaviour: every RX block is scanned.  "suspend" stops the scan while
     // the lock is tracking (Verify/Locked/Holdover) and requires
@@ -163,6 +175,12 @@ struct LiveRxConfig {
     // monitoring is off.  A lookback of -1 means acq_span + window (one
     // autocorrelation platform plus one packet window); 0 resumes at `end`.
     std::string autocorr_when_locked = "scan";
+    // Fixed-tone cancellation geometry while the target is locked.
+    //   full   : cancel (and copy into the ring) every received sample.
+    //   window : under --autocorr-when-locked suspend, skip the locked silent
+    //            regions (no copy, no cancel) and only cancel the samples the
+    //            scheduler will actually cut into target windows.
+    std::string tone_when_locked = "full";
     long long autocorr_resume_lookback = -1;
     double timed_lead_us = 300.0;
     double timed_t0_ms = 0.0;

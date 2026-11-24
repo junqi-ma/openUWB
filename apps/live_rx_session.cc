@@ -30,6 +30,7 @@
 #include <gnuradio/uwb/uwb_uhd_sc16_pipeline.h>
 
 #include <openuwb/phy/hrp/tx/hrp_mod_core.h>
+#include <openuwb/runtime/preamble_xcorr_acquisition.h>
 #include <openuwb/sic/sic_unified.h>
 
 #include <algorithm>
@@ -424,6 +425,32 @@ struct WindowSubmissionTracker {
         }
     }
 
+    // True while an acquired/deferred acquisition window is waiting for data.
+    // The tone stage must never skip samples such a window still needs.
+    bool has_pending_acquire() const { return pending_seed >= 0 || !pending.empty(); }
+
+    // Absolute number of samples the tone stage may skip starting at `end`
+    // without touching any window the scheduler will still cut.  The next
+    // planned target window (and the one already awaiting data) bound the
+    // budget; one raw block of margin absorbs the block granularity of the
+    // read loop.  Returns 0 when no safe region exists.
+    int64_t tone_skip_budget(int64_t end, size_t block,
+                             const core::TargetLockCore& lock) const {
+        int64_t protect = std::numeric_limits<int64_t>::max();
+        core::TargetSlotPlan plan;
+        if (lock.next_plan(end, plan)) {
+            protect = std::min(protect, plan.window_start);
+        }
+        if (have_pending_plan) {
+            protect = std::min(protect, pending_plan.window_start);
+        }
+        if (protect == std::numeric_limits<int64_t>::max()) {
+            return 0;
+        }
+        const int64_t safe_start = protect - static_cast<int64_t>(block);
+        return safe_start > end ? safe_start - end : 0;
+    }
+
     void flush_pending_on_gap(ConsoleReporter& report) {
         if (pending_seed >= 0) {
             report.result(pending_id, pending_seed, "INVALID_GAP", nullptr,
@@ -788,6 +815,21 @@ int run_live_rx(const LiveRxConfig& o)
     lock_cfg.window_capacity = window;
     core::TargetLockCore lock(lock_cfg);
     core::TargetLockState last_state = lock.state();
+    // Frontend selection is resolved once, before the source is opened.  The
+    // autocorr branch below is the unchanged legacy path; xcorr only replaces
+    // the streaming scan, sharing the same seed submission/lock machinery.
+    const bool xcorr_mode = (o.acq_mode == "xcorr");
+    std::string acq_info = " acq_mode=" + o.acq_mode;
+    if (xcorr_mode) {
+        std::ostringstream s;
+        s << " acq_xcorr_k_coh=" << o.acq_xcorr_k_coh
+          << " acq_xcorr_g_fast=" << o.acq_xcorr_g_fast
+          << " acq_xcorr_g_full=" << o.acq_xcorr_g_full
+          << " acq_xcorr_hop=" << o.acq_xcorr_hop
+          << " acq_xcorr_par_fast=" << o.acq_xcorr_par_fast
+          << " acq_xcorr_par=" << o.acq_xcorr_par;
+        acq_info += s.str();
+    }
     ConsoleReporter report(o.summary, o.print == "packets", o.sic != "off");
     std::string sic_info;
     if (o.sic != "off") {
@@ -819,9 +861,11 @@ int run_live_rx(const LiveRxConfig& o)
         " acq_persist="+std::to_string(o.acq_persist)+
         " acq_low="+std::to_string(o.acq_low)+
         " acq_peak="+std::to_string(o.acq_peak)+
+        acq_info+
         " lock_fcs="+o.lock_fcs+
         " stop_after_sfd="+o.stop_after_sfd+
         " autocorr_when_locked="+std::string(o.autocorr_suspend?"suspend":"scan")+
+        (o.tone_when_locked == "window" ? " tone_when_locked=window" : "")+
         sic_info);
     // Effective pre-guard for the next cut window.  It follows the lock state:
     // the blind acquisition platform needs the wide guard, the locked
@@ -923,6 +967,9 @@ int run_live_rx(const LiveRxConfig& o)
         source_owner = std::move(dec);
         src = decorator;
     }
+    // Locked silent-region tone policy (validated: `window` implies suspend +
+    // continuous mode).  `full` leaves every path bit-for-bit unchanged.
+    const bool tone_window = (o.tone_when_locked == "window");
     const auto source_stats = [&]() -> pipeline::FixedToneCancelStats {
         if (decorator)
             return decorator->stats();
@@ -936,6 +983,24 @@ int run_live_rx(const LiveRxConfig& o)
     Acquisition acq;
     acq.configure(int64_t(o.acq_span), int64_t(o.acq_step),
                   int64_t(o.acq_persist), o.acq_low, o.acq_peak);
+    // Opt-in folded preamble cross-correlation frontend.  Built and configured
+    // BEFORE the source opens so the hot scan path never allocates.  In
+    // autocorr mode the pointer stays null: no object, no allocation and the
+    // legacy path below is bit-for-bit unchanged.
+    std::unique_ptr<PreambleXcorrAcquisition> xcorr_acq;
+    if (xcorr_mode) {
+        PreambleXcorrConfig xcfg;
+        xcfg.code_index = size_t(lock_cfg.code_index);
+        xcfg.preamble_reps = lock_cfg.preamble_repetitions;
+        xcfg.k_coh = o.acq_xcorr_k_coh;
+        xcfg.g_fast = o.acq_xcorr_g_fast;
+        xcfg.g_full = o.acq_xcorr_g_full;
+        xcfg.hop_symbols = o.acq_xcorr_hop;
+        xcfg.par_fast_thr = o.acq_xcorr_par_fast;
+        xcfg.par_thr = o.acq_xcorr_par;
+        xcorr_acq = std::make_unique<PreambleXcorrAcquisition>();
+        xcorr_acq->configure(xcfg);
+    }
     // Locked-state autocorrelation gate.  The policy was resolved during CLI
     // validation (before the source opened); only the -1 lookback default
     // depends on the configured acq_span, so it is resolved here.
@@ -943,7 +1008,8 @@ int run_live_rx(const LiveRxConfig& o)
     autocorr_gate.enabled = o.autocorr_suspend;
     const int64_t autocorr_lookback =
         (o.autocorr_resume_lookback == -1)
-            ? int64_t(o.acq_span) + int64_t(window)
+            ? (xcorr_acq ? xcorr_acq->required_window_samples()
+                         : int64_t(o.acq_span)) + int64_t(window)
             : int64_t(o.autocorr_resume_lookback);
     if (!src->open()) throw std::runtime_error("cannot open UHD/replay or tone configuration");
     if (std::abs(src->actual_rx_rate()-fs)>.5) throw std::runtime_error("unexpected RX rate");
@@ -1057,7 +1123,37 @@ int run_live_rx(const LiveRxConfig& o)
         const size_t at0 = size_t(end) & (history_size-1);
         const bool direct = (at0 + block <= history_size);
         std::complex<int16_t>* dst = direct ? ring.data()+at0 : incoming.data();
-        const auto n=src->read_samples(dst,block,meta);
+        // --- locked-idle tone policy (--tone-when-locked window) -----------
+        // While the target is LOCKED and the frontend scan is suspended, the
+        // ring only has to hold the samples a scheduled target window will
+        // later read.  Everything before the next planned window (minus one
+        // block of margin) is advanced past WITHOUT copy_cancel()/ring writes.
+        // skip_samples() runs the same epoch/20 ms training state machine, so
+        // the tone phase stays the single source of truth; skipped samples are
+        // recorded separately and valid_begin is moved to `end` so no path can
+        // read the stale ring range.
+        bool tone_skipped = false;
+        size_t n = 0;
+        if (tone_window && decorator && o.mode != "timed" &&
+            lock.state() == core::TargetLockState::Locked &&
+            autocorr_gate.suspended && !submissions.has_pending_acquire()) {
+            const int64_t budget = submissions.tone_skip_budget(end, block, lock);
+            if (budget > 0) {
+                n = decorator->skip_samples(
+                    std::min<size_t>(block, static_cast<size_t>(budget)), meta);
+                tone_skipped = (n > 0);
+                if (n == 0 && meta.is_gap) {
+                    // Discontinuity ahead: fall back to the normal read path
+                    // so the gap report and epoch reset stay in one place.
+                    n = src->read_samples(dst, block, meta);
+                    tone_skipped = false;
+                }
+            } else {
+                n = src->read_samples(dst, block, meta);
+            }
+        } else {
+            n = src->read_samples(dst, block, meta);
+        }
         if (meta.is_gap || (n && meta.start_sample_abs!=end)) {
             // A planned timed gap is expected: it is the monitoring blind
             // time, not a device error, and it must not invalidate the grid.
@@ -1069,10 +1165,13 @@ int run_live_rx(const LiveRxConfig& o)
                         " gap_samples="+std::to_string(meta.gap_samples));
             submissions.flush_pending_on_gap(report);
             end=meta.start_sample_abs; valid_begin=end; acq.reset(end);
+            // A gap invalidates both frontends' accumulated history; reset the
+            // active one (autocorr is already reset above unconditionally).
+            if (xcorr_acq) xcorr_acq->reset(end);
             // The block was read at the pre-gap origin; move it to the new one.
             // Gaps are rare, so the relocation cost never shows up in the
             // steady-state budget.
-            if (n && direct) {
+            if (n && direct && !tone_skipped) {
                 const size_t at = size_t(end) & (history_size-1);
                 if (at + n <= history_size) {
                     std::memmove(ring.data()+at, ring.data()+at0,
@@ -1090,12 +1189,14 @@ int run_live_rx(const LiveRxConfig& o)
         if (n) {
             const auto frontend_start = Clock::now();
             const size_t at=size_t(end)&(history_size-1);
-            if (dst != ring.data()+at) {
+            if (!tone_skipped && dst != ring.data()+at) {
                 const size_t first=std::min(n,history_size-at);
                 std::copy_n(incoming.data(),first,ring.data()+at);
                 std::copy_n(incoming.data()+first,n-first,ring.data());
             }
-            end+=n; valid_begin=std::max(valid_begin,end-int64_t(history_size));
+            end+=n;
+            valid_begin = tone_skipped ? end
+                                       : std::max(valid_begin,end-int64_t(history_size));
             const auto copy_done = Clock::now();
             if (o.mode != "timed") {
                 // Locked-state scan gate: while the lock is tracking the scan
@@ -1104,19 +1205,37 @@ int run_live_rx(const LiveRxConfig& o)
                 // during the teardown latency are still scanned.
                 const auto gate_action = autocorr_gate.update(
                     lock.scheduled(), end, valid_begin, autocorr_lookback, n);
-                if (gate_action.reset)
+                if (gate_action.reset) {
                     acq.reset(gate_action.reset_at);
+                    if (xcorr_acq) xcorr_acq->reset(gate_action.reset_at);
+                }
                 // A block reads [probe, probe+step-1] and [probe+lag,
                 // probe+step-1+lag], so the tail of the block must already be
                 // inside the valid range.
                 if (gate_action.scan) {
-                    while (acq.probe+acq.step-1+Acquisition::lag<end) {
-                        double metric = 0.0;
-                        const auto seed=acq.scan(ring,&metric);
-                        if (seed<0) continue;
-                        submissions.handle_autocorr_seed(
-                            seed, metric, valid_begin, cur_pre_guard, window,
-                            o.interference, id, lock, report);
+                    if (xcorr_acq) {
+                        // xcorr: the window is required_window_samples() long
+                        // and the scan advances itself by hop_samples().
+                        while (xcorr_acq->probe() +
+                                   xcorr_acq->required_window_samples() <= end) {
+                            double metric = 0.0;
+                            const auto seed = xcorr_acq->scan(
+                                ring, valid_begin, &metric);
+                            if (seed < 0) continue;
+                            submissions.handle_autocorr_seed(
+                                seed, metric, valid_begin, cur_pre_guard, window,
+                                o.interference, id, lock, report);
+                        }
+                    } else {
+                        // Legacy delayed-autocorrelation scan: unchanged.
+                        while (acq.probe+acq.step-1+Acquisition::lag<end) {
+                            double metric = 0.0;
+                            const auto seed=acq.scan(ring,&metric);
+                            if (seed<0) continue;
+                            submissions.handle_autocorr_seed(
+                                seed, metric, valid_begin, cur_pre_guard, window,
+                                o.interference, id, lock, report);
+                        }
                     }
                 }
                 submissions.submit_ready_acquire_window(
@@ -1201,6 +1320,20 @@ int run_live_rx(const LiveRxConfig& o)
           << " model_rejects=" << st.model_rejects
           << " training_windows=" << st.training_windows
           << " reader_us=" << st.reader_us;
+    if (tone_window) {
+        // Opt-in locked-idle skipping: only printed when the mode is enabled,
+        // so default `full` stdout is byte-identical to before.
+        costs << " tone_skipped_samples=" << st.skipped_samples
+              << " tone_skip_us=" << st.skip_us;
+    }
+    if (xcorr_acq) {
+        // Early-exit efficiency of the xcorr frontend (Stage-1 windows vs the
+        // subset promoted to Stage-2 vs the emitted seeds).
+        const auto& xs = xcorr_acq->stats();
+        costs << " xcorr_windows=" << xs.windows_scanned
+              << " xcorr_stage2=" << xs.stage2_promoted
+              << " xcorr_seeds=" << xs.seeds_emitted;
+    }
     report.info(costs.str());
     {
         const auto ls = lock.stats();

@@ -307,6 +307,11 @@ set(UWB_UNIT_QA_SOURCES
     # SFD Stage-3 refactor (2026-11-24): soft polarity rescue, 0.008 low
     # floor, incremental derotation and the zero-alloc discrete grid.
     ${UWB_UNIT_DIR}/phy/qa_uwb_sfd_refactor.cc
+    # Acquire folded-preamble xcorr frontend (2026-11-24): noise/tone false
+    # alarms, +-100 kHz CFO sensitivity, leading-edge accuracy, wrong-code
+    # rejection, ring wrap/holdoff/reset and AVX2/scalar parity. Appended last
+    # so the historical test order above is untouched.
+    ${UWB_UNIT_DIR}/runtime/qa_uwb_preamble_xcorr_acquisition.cc
 )
 
 set(UWB_SHARDED_QA_BINARIES
@@ -401,7 +406,10 @@ foreach(_t IN ITEMS
         uwb_qa_uwb_preamble_sic_core_perf.cc
         uwb_qa_uwb_twr_config_parity.cc
         uwb_qa_uwb_twr_frame.cc
-        uwb_qa_uwb_twr_math.cc)
+        uwb_qa_uwb_twr_math.cc
+        # Reads testdata/reference_preamble_code10_998p4.cf32 and
+        # testdata/reference_preamble.bin.
+        uwb_qa_uwb_preamble_xcorr_acquisition.cc)
     uwb_qa_set_testdata_dir(${_t})
 endforeach()
 
@@ -744,6 +752,7 @@ foreach(_t IN ITEMS
     uwb_qa_uwb_resampler_transposed.cc
     uwb_qa_uwb_timing_refactor.cc
     uwb_qa_uwb_sfd_refactor.cc
+    uwb_qa_uwb_preamble_xcorr_acquisition.cc
 )
     if(TEST ${_t})
         set_tests_properties(${_t} PROPERTIES LABELS "core;rx_sic")

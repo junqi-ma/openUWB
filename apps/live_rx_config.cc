@@ -152,7 +152,15 @@ LiveRxCli parse_live_rx_cli(int argc, char** argv)
         else if (key=="--acq-persist") o.acq_persist=std::stoul(value());
         else if (key=="--acq-low") o.acq_low=std::stod(value());
         else if (key=="--acq-peak") o.acq_peak=std::stod(value());
+        else if (key=="--acq-mode") o.acq_mode=value();
+        else if (key=="--acq-xcorr-k-coh") o.acq_xcorr_k_coh=parse_strict_size(key,value());
+        else if (key=="--acq-xcorr-g-fast") o.acq_xcorr_g_fast=parse_strict_size(key,value());
+        else if (key=="--acq-xcorr-g-full") o.acq_xcorr_g_full=parse_strict_size(key,value());
+        else if (key=="--acq-xcorr-hop") o.acq_xcorr_hop=parse_strict_size(key,value());
+        else if (key=="--acq-xcorr-par-fast") o.acq_xcorr_par_fast=std::stod(value());
+        else if (key=="--acq-xcorr-par") o.acq_xcorr_par=std::stod(value());
         else if (key=="--autocorr-when-locked") o.autocorr_when_locked=value();
+        else if (key=="--tone-when-locked") o.tone_when_locked=value();
         else if (key=="--autocorr-resume-lookback") o.autocorr_resume_lookback=std::stoll(value());
         else if (key=="--timed-lead-us") o.timed_lead_us=std::stod(value());
         else if (key=="--timed-lookahead") o.timed_lookahead=std::stoul(value());
@@ -228,6 +236,27 @@ void validate_live_rx_config(LiveRxConfig& o)
     if (!(o.acq_low > 0.0) || o.acq_low >= 1.0 || !std::isfinite(o.acq_low) ||
         !(o.acq_peak >= o.acq_low) || o.acq_peak >= 1.0 || !std::isfinite(o.acq_peak))
         throw std::runtime_error("--acq-low/--acq-peak must satisfy 0 < low <= peak < 1");
+    // Preamble cross-correlation frontend parameters.  These are validated in
+    // BOTH modes on purpose: a typo must fail closed at startup even when
+    // --acq-mode autocorr is still selected, so a later mode flip cannot
+    // silently accept a bad value that was already on the command line.  All
+    // defaults are within range, so the default autocorr path is unaffected.
+    if (o.acq_mode != "autocorr" && o.acq_mode != "xcorr")
+        throw std::runtime_error("--acq-mode must be autocorr or xcorr");
+    if (o.acq_xcorr_k_coh < 1 || o.acq_xcorr_k_coh > 32)
+        throw std::runtime_error("--acq-xcorr-k-coh must be in 1..32");
+    if (o.acq_xcorr_g_fast < 1 || o.acq_xcorr_g_full < o.acq_xcorr_g_fast)
+        throw std::runtime_error(
+            "--acq-xcorr-g-fast/--acq-xcorr-g-full must satisfy 1 <= g_fast <= g_full");
+    if (o.acq_xcorr_g_full > 64)
+        throw std::runtime_error("--acq-xcorr-g-full must be <= 64");
+    if (o.acq_xcorr_hop > 256)
+        throw std::runtime_error("--acq-xcorr-hop must be <= 256 (0 = auto)");
+    if (!std::isfinite(o.acq_xcorr_par_fast) || !std::isfinite(o.acq_xcorr_par) ||
+        !(o.acq_xcorr_par_fast > 1.0) || !(o.acq_xcorr_par > 1.0) ||
+        !(o.acq_xcorr_par_fast <= o.acq_xcorr_par))
+        throw std::runtime_error(
+            "--acq-xcorr-par-fast/--acq-xcorr-par must satisfy 1.0 < par_fast <= par (finite)");
     // Locked-state scan policy.  Resolve it here, BEFORE the device/replay
     // source is opened: `suspend` with --interference on must fail closed at
     // startup instead of silently disabling interference monitoring.
@@ -237,6 +266,20 @@ void validate_live_rx_config(LiveRxConfig& o)
     o.autocorr_suspend = live::resolve_autocorr_suspend(
         live::parse_autocorr_when_locked(o.autocorr_when_locked),
         o.interference);
+    // Locked silent-region tone policy.  `window` only makes sense when the
+    // frontend scan is suspended (otherwise it would scan a range that was
+    // never written to the ring) and when the continuous scheduler owns the
+    // ring geometry (timed mode has planned gaps and no locked idle region).
+    // Fail closed at startup instead of silently falling back to `full`.
+    if (o.tone_when_locked != "full" && o.tone_when_locked != "window")
+        throw std::runtime_error("--tone-when-locked must be full or window");
+    if (o.tone_when_locked == "window" && !o.autocorr_suspend)
+        throw std::runtime_error(
+            "--tone-when-locked window requires --autocorr-when-locked suspend "
+            "(the frontend must be paused before the ring may contain holes)");
+    if (o.tone_when_locked == "window" && o.mode == "timed")
+        throw std::runtime_error(
+            "--tone-when-locked window is not supported with --mode timed");
     // The gate is a drift budget: above the physical ceiling (1 sample over the
     // 127 B payload = 6.5 ppm) the integer grid cannot stay on the correlation
     // peak, so accepting it would produce silently wrong soft chips.

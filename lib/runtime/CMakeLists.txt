@@ -9,6 +9,7 @@
 set(_uwb_runtime_sources
     scheduled_pipeline.cc
     uwb_live_packet_processor.cc
+    uwb_preamble_xcorr_acquisition.cc
     uwb_target_lock_core.cc
     uwb_timed_rx_plan.cc)
 set(_uwb_runtime_deps

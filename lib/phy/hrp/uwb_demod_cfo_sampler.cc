@@ -25,6 +25,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <cstring>
 
 namespace openuwb::demod::core {
 
@@ -107,6 +108,30 @@ inline size_t symbol_length(const std::vector<std::complex<float>>& template_wf)
     return len > sym ? sym : len;
 }
 
+// Cheap content probe for the shaped-template cache: eight evenly spaced
+// samples instead of an FNV over all 1016.  The cache key also includes the
+// buffer pointer and length, so a real waveform change is caught by any of the
+// three; this only exists to skip the full rehash when Stage 2 and Stage 3
+// sample the same template buffer.
+inline uint64_t template_sample_probe(
+    const std::vector<std::complex<float>>& wf)
+{
+    const size_t n = wf.size();
+    if (n == 0)
+        return 0;
+    const size_t idx[8] = { 0, n / 8, n / 4, (3 * n) / 8,
+                            n / 2, (5 * n) / 8, (3 * n) / 4, n - 1 };
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < 8; ++i) {
+        const float parts[2] = { wf[idx[i]].real(), wf[idx[i]].imag() };
+        uint32_t bits[2];
+        std::memcpy(bits, parts, sizeof(bits));
+        h = (h ^ static_cast<uint64_t>(bits[0])) * 1099511628211ULL;
+        h = (h ^ static_cast<uint64_t>(bits[1])) * 1099511628211ULL;
+    }
+    return h;
+}
+
 } // namespace
 
 size_t sample_sync_symbols_simd(
@@ -166,9 +191,25 @@ size_t sample_sync_symbols_simd(
                     code = &scratch.cir_template;
             }
         }
-        if (code)
-            shaped = rxopt::ensure_shaped_sparse_template(
-                template_wf.data(), L, *code, scratch.shaped_sync_template);
+        if (code) {
+            const uint64_t probe = template_sample_probe(template_wf);
+            const bool cache_hit =
+                scratch.shaped_sync_template.valid &&
+                scratch.cfo_template_ptr == static_cast<const void*>(template_wf.data()) &&
+                scratch.cfo_template_len == template_wf.size() &&
+                scratch.cfo_template_probe == probe;
+            if (cache_hit) {
+                shaped = &scratch.shaped_sync_template;
+            } else {
+                shaped = rxopt::ensure_shaped_sparse_template(
+                    template_wf.data(), L, *code, scratch.shaped_sync_template);
+                if (shaped) {
+                    scratch.cfo_template_ptr = template_wf.data();
+                    scratch.cfo_template_len = template_wf.size();
+                    scratch.cfo_template_probe = probe;
+                }
+            }
+        }
     }
 
     const rxopt::RealSyncTemplate& real_tmpl = scratch.real_sync_template;

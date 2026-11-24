@@ -87,6 +87,15 @@ struct DemodScratch {
     std::vector<std::complex<double>> cfo_fft_buf; // zero-padded radix-2 FFT
     std::vector<float> cfo_mag_buf;                // |z| for median clipping
 
+    // ML CFO sampler template probe cache.  Rebuilding the shaped sparse
+    // template re-hashes the whole 1016-sample SYNC waveform (FNV over 2032
+    // floats) on every call; Stage 2 + Stage 3 reuse the same buffer, so a
+    // cheap sample-position probe plus pointer/length identity is enough to
+    // detect a content change without paying that cost twice per packet.
+    const void* cfo_template_ptr = nullptr;
+    size_t cfo_template_len = 0;
+    uint64_t cfo_template_probe = 0;
+
     // Cached sequence data for fixed preamble code and SFD mode (Task B2).
     struct CachedSequenceState {
         size_t code_index = std::numeric_limits<size_t>::max();

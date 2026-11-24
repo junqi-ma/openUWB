@@ -155,34 +155,41 @@ bool estimate_cfo_from_symbols_ml(const std::complex<float>* z,
     const bool do_clip = (huber_median_scale > 0.0) && std::isfinite(huber_median_scale);
     const double clip = do_clip ? huber_median_scale * med : 0.0;
 
-    // Soft-clipped complex symbol, scaled in place when later re-filling.
-    auto make_zt = [&](size_t k) -> std::complex<double> {
+    // `nth_element` permuted the magnitude buffer, so the per-element clip
+    // scale is rebuilt once here and cached in the same buffer: every later
+    // pass (FFT fill, Newton refill) reuses it instead of recomputing |z[k]|.
+    double sum_mag = 0.0;
+    for (size_t k = 0; k < count; ++k) {
+        const double m = static_cast<double>(std::abs(z[k]));
         double scale = 1.0;
-        if (do_clip) {
-            const double m = static_cast<double>(std::abs(z[k]));
-            if (m > 0.0) {
-                const double lim = clip / m;
-                if (lim < 1.0)
-                    scale = lim;
-            }
+        if (do_clip && m > 0.0) {
+            const double lim = clip / m;
+            if (lim < 1.0)
+                scale = lim;
         }
+        mags[k] = static_cast<float>(scale);
+        sum_mag += m * scale;
+    }
+    if (!(sum_mag > 0.0))
+        return false;
+
+    // Soft-clipped complex symbol using the cached scale.
+    auto make_zt = [&](size_t k) -> std::complex<double> {
+        const double scale = static_cast<double>(mags[k]);
         return std::complex<double>(static_cast<double>(z[k].real()) * scale,
                                     static_cast<double>(z[k].imag()) * scale);
     };
 
     // ---- Step 2: zero-padded radix-2 FFT coarse search ------------------
-    const size_t nfft = (count > 512) ? next_pow2_size(2 * count) : size_t{ 1024 };
+    // 4x zero padding keeps every true peak inside the bin grid while scaling
+    // the FFT with the window: 256 points for a 64-SYMBOL coarse window
+    // (~4x cheaper), 1024 for the 192-232 SYMBOL full preamble.
+    const size_t nfft = next_pow2_size(std::max<size_t>(256, 4 * count));
     auto& buf = scratch.cfo_fft_buf;
     buf.assign(nfft, std::complex<double>(0.0, 0.0)); // reserved 2048 normally
 
-    double sum_mag = 0.0;
-    for (size_t k = 0; k < count; ++k) {
-        const std::complex<double> zt = make_zt(k);
-        buf[k] = zt;
-        sum_mag += std::abs(zt);
-    }
-    if (!(sum_mag > 0.0))
-        return false;
+    for (size_t k = 0; k < count; ++k)
+        buf[k] = make_zt(k);
 
     if (!fft_radix2_inplace(buf.data(), nfft))
         return false;
@@ -262,15 +269,18 @@ bool estimate_cfo_from_symbols_ml(const std::complex<float>* z,
         }
     };
 
+    // Newton-Raphson with backtracking.  The spectrum triple is evaluated once
+    // before the loop and then carried forward from each accepted trial, so a
+    // converged estimate never pays for an extra full-sequence evaluation.
     std::complex<double> s0, s1, s2;
+    eval_spectrum(w, s0, s1, s2);
+    double J = std::norm(s0);
     const double max_step = kPi / static_cast<double>(count);
     for (int iter = 0; iter < 5; ++iter) {
-        eval_spectrum(w, s0, s1, s2);
-        const double J = std::norm(s0);
         const double J1 = 2.0 * std::imag(std::conj(s0) * s1);
         const double J2 = 2.0 * (std::norm(s1) - std::real(std::conj(s0) * s2));
         if (!(J2 < -1e-18))
-            break; // not concave / flat: keep the FFT estimate
+            break; // not concave / flat: keep the current estimate
 
         double step = -J1 / J2;
         if (!std::isfinite(step))
@@ -281,27 +291,33 @@ bool estimate_cfo_from_symbols_ml(const std::complex<float>* z,
             step = -max_step;
 
         // Backtracking line search: accept only a step that does not lower J.
+        std::complex<double> t0, t1, t2;
         double accepted = 0.0;
+        bool have_step = false;
         for (int bt = 0; bt < 3; ++bt) {
             if (!(std::abs(step) > 1e-14))
                 break;
-            std::complex<double> t0, t1, t2;
             eval_spectrum(w + step, t0, t1, t2);
             if (std::norm(t0) >= J) {
                 accepted = step;
+                have_step = true;
                 break;
             }
             step *= 0.5;
         }
-        if (accepted == 0.0)
+        if (!have_step)
             break;
         w += accepted;
+        s0 = t0;
+        s1 = t1;
+        s2 = t2;
+        J = std::norm(s0);
         if (std::abs(accepted) < 1e-8)
             break; // converged
     }
 
-    // Final metrics at the refined frequency.
-    eval_spectrum(w, s0, s1, s2);
+    // `s0..s2` already describe the final `w` (initial eval or last accepted
+    // trial), so the metrics below need no extra evaluation.
     const double s0_abs = std::abs(s0);
     const double cfo_hz = w * sample_rate_hz / (kTwoPi * symbol_period_samples);
 
@@ -422,6 +438,18 @@ bool estimate_cfo_ml(const std::complex<float>* rx,
     const bool use_frac = delta_max >= cfg.frac_drift_threshold_samples;
 
     // ---- Step 2: full-window sampling + ML estimate ---------------------
+    // When the coarse window already covers the whole requested range and the
+    // integer grid is valid there is nothing to gain from resampling: the
+    // coarse ML estimate *is* the full-window estimate.  This is the normal
+    // Stage-2 path (single 64-SYMBOL centred window).
+    if (coarse_res.ok && total <= cfg.coarse_window_symbols && !use_frac) {
+        out = coarse_res;
+        out.effective_period = nominal;
+        out.used_fractional_grid = false;
+        out.used_coherence_fallback = false;
+        return out.ok;
+    }
+
     scratch.cfo_sym_z.resize(total); // reserved 512
     size_t first_full = 0;
     size_t used = sample_sync_symbols_simd(

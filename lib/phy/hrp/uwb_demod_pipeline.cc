@@ -174,16 +174,47 @@ bool run_initial_cfo_and_bootstrap_sfd(
     // The safe interior window keeps the startup transient and any leading
     // acquisition error away from the estimator; a short/abnormal frame falls
     // back to the legacy fit so every edge case stays covered.
+    //
+    // In the default legacy refit mode Stage 3 always runs the SFD-anchored
+    // 232-SYMBOL full-preamble estimate, so Stage 2 only has to bootstrap the
+    // SFO and the first rotation: a single 64-SYMBOL centred ML pass (48 on a
+    // 64-SYNC fixture) buys <50 Hz accuracy for ~1/3 of the work.  Modes 1/2
+    // can skip Stage 3, so they keep the full interior window to satisfy
+    // cfo_refit_min_peaks and the auto/legacy rotation contract.
     const size_t n_rep = profile.preamble_repetitions;
     const size_t margin = (n_rep >= 16) ? std::min<size_t>(32, n_rep / 8) : 0;
-    const size_t ml_begin = margin;
-    const size_t ml_end = n_rep - margin;
+    size_t ml_begin = margin;
+    size_t ml_end = n_rep - margin;
+    if (profile.cfo_refit_mode == 0 && n_rep >= 64 && ml_end > ml_begin) {
+        const size_t interior = ml_end - ml_begin;
+        const size_t window = std::min<size_t>(64, interior);
+        ml_begin += (interior - window) / 2;
+        ml_end = ml_begin + window;
+    }
     bool cfo_ok = false;
     if (res.timing.preamble_start_sample >= 0 && ml_end > ml_begin) {
         cfo_ok = estimate_stage_cfo_ml(
             rx, n, profile, template_wf, res.timing.preamble_start_sample,
             ml_begin, ml_end, /*has_cfo_hint=*/false, 0.0, res.timing,
             scratch, res.cfo);
+    }
+    if (cfo_ok) {
+        // Cross-check the ML estimate against the legacy peak-phase fit.  The
+        // ML sampling grid is anchored on the Stage-1 preamble start; on a
+        // folded acquire window that anchor can be off by a few symbols, which
+        // biases the ML frequency enough to rotate the bootstrap SFD out of
+        // its ±64-sample window (measured on the try2 capture: the lock then
+        // never leaves Verify).  The legacy fit works from the measured peaks,
+        // so a strong disagreement means the ML window is misplaced: keep the
+        // proven estimate.  The check costs ~0.5 µs.
+        CfoResult legacy;
+        if (fit_cfo(rx, n, profile, res.timing, legacy, scratch)) {
+            const double tol = std::max(2000.0, 0.05 * std::abs(legacy.cfo_hz));
+            if (!std::isfinite(res.cfo.cfo_hz) ||
+                std::abs(res.cfo.cfo_hz - legacy.cfo_hz) > tol) {
+                res.cfo = legacy;
+            }
+        }
     }
     if (!cfo_ok && !fit_cfo(rx, n, profile, res.timing, res.cfo, scratch)) {
         clock.lap(res.stage_cfo_us, res.stage_total_us);

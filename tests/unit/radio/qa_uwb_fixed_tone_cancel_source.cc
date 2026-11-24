@@ -745,3 +745,200 @@ BOOST_AUTO_TEST_CASE(test_pipeline_enabled_path_cancels_before_capture)
 
     std::filesystem::remove_all(run.dump_dir);
 }
+
+// ---------------------------------------------------------------------------
+// skip_samples(): locked-idle skipping must not perturb the model or the
+// resumed read path.  The reference run reads the SAME deterministic stream
+// continuously; the mixed run skips whole regions, so every training window
+// is folded from the same raw samples and every resumed read must be
+// bit-identical at the same absolute index.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Consume exactly `want` samples through read_samples(), comparing each chunk
+// with the continuous reference at its absolute position.
+void read_and_compare(FixedToneCancelSc16Source& stage,
+                      size_t want,
+                      const std::vector<std::complex<int16_t>>& reference,
+                      int64_t* consumed)
+{
+    std::vector<std::complex<int16_t>> buf(std::min<size_t>(want, 512));
+    size_t got = 0;
+    while (got < want) {
+        StreamReadMeta meta;
+        const size_t n = stage.read_samples(buf.data(), std::min(buf.size(), want - got), meta);
+        BOOST_REQUIRE_MESSAGE(n > 0, "read stopped early at " << *consumed + got);
+        BOOST_REQUIRE_EQUAL(uint64_t(meta.start_sample_abs), uint64_t(*consumed + got));
+        BOOST_REQUIRE(!meta.is_gap);
+        for (size_t i = 0; i < n; ++i) {
+            BOOST_REQUIRE_MESSAGE(
+                buf[i] == reference[size_t(meta.start_sample_abs) + i],
+                "resumed read differs at absolute sample "
+                    << meta.start_sample_abs + int64_t(i));
+        }
+        got += n;
+    }
+    *consumed += got;
+}
+
+void skip_exactly(FixedToneCancelSc16Source& stage,
+                  size_t want,
+                  int64_t* consumed,
+                  size_t* skipped)
+{
+    while (want > 0) {
+        StreamReadMeta meta;
+        const size_t n = stage.skip_samples(want, meta);
+        BOOST_REQUIRE_MESSAGE(n > 0, "skip stopped early");
+        BOOST_REQUIRE(!meta.is_gap);
+        BOOST_REQUIRE_EQUAL(uint64_t(meta.start_sample_abs), uint64_t(*consumed));
+        want -= n;
+        *consumed += int64_t(n);
+        *skipped += n;
+    }
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(test_skip_samples_preserves_model_and_resumed_reads)
+{
+    FakeOptions opts;
+    opts.total = 4 * static_cast<int64_t>(kPeriodLength);
+    opts.read_sizes = { 97, 256, 31, 512 };
+
+    // Reference: continuous read of the whole stream.
+    auto ref_stage = make_stage(std::make_unique<FakeToneSource>(opts), 256, 512);
+    BOOST_REQUIRE(ref_stage->start_stream());
+    const auto ref = drain(*ref_stage, 333);
+    const auto& rs = ref_stage->stats();
+    BOOST_REQUIRE_EQUAL(ref.samples.size(), static_cast<size_t>(opts.total));
+    BOOST_REQUIRE_EQUAL(rs.model_updates, uint64_t(4));
+    BOOST_REQUIRE_EQUAL(rs.training_windows, uint64_t(4));
+    BOOST_REQUIRE_EQUAL(rs.model_rejects, uint64_t(0));
+
+    auto stage = make_stage(std::make_unique<FakeToneSource>(opts), 256, 512);
+    BOOST_REQUIRE(stage->start_stream());
+    int64_t pos = 0;
+    size_t skipped = 0;
+    // Cross the 20 ms model boundaries (2880 / 5760 / 8640) inside skipped
+    // regions: the training fold must still run and commit on schedule.
+    read_and_compare(*stage, 600, ref.samples, &pos);
+    skip_exactly(*stage, 400, &pos, &skipped);
+    read_and_compare(*stage, 500, ref.samples, &pos);
+    skip_exactly(*stage, 1000, &pos, &skipped);
+    skip_exactly(*stage, 1000, &pos, &skipped);   // crosses 2880
+    read_and_compare(*stage, 900, ref.samples, &pos);
+    skip_exactly(*stage, 2500, &pos, &skipped);   // crosses 5760
+    read_and_compare(*stage, 1200, ref.samples, &pos);
+    skip_exactly(*stage, 2420, &pos, &skipped);   // crosses 8640
+    read_and_compare(*stage, size_t(opts.total) - size_t(pos), ref.samples,
+                     &pos);
+    BOOST_REQUIRE_EQUAL(pos, opts.total);
+
+    const auto& s = stage->stats();
+    check_conservation(s);
+    BOOST_CHECK_EQUAL(s.skipped_samples, uint64_t(skipped));
+    BOOST_CHECK_GT(s.skipped_samples, uint64_t(0));
+    BOOST_CHECK_EQUAL(s.consumed_samples, uint64_t(opts.total));
+    BOOST_CHECK_EQUAL(s.dropped_samples, uint64_t(0));
+    BOOST_CHECK_EQUAL(s.skipped_samples + s.cancelled_samples + s.bypassed_samples,
+                      uint64_t(opts.total));
+    // Same model history as the continuous run: updates, epochs, coefficient.
+    BOOST_CHECK_EQUAL(s.training_windows, rs.training_windows);
+    BOOST_CHECK_EQUAL(s.model_updates, rs.model_updates);
+    BOOST_CHECK_EQUAL(s.model_rejects, rs.model_rejects);
+    BOOST_CHECK_EQUAL(s.model_generation, rs.model_generation);
+    BOOST_CHECK_EQUAL(s.model_epoch, rs.model_epoch);
+    BOOST_CHECK_EQUAL(s.bypassed_samples, rs.bypassed_samples);
+    BOOST_CHECK_EQUAL(stage->tone_core().model().coefficient,
+                      ref_stage->tone_core().model().coefficient);
+    BOOST_CHECK_EQUAL(stage->tone_core().model().training_samples,
+                      ref_stage->tone_core().model().training_samples);
+    BOOST_CHECK_GT(s.skip_calls, uint64_t(0));
+}
+
+BOOST_AUTO_TEST_CASE(test_skip_samples_refuses_to_cross_a_gap)
+{
+    FakeOptions opts;
+    opts.total = 4 * static_cast<int64_t>(kPeriodLength);
+    opts.read_sizes = { 100 };
+    opts.gap_at = 4000;      // logical position of the first post-gap sample
+    opts.gap_samples = 64;   // 4000 -> 4064 on the absolute axis
+    auto stage = make_stage(std::make_unique<FakeToneSource>(opts), 256, 512);
+    BOOST_REQUIRE(stage->start_stream());
+
+    // Prime the model and consume up to 1000, then skip the contiguous run up
+    // to the discontinuity: the skip truncates at the gap boundary.
+    std::vector<std::complex<int16_t>> buf(256);
+    int64_t pos = 0;
+    while (pos < 1000) {
+        StreamReadMeta meta;
+        const size_t n = stage->read_samples(
+            buf.data(), std::min<size_t>(buf.size(), size_t(1000 - pos)), meta);
+        BOOST_REQUIRE(n > 0);
+        pos += int64_t(n);
+    }
+    BOOST_REQUIRE_EQUAL(pos, int64_t(1000));
+
+    size_t skipped = 0;
+    // Skip the contiguous run up to the discontinuity.  skip_samples() is
+    // allowed to stop at a 20 ms training boundary, so consume in a loop.
+    while (pos < 4000) {
+        StreamReadMeta meta;
+        const size_t want = size_t(4000 - pos);
+        const size_t n = stage->skip_samples(want, meta);
+        BOOST_REQUIRE_MESSAGE(n > 0, "skip did not stop at the gap boundary");
+        BOOST_REQUIRE(!meta.is_gap);
+        BOOST_REQUIRE_EQUAL(uint64_t(meta.start_sample_abs), uint64_t(pos));
+        skipped += n;
+        pos += int64_t(n);
+    }
+    BOOST_REQUIRE_EQUAL(pos, int64_t(4000));
+
+    // The next skip stops AT the discontinuity and reports the marker with
+    // n == 0; the model axis is untouched so the next read owns the reset.
+    StreamReadMeta meta;
+    size_t n = stage->skip_samples(1000, meta);
+    BOOST_REQUIRE_EQUAL(n, size_t(0));
+    BOOST_REQUIRE(meta.is_gap);
+    BOOST_CHECK_EQUAL(meta.start_sample_abs, int64_t(4064));
+    BOOST_CHECK_EQUAL(meta.gap_samples, int64_t(64));
+    skipped += n;
+
+    // Falling back to read_samples() reports the gap exactly once and resets
+    // the epoch at the first post-gap sample.
+    const uint64_t resets_before = stage->stats().epoch_resets;
+    size_t read_n = 0;
+    while (read_n == 0) {
+        StreamReadMeta rm;
+        const size_t got = stage->read_samples(buf.data(), buf.size(), rm);
+        if (got == 0) {
+            BOOST_REQUIRE(!stage->is_eof());
+            continue;
+        }
+        BOOST_REQUIRE(rm.is_gap);
+        BOOST_CHECK_EQUAL(rm.start_sample_abs, int64_t(4064));
+        BOOST_CHECK_EQUAL(rm.gap_samples, int64_t(64));
+        read_n = got;
+    }
+    BOOST_CHECK_GE(stage->stats().epoch_resets, resets_before + 1);
+
+    // Drain the rest; the post-gap model must be anchored after the gap.
+    DrainResult rest;
+    for (;;) {
+        StreamReadMeta rm;
+        const size_t got = stage->read_samples(buf.data(), buf.size(), rm);
+        if (got == 0) {
+            if (stage->is_eof() || stage->fatal_error(nullptr)) break;
+            continue;
+        }
+        if (rm.is_gap) {
+            rest.gaps.emplace_back(rm.start_sample_abs, rm.gap_samples);
+        }
+    }
+    const auto& s = stage->stats();
+    check_conservation(s);
+    BOOST_CHECK_GE(s.model_epoch, int64_t(4064));
+    BOOST_CHECK_EQUAL(s.skipped_samples, uint64_t(skipped));
+    BOOST_CHECK_EQUAL(rest.gaps.size(), size_t(0));
+}

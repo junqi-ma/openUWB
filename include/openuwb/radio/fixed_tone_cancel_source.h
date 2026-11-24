@@ -87,6 +87,10 @@ struct FixedToneCancelStats {
     // Cancellation bookkeeping.
     uint64_t cancelled_samples = 0;
     uint64_t bypassed_samples = 0;
+    // Samples consumed through skip_samples(): advanced past without calling
+    // the tone core and never written to the caller's ring.  Kept strictly
+    // separate from bypassed_samples (which are pass-through copies).
+    uint64_t skipped_samples = 0;
     uint64_t training_windows = 0;
     uint64_t model_updates = 0;
     uint64_t model_rejects = 0;
@@ -98,6 +102,8 @@ struct FixedToneCancelStats {
     // Decorator read calls (aggregate view; per-call detail is in the CSV/JSON).
     uint64_t read_calls = 0;
     uint64_t empty_reads = 0;
+    // skip_samples() calls and the samples they advanced past.
+    uint64_t skip_calls = 0;
 
     uint64_t model_generation = 0;
     double model_amplitude = 0.0;
@@ -107,6 +113,7 @@ struct FixedToneCancelStats {
     // CPU time in this stage (thread-local clocks, summed).
     double estimate_us = 0.0;   // fold + projection + table build
     double cancel_us = 0.0;     // fused copy-and-cancel
+    double skip_us = 0.0;       // skip_samples() bookkeeping (no copy/cancel)
     double reader_us = 0.0;     // wrapped source read (reader thread)
 };
 
@@ -131,6 +138,22 @@ public:
     size_t read_samples(std::complex<int16_t>* dest,
                         size_t max_samples,
                         StreamReadMeta& meta) override;
+    // Advances over up to max_samples of the SAME continuous stream WITHOUT
+    // cancelling them and without writing anything to the caller's storage.
+    //
+    // It runs the identical epoch/gap/20 ms training state machine as
+    // read_samples() (each training window is still folded from the raw ring,
+    // so model_updates and the model coefficients are bit-identical), then
+    // releases the consumed raw blocks and records skipped_samples.  The model
+    // therefore stays the single source of truth for tone phase: no second
+    // cancellation pass and no cross-thread LUT access are introduced.
+    //
+    // Returns the number of samples skipped (0 on EOF/fatal/empty).  meta
+    // carries the same start_sample_abs / is_gap / gap_samples / is_eof fields
+    // as read_samples(); a gap boundary is reported with n == 0 so the caller
+    // handles it exactly like a normal gap.  The skipped absolute range is NOT
+    // valid in the caller's ring afterwards.
+    size_t skip_samples(size_t max_samples, StreamReadMeta& meta);
     double actual_rx_rate() const override;
     bool is_eof() const override;
     bool fatal_error(std::string* msg) const override;
@@ -148,6 +171,13 @@ private:
     void set_fatal(int code, const std::string& msg);
     // Wait (bounded) for at least one published raw block.
     bool wait_for_data(std::unique_lock<std::mutex>& lk);
+    // Shared read/skip implementation: identical stream state machine, the
+    // only difference is whether the produced region is copied-and-cancelled
+    // into dest (cancel == true) or merely consumed (cancel == false).
+    size_t produce(std::complex<int16_t>* dest,
+                   size_t max_samples,
+                   StreamReadMeta& meta,
+                   bool cancel);
     void notify_waiters();
 };
 

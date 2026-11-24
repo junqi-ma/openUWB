@@ -96,6 +96,7 @@ struct FixedToneCancelSc16Source::Impl {
     std::atomic<uint64_t> consumed_samples{ 0 };
     std::atomic<uint64_t> cancelled_samples{ 0 };
     std::atomic<uint64_t> bypassed_samples{ 0 };
+    std::atomic<uint64_t> skipped_samples{ 0 };
     std::atomic<uint64_t> training_windows{ 0 };
     std::atomic<uint64_t> model_updates{ 0 };
     std::atomic<uint64_t> model_rejects{ 0 };
@@ -105,8 +106,10 @@ struct FixedToneCancelSc16Source::Impl {
     std::atomic<uint64_t> gap_samples_forwarded{ 0 };
     std::atomic<uint64_t> read_calls{ 0 };
     std::atomic<uint64_t> empty_reads{ 0 };
+    std::atomic<uint64_t> skip_calls{ 0 };
     std::atomic<uint64_t> estimate_ns{ 0 };
     std::atomic<uint64_t> cancel_ns{ 0 };
+    std::atomic<uint64_t> skip_ns{ 0 };
     std::atomic<uint64_t> reader_ns{ 0 };
 
     // Consumer-side state (only the window-assembler thread touches it).
@@ -477,6 +480,7 @@ const FixedToneCancelStats& FixedToneCancelSc16Source::stats() const
         v.queued_samples >= v.consumed_samples ? v.queued_samples - v.consumed_samples : 0;
     v.cancelled_samples = d.cancelled_samples.load(std::memory_order_relaxed);
     v.bypassed_samples = d.bypassed_samples.load(std::memory_order_relaxed);
+    v.skipped_samples = d.skipped_samples.load(std::memory_order_relaxed);
     v.training_windows = d.training_windows.load(std::memory_order_relaxed);
     v.model_updates = d.model_updates.load(std::memory_order_relaxed);
     v.model_rejects = d.model_rejects.load(std::memory_order_relaxed);
@@ -487,12 +491,14 @@ const FixedToneCancelStats& FixedToneCancelSc16Source::stats() const
     v.gap_samples_forwarded = d.gap_samples_forwarded.load(std::memory_order_relaxed);
     v.read_calls = d.read_calls.load(std::memory_order_relaxed);
     v.empty_reads = d.empty_reads.load(std::memory_order_relaxed);
+    v.skip_calls = d.skip_calls.load(std::memory_order_relaxed);
     v.model_generation = d.core.model().generation;
     v.model_amplitude = d.core.model().amplitude;
     v.model_phase_radians = d.core.model().phase_radians;
     v.model_epoch = d.core.model().epoch;
     v.estimate_us = 1e-3 * static_cast<double>(d.estimate_ns.load(std::memory_order_relaxed));
     v.cancel_us = 1e-3 * static_cast<double>(d.cancel_ns.load(std::memory_order_relaxed));
+    v.skip_us = 1e-3 * static_cast<double>(d.skip_ns.load(std::memory_order_relaxed));
     v.reader_us = 1e-3 * static_cast<double>(d.reader_ns.load(std::memory_order_relaxed));
     return v;
 }
@@ -550,16 +556,38 @@ size_t FixedToneCancelSc16Source::read_samples(std::complex<int16_t>* dest,
                                                size_t max_samples,
                                                StreamReadMeta& meta)
 {
+    return produce(dest, max_samples, meta, /*cancel=*/true);
+}
+
+size_t FixedToneCancelSc16Source::skip_samples(size_t max_samples,
+                                               StreamReadMeta& meta)
+{
+    return produce(nullptr, max_samples, meta, /*cancel=*/false);
+}
+
+size_t FixedToneCancelSc16Source::produce(std::complex<int16_t>* dest,
+                                          size_t max_samples,
+                                          StreamReadMeta& meta,
+                                          bool cancel)
+{
     auto& d = *impl_;
     meta = StreamReadMeta{};
     if (!d.prepared.load(std::memory_order_acquire)) {
         meta.is_eof = true;
         return 0;
     }
-    d.read_calls.fetch_add(1, std::memory_order_relaxed);
-    if (dest == nullptr || max_samples == 0) {
-        meta.is_eof = is_eof();
-        return 0;
+    if (cancel) {
+        d.read_calls.fetch_add(1, std::memory_order_relaxed);
+        if (dest == nullptr || max_samples == 0) {
+            meta.is_eof = is_eof();
+            return 0;
+        }
+    } else {
+        d.skip_calls.fetch_add(1, std::memory_order_relaxed);
+        if (max_samples == 0) {
+            meta.is_eof = is_eof();
+            return 0;
+        }
     }
 
     {
@@ -569,7 +597,7 @@ size_t FixedToneCancelSc16Source::read_samples(std::complex<int16_t>* dest,
                 meta.error_code = d.fatal_code.load(std::memory_order_relaxed);
             }
             meta.is_eof = is_eof();
-            if (!meta.is_eof && !d.fatal.load(std::memory_order_acquire)) {
+            if (cancel && !meta.is_eof && !d.fatal.load(std::memory_order_acquire)) {
                 d.empty_reads.fetch_add(1, std::memory_order_relaxed);
             }
             return 0;
@@ -631,6 +659,18 @@ size_t FixedToneCancelSc16Source::read_samples(std::complex<int16_t>* dest,
     uint64_t t0 = d.tail.load(std::memory_order_acquire);
     Pending* cur_block = block_at(t0);
     int64_t cur = cur_block->start_abs + static_cast<int64_t>(d.cur_offset);
+
+    // skip_samples() never jumps across a discontinuity: the caller must fall
+    // back to read_samples(), which owns the gap report (meta.is_gap) and the
+    // epoch reset.  Returning the marker with n == 0 keeps the ring valid range
+    // and the model axis untouched.
+    if (!cancel && cur == cur_block->start_abs && cur_block->is_gap) {
+        meta.is_gap = true;
+        meta.gap_samples = cur_block->gap_samples;
+        meta.start_sample_abs = cur;
+        meta.is_eof = is_eof();
+        return 0;
+    }
 
     if (!d.have_epoch) {
         d.have_epoch = true;
@@ -823,7 +863,9 @@ size_t FixedToneCancelSc16Source::read_samples(std::complex<int16_t>* dest,
         // No contiguous sample available right now (a bounded wait already
         // succeeded, so this only covers a just-detected discontinuity).
         meta.is_eof = is_eof();
-        d.empty_reads.fetch_add(1, std::memory_order_relaxed);
+        if (cancel) {
+            d.empty_reads.fetch_add(1, std::memory_order_relaxed);
+        }
         return 0;
     }
     int64_t limit = std::min<int64_t>(run_end, d.next_period_start);
@@ -866,13 +908,15 @@ size_t FixedToneCancelSc16Source::read_samples(std::complex<int16_t>* dest,
         const size_t off = d.cur_offset;
         const size_t avail = b->count - off;
         const size_t take = std::min(avail, count - produced);
-        const auto counts = d.core.copy_cancel(
-            reinterpret_cast<const int16_t*>(b->samples.data()) + 2 * off,
-            reinterpret_cast<int16_t*>(dest) + 2 * produced,
-            take,
-            pos);
-        d.cancelled_samples.fetch_add(counts.cancelled, std::memory_order_relaxed);
-        d.bypassed_samples.fetch_add(counts.bypassed, std::memory_order_relaxed);
+        if (cancel) {
+            const auto counts = d.core.copy_cancel(
+                reinterpret_cast<const int16_t*>(b->samples.data()) + 2 * off,
+                reinterpret_cast<int16_t*>(dest) + 2 * produced,
+                take,
+                pos);
+            d.cancelled_samples.fetch_add(counts.cancelled, std::memory_order_relaxed);
+            d.bypassed_samples.fetch_add(counts.bypassed, std::memory_order_relaxed);
+        }
         produced += take;
         pos += static_cast<int64_t>(take);
         d.cur_offset += take;
@@ -882,8 +926,13 @@ size_t FixedToneCancelSc16Source::read_samples(std::complex<int16_t>* dest,
         }
     }
     d.consumed_samples.fetch_add(produced, std::memory_order_relaxed);
-    d.cancel_ns.fetch_add(elapsed_ns(t_cancel, std::chrono::steady_clock::now()),
-                          std::memory_order_relaxed);
+    const auto elapsed = elapsed_ns(t_cancel, std::chrono::steady_clock::now());
+    if (cancel) {
+        d.cancel_ns.fetch_add(elapsed, std::memory_order_relaxed);
+    } else {
+        d.skip_ns.fetch_add(elapsed, std::memory_order_relaxed);
+        d.skipped_samples.fetch_add(produced, std::memory_order_relaxed);
+    }
 
     meta.is_eof = is_eof();
     return produced;

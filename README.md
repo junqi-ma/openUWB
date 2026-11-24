@@ -29,6 +29,12 @@ We believe that bringing full SDR programmability together with commercial stand
 - **2026-11-20 — Native C++17 Refactor & Rename to OpenUWB (Phase 0–4)**
   - Removed the runtime dependency on GNU Radio (archived under `archive/gnuradio-adapter`) and promoted the native C++17 / UHD codebase to the repository root.
   - Renamed the project to **OpenUWB**, introducing the `openuwb` namespace, unidirectional domain libraries (`support → dsp → phy_hrp → {sic, sensing, twr_core}`, with `openuwb_radio` isolating UHD and `openuwb_runtime` assembling the pipeline), and unified `openuwb_*` applications.
+- **2026-11-21 — `openuwb_rx` SIC Integration & Build System Overhaul**
+  - Wired preamble/Ipatov SIC into `openuwb_rx` (`--sic`, fail-open, zero overhead when disabled) with empirical steady-state L1 vectorization and truncated-SFD rescue (offline replay verified).
+  - Migrated all presets to Ninja with PCH, `ccache`/`mold` support, heavy-header implementation decoupling, and domain-scoped dev presets (`dev-rx`, `dev-tx`, `dev-twr`, `dev-radar`).
+- **2026-11-24 — RX Frontend & Demodulation Pipeline Refactor (Offline Replay)**
+  - Refactored the HRP demodulation stages: Stage-1 Timing (local `K=4` folded fast path and sparse anchor fitting), Stage-2 CFO (decoupled SIMD symbol sampler and complex ML estimator), and Stage-3 SFD (soft polarity, low-threshold search, and incremental derotation).
+  - Added 250 MHz channel-selective `65/48` resampler filters (`--taps ch250_eq16/24/32/48`), a folded preamble cross-correlation acquisition frontend (`--acq-mode xcorr`), and whole-region AVX2 + opt-in locked-idle on-demand fixed-tone cancellation (`skip_samples` + `--tone-when-locked window`, paired with `--autocorr-when-locked suspend`), all validated via offline DW3000 file replay (live hardware validation pending).
 
 ## Repository Navigation
 

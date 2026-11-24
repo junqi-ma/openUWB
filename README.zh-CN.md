@@ -29,6 +29,12 @@
 - **2026-11-20 — 去 GNU Radio 化与 OpenUWB 架构重构（Phase 0–4）**
   - 剥离 GNU Radio 运行时依赖（历史适配器归档至 `archive/gnuradio-adapter`），将原生 C++17 / UHD 工程提升至仓库根目录。
   - 项目正式更名为 **OpenUWB**，确立 `openuwb` 命名空间与单向依赖的模块化域库（`support → dsp → phy_hrp → {sic, sensing, twr_core}`，由 `openuwb_radio` 隔离 UHD、`openuwb_runtime` 统一组装），并切换为 `openuwb_*` 应用入口。
+- **2026-11-21 — `openuwb_rx` 接入 SIC 与构建体系加速**
+  - 将前导/Ipatov SIC 接入 `openuwb_rx`（`--sic`，默认关闭零分配、开启 fail-open），补齐经验稳态 L1 向量化与截断 SFD 救援（离线回放验证）。
+  - 全预设切换为 Ninja，引入 PCH、`ccache`/`mold` 自动探测、重型头文件声明/实现解耦及按域裁剪开发预设（`dev-rx` / `dev-tx` / `dev-twr` / `dev-radar`）。
+- **2026-11-24 — RX 前端与解调管线全面重构与加速（离线回放）**
+  - 重构 HRP 解调核心阶段：Stage-1 Timing（局部 `K=4` 折叠快路径与稀疏锚点拟合）、Stage-2 CFO（解耦 SIMD 符号采样与复数域 ML 估计器）、Stage-3 SFD（软极性、低门限搜索与增量补旋）。
+  - 新增 250 MHz 信道化 `65/48` 重采样滤波器（`--taps ch250_eq16/24/32/48`）、折叠前导码互相关捕获前端（`--acq-mode xcorr`）以及整段 AVX2 + 锁后静默期按需固定单音消除（`skip_samples` + `--tone-when-locked window`，配合 `--autocorr-when-locked suspend`）；以上均为离线 DW3000 实采回放验证（尚未上板）。
 
 ## 当前仓库导航
 

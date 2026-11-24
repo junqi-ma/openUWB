@@ -1,0 +1,64 @@
+# =====================================================================
+# .antigravityignore — agy cli / Antigravity agent 上下文裁剪
+# 目标：排除生成物、采集数据、历史实验结果，只保留开发与验证必需的源码/报告。
+# 语法按 gitignore 约定；行尾不能写注释，注释必须独占一行。
+# =====================================================================
+
+# ----- 1. 构建 / 生成物 -----
+# build 下除产物外还有 ~500M 的预生成 .cc 和 compile_commands.json。
+build/
+.worktrees/
+Testing/
+out/
+logs/
+.git/
+
+# ----- 2. 大型采集数据（testdata 约 145G，只排二进制，保留夹具清单与脚本）-----
+testdata/**/*.dat
+testdata/**/*.cfile
+testdata/**/*.bin
+testdata/**/*.sc16
+testdata/**/*.cf32
+testdata/**/*.iq
+testdata/**/*.ucr4
+testdata/**/*.f32
+testdata/**/*.npy
+testdata/**/*.npz
+testdata/**/*.mat
+testdata/**/*.png
+testdata/archive/
+
+# 全部为本地 DW3000 采集，未被 git 跟踪，每个约 14G。
+testdata/dw3000_*/
+
+# 本地 SNR / 固定音探针的窗口数据。
+testdata/x410_snr_20261118/
+testdata/uwb_radar_synthetic/
+
+# ----- 3. 实验数据：docs/performance/data_*/ 下的 JSON/CSV（约 1.19G，占已跟踪文本 99%）-----
+# 只排数据文件，保留同目录的 README.md / ARCHIVE.md 与报告。
+docs/performance/data_*/raw/
+docs/performance/data_*/**/*.json
+docs/performance/data_*/**/*.jsonl
+docs/performance/data_*/**/*.csv
+docs/performance/data_*/**/*.txt
+docs/performance/data_*/**/*.log
+docs/performance/data_*/**/*.mat
+docs/performance/data_*/**/*.png
+docs/performance/data_*/**/*.npz
+
+# ----- 4. 历史实验输出（代码不引用，仅文档提及）-----
+analysis_outputs/
+
+# ----- 5. 明确 out of scope 的 MATLAB 参考实现 -----
+# 如需“逐算法对照 MATLAB”时再临时移除此条。
+UWB_demodulation/
+
+# ----- 6. 工具 / 编辑器本地状态 -----
+.claude/
+.codex/
+.agents/
+.opencode-task/
+.idea/
+.vscode/
+**/__pycache__/

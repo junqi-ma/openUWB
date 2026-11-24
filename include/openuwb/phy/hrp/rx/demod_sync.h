@@ -6,6 +6,8 @@
 #include <openuwb/phy/hrp/rx/rx_matched_filter.h>
 #include <openuwb/dsp/detector_core.h>
 
+#include <cstring>
+
 namespace openuwb::demod::core {
 // ---------------------------------------------------------------------------
 // R1 implementations: Stage 1 (timing), Stage 2 (CFO), Stage 3 (SFD refine).
@@ -70,6 +72,63 @@ inline const rxopt::SparseCirTemplate* prepare_sparse_sync_template(
     return scratch.cir_template.code_energy > 0.0f ? &scratch.cir_template : nullptr;
 }
 
+    // Cheap content probe for the shaped-template cache: eight evenly spaced
+    // samples instead of an FNV over all 1016.  The cache key also includes the
+    // buffer pointer and length, so a real waveform change is caught by any of
+    // the three; this only exists to skip the full rehash when Stage 1/2/3
+    // sample the same template buffer.
+    inline uint64_t
+    template_sample_probe(const std::vector<std::complex<float>>& wf)
+    {
+        const size_t n = wf.size();
+        if (n == 0)
+            return 0;
+        const size_t idx[8] = { 0, n / 8, n / 4, (3 * n) / 8,
+                                n / 2, (5 * n) / 8, (3 * n) / 4, n - 1 };
+        uint64_t h = 1469598103934665603ULL;
+        for (size_t i = 0; i < 8; ++i) {
+            const float parts[2] = { wf[idx[i]].real(), wf[idx[i]].imag() };
+            uint32_t bits[2];
+            std::memcpy(bits, parts, sizeof(bits));
+            h = (h ^ static_cast<uint64_t>(bits[0])) * 1099511628211ULL;
+            h = (h ^ static_cast<uint64_t>(bits[1])) * 1099511628211ULL;
+        }
+        return h;
+    }
+
+    // Shared shaped-template cache for Stage 1 (timing) and the CFO sampler.
+    // `rxopt::ensure_shaped_sparse_template()` re-hashes the whole 1016-sample
+    // SYNC waveform on every call; the (8-point probe, pointer, length, code
+    // key) identity is enough to detect a content change and lets both stages
+    // reuse the SAME cached ShapedSparseTemplate within one packet.
+    inline const rxopt::ShapedSparseTemplate*
+    ensure_shaped_sparse_template_cached(
+        const std::vector<std::complex<float>>& template_wf,
+        size_t len,
+        const rxopt::SparseCirTemplate& code,
+        DemodScratch& scratch)
+    {
+        const uint64_t probe = template_sample_probe(template_wf);
+        const bool cache_hit =
+            scratch.shaped_sync_template.valid &&
+            scratch.cfo_template_ptr ==
+                static_cast<const void*>(template_wf.data()) &&
+            scratch.cfo_template_len == template_wf.size() &&
+            scratch.cfo_template_probe == probe &&
+            scratch.cfo_template_code_key == code.key;
+        if (cache_hit)
+            return &scratch.shaped_sync_template;
+        const auto* shaped = rxopt::ensure_shaped_sparse_template(
+            template_wf.data(), len, code, scratch.shaped_sync_template);
+        if (shaped) {
+            scratch.cfo_template_ptr = template_wf.data();
+            scratch.cfo_template_len = template_wf.size();
+            scratch.cfo_template_probe = probe;
+            scratch.cfo_template_code_key = code.key;
+        }
+        return shaped;
+    }
+
 // Full-rate normalized matched filter over [roi_start, roi_end).  Fills
 // metric[j] for j in [roi_start, roi_end-L), with
 //   metric[j] = |<rx, tmpl>|^2 / (winpow[j] * Et + eps)
@@ -120,6 +179,23 @@ inline constexpr size_t kFoldMinSymbols = 16;
 inline constexpr float kFoldThreshold = 0.05f;
 inline constexpr size_t kFoldAnchorGroupSymbols = 4;
 inline constexpr int64_t kFoldAnchorRefine = 8;
+// fold_anchor_fit() keeps `groups` as the TOTAL number of 4-SYMBOL groups
+// available in the preamble, but only measures at most this many of them.  The
+// sampled groups are spread uniformly over [0, groups-1] INCLUDING both
+// endpoints -- never just the first 16 groups -- so for the 256-SYMBOL
+// preamble (64 groups) the 16 anchors still span the full 252-symbol baseline.
+// measured_period / the intercept therefore keep the same time baseline (and
+// the same integer-grid snap) as the old 64-group fit, while both refold/
+// correlation passes drop to a quarter of the work.
+//
+// Consequence for Stage-2 fit_cfo(): 16 anchors over 64 groups are 16/20 SYMBOLS
+// apart, so the sparse-anchor phase train is only unambiguous for
+// |CFO| < fs / (2 * 16.8 * kQm35SamplesPerSymbol) ~= 29.3 kHz (the 20-symbol
+// fallback bounds the interval, not the phase wrap).  Fold packets that leave
+// `fold_phase_per_symbol` at zero therefore need a correct CFO hint -- fit_cfo()
+// already prefers that hint as the unwrap slope -- for larger offsets.  For
+// <= 16 groups (the 64-repetition default) every group is still measured.
+inline constexpr size_t kFoldAnchorMaxGroups = 16;
 
 struct FoldAcquireResult {
     bool ok = false;
@@ -236,7 +312,36 @@ FoldAcquireResult fold_acquire(const std::complex<float>* rx,
                                double phase_per_symbol = 0.0,
                                const rxopt::SparseCirTemplate* sparse_tmpl = nullptr,
                                std::vector<std::complex<float>>* fold_buf = nullptr,
-                               const rxopt::ShapedSparseTemplate* shaped_tmpl = nullptr);
+                               const rxopt::ShapedSparseTemplate* shaped_tmpl = nullptr,
+                               std::vector<float>* lag_metrics_buf = nullptr);
+
+// Absolute-symbol disambiguation for the fold path.
+//
+// The preamble is 256 VERBATIM copies of one SYNC symbol, so the fold metric is
+// exactly P-periodic: `fold.start` is only the grid phase nearest the seed.  The
+// one non-periodic feature available before the SFD is the preamble's leading
+// edge: immediately before the true start there is noise (every acquisition
+// window carries a pre-guard), while every other candidate has a SYNC before it.
+// Scan the candidate grid from EARLY to LATE and take the first slot whose
+// single-SYMBOL metric clears a noise/signal threshold.
+//
+// `cand_metric` is caller-owned scratch (DemodScratch::timing_fold_cand_metrics)
+// so a warm packet allocates nothing; the candidate count is 2*radius/P + 5.
+struct FoldLeadingEdge {
+    int64_t start = -1;   // leading-edge SYMBOL START (fold.start on no crossing)
+    float max_here = 0.0f; // strongest single-SYMBOL metric on the candidate grid
+    bool crossed = false;  // a candidate cleared the leading-edge threshold
+};
+
+FoldLeadingEdge disambiguate_fold_leading_edge(
+    const std::complex<float>* rx,
+    size_t n,
+    const rxopt::SyncMatchedFilter& filter,
+    size_t L,
+    float Et,
+    const FoldAcquireResult& fold,
+    int64_t radius,
+    std::vector<float>& cand_metric);
 
 // Interval local probe: coherently fold `fold_symbols` SYNC periods starting at
 // `probe`, then correlate over ONE symbol period and report the best absolute
@@ -274,9 +379,12 @@ FoldAcquireResult fold_probe_acquire(
 // The folded metric resolves the packet origin to ~1 sample, but its period
 // would be the nominal grid by construction: the fold has no resolution along
 // the symbol index.  `measured_period` feeds integer_chip_grid()/spc_ppm and
-// the fused-CMF admission, so it must stay a genuine measurement.  Group the
-// SYNCs into `groups` blocks of kFoldAnchorGroupSymbols, coherently sum each
-// block into one super-symbol (+12 dB), refine its position with a
+// the fused-CMF admission, so it must stay a genuine measurement.  Partition
+// the SYNCs into `groups` blocks of kFoldAnchorGroupSymbols (`groups` is the
+// TOTAL available count), sample at most kFoldAnchorMaxGroups of them uniformly
+// over [0, groups-1] with BOTH endpoints included (so the fit baseline is the
+// full preamble, not its first 16 groups), coherently sum each selected block
+// into one super-symbol (+12 dB), refine its position with a
 // +/-kFoldAnchorRefine normalized search, then least-squares fit
 //     peak(g) = start + (g*kFoldAnchorGroupSymbols)*period + (L-1)
 // exactly like the legacy 256-peak fit (symbol-END convention; the intercept is
@@ -297,7 +405,9 @@ bool fold_anchor_fit(const std::complex<float>* rx,
                      double phase_per_symbol = 0.0,
                      const rxopt::SparseCirTemplate* sparse_tmpl = nullptr,
                      std::vector<std::complex<float>>* sup_buf = nullptr,
-                     const rxopt::ShapedSparseTemplate* shaped_tmpl = nullptr);
+                     const rxopt::ShapedSparseTemplate* shaped_tmpl = nullptr,
+                     std::vector<int64_t>* cfo_peak_samples = nullptr,
+                     std::vector<std::complex<float>>* cfo_peak_corr = nullptr);
 
 } // namespace detail
 

@@ -10,6 +10,11 @@
 #include <openuwb/phy/hrp/rx/rx_cfo_opt.h>
 #include <openuwb/phy/hrp/rx/rx_phase_sfo.h>
 
+#include <array>
+#include <cmath>
+#include <limits>
+#include <numeric>
+
 namespace openuwb::demod::core {
 
 bool fit_cfo(const std::complex<float>* rx,
@@ -20,7 +25,22 @@ bool fit_cfo(const std::complex<float>* rx,
              DemodScratch& scratch)
 {
     out = CfoResult{};
-    const size_t np = timing.peak_samples.size();
+    // The fold path publishes a dense 4-SYMBOL-group CFO grid in scratch
+    // (up to 64 phases, alias-free to +/-122.8 kHz, 24-symbol skip -> 40
+    // points).  It restores the information the old 64-anchor train gave the
+    // legacy Stage-2 cross-check while TimingResult keeps its sparse <= 16
+    // detected_peaks contract.  Non-fold / synthetic sparse trains fall back
+    // to timing.peak_samples.
+    const bool use_fold_cfo =
+        timing.sync_peaks_folded &&
+        scratch.timing_fold_cfo_samples.size() >= 4 &&
+        scratch.timing_fold_cfo_corr.size() ==
+            scratch.timing_fold_cfo_samples.size();
+    const std::vector<int64_t>& ps =
+        use_fold_cfo ? scratch.timing_fold_cfo_samples : timing.peak_samples;
+    const std::vector<std::complex<float>>& pc =
+        use_fold_cfo ? scratch.timing_fold_cfo_corr : timing.peak_corr;
+    const size_t np = ps.size();
     if (np < 4)
         return false;
 
@@ -35,20 +55,20 @@ bool fit_cfo(const std::complex<float>* rx,
     if (nfit < 2)
         return false;
     out.skipped_peaks = skip;
-    out.fit_first_peak_sample = timing.peak_samples[skip];
-    out.fit_last_peak_sample = timing.peak_samples[np - 1];
+    out.fit_first_peak_sample = ps[skip];
+    out.fit_last_peak_sample = ps[np - 1];
 
     // Gather per-peak carrier phases from the SYNC matched-filter values (the
     // noise-averaged correlation phase, NOT the raw rx[peak] sample).  Falls
     // back to the raw sample if the timing stage did not populate peak_corr.
     const auto cfo_fit_begin = std::chrono::steady_clock::now();
-    const bool have_corr = timing.peak_corr.size() >= np;
+    const bool have_corr = pc.size() >= np;
     scratch.metric.resize(nfit);
     for (size_t k = 0; k < nfit; ++k) {
         const size_t idx = skip + k;
         scratch.metric[k] =
-            have_corr ? std::arg(timing.peak_corr[idx])
-                      : std::arg(rx[timing.peak_samples[idx]]);
+            have_corr ? std::arg(pc[idx])
+                      : std::arg(rx[ps[idx]]);
     }
     // Unwrap: adjacent SYNC phases must stay within ±π.  When LockedBounded
     // bridges a multi-symbol interference gap, estimate the per-sample phase
@@ -63,11 +83,11 @@ bool fit_cfo(const std::complex<float>* rx,
                 const size_t idx0 = skip + k - 1;
                 const size_t idx1 = skip + k;
                 const double dt = static_cast<double>(
-                    timing.peak_samples[idx1] - timing.peak_samples[idx0]);
+                    ps[idx1] - ps[idx0]);
                 if (dt > 0.0 && dt <= max_dt) {
                     if (have_corr) {
-                        const std::complex<double> c0(timing.peak_corr[idx0]);
-                        const std::complex<double> c1(timing.peak_corr[idx1]);
+                        const std::complex<double> c0(pc[idx0]);
+                        const std::complex<double> c1(pc[idx1]);
                         s += c1 * std::conj(c0);
                     } else {
                         const double dphi = static_cast<double>(scratch.metric[k] - scratch.metric[k - 1]);
@@ -86,17 +106,111 @@ bool fit_cfo(const std::complex<float>* rx,
         if (std::norm(adj_sum) > 1e-24) {
             unwrap_slope_rad_per_sample =
                 std::arg(adj_sum) / static_cast<double>(kQm35SamplesPerSymbol);
-        } else if (timing.fold_phase_per_symbol != 0.0) {
-            unwrap_slope_rad_per_sample = timing.fold_phase_per_symbol /
-                static_cast<double>(kQm35SamplesPerSymbol);
         } else {
-            // Fallback for sparse trains (e.g. 16 super-anchors spaced
-            // 16*1016): recover the average per-sample slope across intervals up
-            // to 20 symbols so bridging gaps still unwraps cleanly.
-            adj_sum = collect_adj(
-                20.0 * static_cast<double>(kQm35SamplesPerSymbol), mean_dt);
-            if (std::norm(adj_sum) > 1e-24 && mean_dt > 0.0) {
-                unwrap_slope_rad_per_sample = std::arg(adj_sum) / mean_dt;
+            // A dense 4-SYMBOL-group train (the fold path's shadow CFO grid,
+            // or the legacy 64-anchor train) has adjacent 4P pairs: the 20P
+            // average is alias-free to +/-122.8 kHz and needs no search.
+            double min_gap = std::numeric_limits<double>::infinity();
+            for (size_t k = 1; k < nfit; ++k)
+                min_gap = std::min(
+                    min_gap, static_cast<double>(ps[skip + k] -
+                                                 ps[skip + k - 1]));
+            if (min_gap <= 4.5 * static_cast<double>(kQm35SamplesPerSymbol)) {
+                adj_sum = collect_adj(
+                    20.0 * static_cast<double>(kQm35SamplesPerSymbol),
+                    mean_dt);
+                if (std::norm(adj_sum) > 1e-24 && mean_dt > 0.0)
+                    unwrap_slope_rad_per_sample =
+                        std::arg(adj_sum) / mean_dt;
+            } else {
+            // Sparse train (the fold path reports up to 16 super-anchors over
+            // the full preamble).  There is no 1-symbol pair to unwrap from.
+            // Every anchor sits on a 4-SYMBOL group boundary, so the phase
+            // train has a hard alias at +/-fs/(4*P) ~= +/-122.8 kHz; the mixed
+            // 16/20-symbol gaps shape the peak but do not remove that alias.
+            // A timing-side CFO hint is not reliable under the real capture's
+            // phase noise, so run a small periodogram over the unambiguous
+            // +/-120 kHz range (the Stage-2 spec is +/-40 kHz): the true slope
+            // aligns all 16 anchor phasors, an alias does not.  The final OLS
+            // below then refines the chosen branch.
+            constexpr double kCoarseStepHz = 1000.0;
+            constexpr double kFineStepHz = 50.0;
+            std::array<double, 512> raw_phase{};
+            std::array<std::complex<double>, 512> anchor{};
+            std::array<int, 512> group_pos{};
+            if (nfit <= raw_phase.size()) {
+                const double group_samples =
+                    4.0 * static_cast<double>(kQm35SamplesPerSymbol);
+                for (size_t k = 0; k < nfit; ++k) {
+                    const double ph =
+                        static_cast<double>(scratch.metric[skip + k]);
+                    raw_phase[k] = ph;
+                    anchor[k] = std::polar(1.0, ph);
+                    const double dt = static_cast<double>(
+                        ps[skip + k] -
+                        ps[skip]);
+                    group_pos[k] = static_cast<int>(
+                        std::llround(dt / group_samples));
+                }
+                // The unambiguous range is set by the GCD of the anchor gaps:
+                // a uniform 16-symbol train (4-group gaps) repeats every
+                // fs/(4*4P) ~= 61 kHz, while the fold path's mixed 4/5-group
+                // (16/20-symbol) gaps push the first alias to fs/(4P) ~=
+                // 245.7 kHz.  Search only +/- half that spacing.
+                int gap_gcd = 0;
+                for (size_t k = 1; k < nfit; ++k)
+                    gap_gcd = std::gcd(gap_gcd,
+                                       group_pos[k] - group_pos[k - 1]);
+                if (gap_gcd <= 0)
+                    gap_gcd = 1;
+                const double max_cfo_hz = std::min(
+                    120000.0,
+                    profile.sample_rate /
+                        (2.0 * static_cast<double>(gap_gcd) * group_samples));
+                // |sum_k e^{j(phi_k - u*g_k)}| maximised over the CFO grid.
+                // g_k counts 4-SYMBOL groups, so one complex multiply per
+                // group step evaluates the whole train; no per-(k,f)
+                // transcendental is needed.
+                auto coherence = [&](double f_hz) -> double {
+                    const double u = 2.0 * M_PI * f_hz * group_samples /
+                                     profile.sample_rate;
+                    const std::complex<double> w = std::polar(1.0, -u);
+                    std::complex<double> rot(1.0, 0.0);
+                    std::complex<double> acc(0.0, 0.0);
+                    int cur = 0;
+                    for (size_t k = 0; k < nfit; ++k) {
+                        while (cur < group_pos[k]) {
+                            rot *= w;
+                            ++cur;
+                        }
+                        acc += anchor[k] * rot;
+                    }
+                    return std::abs(acc);
+                };
+                double best_f = 0.0;
+                double best_coh = -1.0;
+                for (double f = -max_cfo_hz; f <= max_cfo_hz;
+                     f += kCoarseStepHz) {
+                    const double c = coherence(f);
+                    if (c > best_coh) {
+                        best_coh = c;
+                        best_f = f;
+                    }
+                }
+                const double f_lo = std::max(-max_cfo_hz,
+                                             best_f - kCoarseStepHz);
+                const double f_hi = std::min(max_cfo_hz,
+                                             best_f + kCoarseStepHz);
+                for (double f = f_lo; f <= f_hi; f += kFineStepHz) {
+                    const double c = coherence(f);
+                    if (c > best_coh) {
+                        best_coh = c;
+                        best_f = f;
+                    }
+                }
+                unwrap_slope_rad_per_sample =
+                    2.0 * M_PI * best_f / profile.sample_rate;
+            }
             }
         }
     }
@@ -104,7 +218,7 @@ bool fit_cfo(const std::complex<float>* rx,
         const size_t idx0 = skip + k - 1;
         const size_t idx1 = skip + k;
         const double dt = static_cast<double>(
-            timing.peak_samples[idx1] - timing.peak_samples[idx0]);
+            ps[idx1] - ps[idx0]);
         const float pred = scratch.metric[k - 1] +
                            static_cast<float>(unwrap_slope_rad_per_sample * dt);
         while (scratch.metric[k] - pred > (float)M_PI)
@@ -115,12 +229,12 @@ bool fit_cfo(const std::complex<float>* rx,
 
     // Linear fit of phase vs RELATIVE time (the slope is offset-invariant, so
     // subtracting t0 only improves conditioning).
-    const double t0 = (double)timing.peak_samples[skip] / profile.sample_rate;
+    const double t0 = (double)ps[skip] / profile.sample_rate;
     detail::LinearFit fit;
     for (size_t k = 0; k < nfit; ++k) {
         const size_t idx = skip + k;
         const double t =
-            (double)timing.peak_samples[idx] / profile.sample_rate - t0;
+            (double)ps[idx] / profile.sample_rate - t0;
         const double ph = (double)scratch.metric[k];
         fit.add(t, ph);
     }

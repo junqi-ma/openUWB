@@ -67,6 +67,21 @@ struct DemodScratch {
     // Reused fold buffers for the low-SNR fold acquisition path.
     std::vector<std::complex<float>> fold_buf;
     std::vector<std::complex<float>> fold_sup_buf;
+    // Stage-1 fold hot-path scratch (warm packets allocate nothing):
+    //   * cand_metrics: per-candidate single-SYMBOL metrics used by the
+    //     leading-edge disambiguation (2*(radius/P)+5 entries, <= 64);
+    //   * lag_metrics: per-lag folded correlation metrics (<= P + 1 = 1017);
+    //   * peak_indices: repetition index of every tracked SYNC peak (<= 512).
+    std::vector<float> timing_fold_cand_metrics;
+    std::vector<float> timing_fold_lag_metrics;
+    std::vector<size_t> timing_peak_indices;
+    // Shadow dense CFO grid for the fold path: all 4-SYMBOL group anchors on
+    // the fitted timing grid.  Stage-2 `fit_cfo()` consumes these phases (up to
+    // 64, 4/symbol apart, alias-free to +/-122.8 kHz and robust enough for the
+    // 24-symbol startup skip) while the public TimingResult still reports the
+    // sparse 16 super-anchors required by the detected_peaks <= 16 contract.
+    std::vector<int64_t> timing_fold_cfo_samples;
+    std::vector<std::complex<float>> timing_fold_cfo_corr;
 
     // Coherent SYNC average tail (last 32 SYNCs) produced while estimating the
     // CIR from the raw, unrotated rx.  `stage_softchips_from_cir`'s
@@ -95,6 +110,7 @@ struct DemodScratch {
     const void* cfo_template_ptr = nullptr;
     size_t cfo_template_len = 0;
     uint64_t cfo_template_probe = 0;
+    uint64_t cfo_template_code_key = 0;
 
     // Cached sequence data for fixed preamble code and SFD mode (Task B2).
     struct CachedSequenceState {
@@ -277,6 +293,11 @@ struct DemodScratch {
         peak_values.reserve(256);
         fold_buf.reserve(16384);
         fold_sup_buf.reserve(2048);
+        timing_fold_cand_metrics.reserve(64);
+        timing_fold_lag_metrics.reserve(2048);
+        timing_peak_indices.reserve(512);
+        timing_fold_cfo_samples.reserve(128);
+        timing_fold_cfo_corr.reserve(128);
         cfo_sym_z.reserve(512);
         cfo_coarse_z.reserve(128);
         cfo_fft_buf.reserve(2048);

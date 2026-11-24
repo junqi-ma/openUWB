@@ -14,7 +14,9 @@ set(_uwb_phy_hrp_sources
 if(UWB_ENABLE_RX)
     list(APPEND _uwb_phy_hrp_sources
         uwb_demod_pipeline.cc
+        uwb_demod_simd_utils.cc
         uwb_demod_timing.cc
+        uwb_demod_timing_fold.cc
         uwb_demod_cfo_sfd.cc
         uwb_demod_cfo_sampler.cc
         uwb_demod_cfo_ml.cc

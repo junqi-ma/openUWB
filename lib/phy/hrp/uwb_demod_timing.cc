@@ -3,14 +3,1375 @@
 // Out-of-line definitions for the HRP timing stage.  The declarations stay in
 // the public headers (demod_timing.h / demod_sync.h / rx_sync_opt.h /
 // rx_matched_filter.h); this translation unit hosts the coarse stage entry
-// point, the low-SNR fold acquisition helpers, the SFD template caches and the
-// matched-filter scan loops.
+// point and the matched-filter scan loops.
+//
+// stage_timing() is deliberately only the orchestrator: filter preparation,
+// the two acquisition strategies, the locked grid tracker and the legacy
+// per-SYMBOL train live in file-local helpers below so each policy (bounded
+// tracking, blind acquisition, low-SNR fold rescue) can be read on its own.
+// Every helper keeps the original data flow -- the shared Result lives in
+// `TimingEnv::out`, the per-search acquisition state in `AcquisitionState` --
+// so the decomposition is purely structural: no field, ordering or threshold
+// changes.
 #include <openuwb/phy/hrp/rx/demod_timing.h>
 #include <openuwb/phy/hrp/rx/demod_sync.h>
 #include <openuwb/phy/hrp/rx/rx_matched_filter.h>
 #include <openuwb/phy/hrp/rx/rx_sync_opt.h>
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <complex>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
 namespace openuwb::demod::core {
+namespace {
+
+// ---------------------------------------------------------------------------
+// Prepared matched-filter state
+// ---------------------------------------------------------------------------
+// Everything the timing stage derives from the packet's SYNC template in one
+// immutable bundle: the (dense / sparse / shaped / real-dup) matched filter,
+// its normalizer Et, and the template views the fold helpers need.  Building it
+// once keeps the dense-template copy / L2 normalize / shaped-cache probe off the
+// helper signatures.
+struct PreparedTimingFilter {
+    rxopt::SyncMatchedFilter filter; // dense or sparse/shaped, chosen per profile
+    float Et = 0.0f;                 // matched-filter normalizer
+    const rxopt::SparseCirTemplate* sparse = nullptr;
+    const rxopt::ShapedSparseTemplate* shaped = nullptr;
+    const rxopt::RealSyncTemplate* real = nullptr;
+};
+
+// Immutable per-call environment shared by every helper.
+struct TimingEnv {
+    const std::complex<float>* rx;
+    size_t n;
+    size_t L;
+    const Qm35825Profile& profile;
+    const std::vector<std::complex<float>>& template_wf;
+    DemodScratch& scratch;
+    TimingResult& out;
+    PreparedTimingFilter pf;
+    // Seeded search window (absolute coordinates).  Defaults to the whole
+    // buffer; narrowed around seed_start by stage_timing().
+    int64_t roi_start = 0;
+    int64_t roi_end = 0;
+};
+
+// The acquisition outcome that is shared between the two strategy branches and
+// the common backtrack / tracking tail.  `first_*` is the best confirmed SYNC
+// start so far; `fold_used` records that it came from the K-symbol fold;
+// `acq_seed` is the non-bounded seed hoisted for the post-train fold retry.
+struct AcquisitionState {
+    bool raw_par_hit = false;
+    int64_t first_start = -1;
+    size_t first_hit_k = 0;
+    float first_metric = 0.0f;
+    std::complex<float> first_corr{ 0.0f, 0.0f };
+    bool fold_used = false;
+    int64_t acq_seed = -1;
+};
+
+// Build the matched-filter state exactly once per packet.
+//
+// The sparse path never reads the dense template, so building it would be pure
+// waste (copy + L2 normalize + duplicate real taps on every call).  Only the
+// dense path materializes the normalized template, and the real duplicate is
+// reused when its content key matches.
+PreparedTimingFilter prepare_timing_filter(
+    const Qm35825Profile& profile,
+    const std::vector<std::complex<float>>& template_wf,
+    DemodScratch& scratch)
+{
+    const size_t L = template_wf.size();
+    const auto* sparse_tmpl =
+        detail::prepare_sparse_sync_template(profile, L, scratch);
+    // MF-4: factorize the dense template into (r * code) * p.  This replaces
+    // the dense matched filter (same metric scale, same lag convention, same
+    // pulse-matched gain) at a fraction of its cost; it does not change the
+    // sparse path's peak-sample convention.  The builder rejects any template
+    // that is not code*p, so a custom waveform silently keeps its old path.
+    // The code template is needed even when the sparse timing path is off.
+    const rxopt::ShapedSparseTemplate* shaped_tmpl = nullptr;
+    if (profile.rx_timing_shaped_sparse && L == 2 * kQm35ChipsPerSymbol) {
+        const rxopt::SparseCirTemplate* code_tmpl = sparse_tmpl;
+        if (!code_tmpl) {
+            if (scratch.cached_seq.code_index != profile.code_index ||
+                scratch.cached_seq.pcode.empty())
+                scratch.cached_seq.update(profile.code_index, profile.sfd_mode);
+            const auto& pcode = scratch.cached_seq.pcode;
+            rxopt::ensure_sparse_cir_template(pcode.data(), pcode.size(),
+                                              scratch.cir_template);
+            if (scratch.cir_template.code_energy > 0.0f)
+                code_tmpl = &scratch.cir_template;
+        }
+        if (code_tmpl)
+            shaped_tmpl = detail::ensure_shaped_sparse_template_cached(
+                template_wf, L, *code_tmpl, scratch);
+    }
+    float dense_Et = 0.0f;
+    if (!sparse_tmpl && !shaped_tmpl) {
+        scratch.work.assign(template_wf.begin(), template_wf.end());
+        openuwb::core::uwb_l2_normalize(scratch.work);
+        dense_Et = openuwb::core::uwb_template_energy(scratch.work);
+        rxopt::ensure_real_sync_template(scratch.work,
+                                         scratch.real_sync_template);
+    }
+    const float Et = shaped_tmpl
+        ? shaped_tmpl->energy
+        : (sparse_tmpl ? sparse_tmpl->code_energy : dense_Et);
+    const auto& real = scratch.real_sync_template;
+    const rxopt::SyncMatchedFilter filter(
+        scratch.work.data(), L, real.is_real ? real.taps_dup.data() : nullptr,
+        sparse_tmpl, true, shaped_tmpl);
+    return PreparedTimingFilter{ filter, Et, sparse_tmpl, shaped_tmpl, &real };
+}
+
+// Local normalized-correlation helper over a small window around `want`:
+// finds the SYNC START that best matches the template, returns position,
+// metric, and the complex matched-filter value at the best position (the
+// CFO stage uses its phase).
+bool local_best(TimingEnv& env,
+                AcquisitionState& st,
+                int64_t want,
+                int64_t radius,
+                float min_metric,
+                int64_t* pos,
+                float* met,
+                std::complex<float>* corr_out,
+                bool allow_par_fallback = false,
+                float* raw_max_out = nullptr)
+{
+    const auto& profile = env.profile;
+    const auto& filter = env.pf.filter;
+    const float Et = env.pf.Et;
+    const size_t L = env.L;
+    const auto* rx = env.rx;
+    const size_t n = env.n;
+    const int64_t w0 = std::max<int64_t>(0, want - radius);
+    const int64_t w1 =
+        std::min<int64_t>(static_cast<int64_t>(n) - static_cast<int64_t>(L),
+                          want + radius);
+    if (w1 <= w0)
+        return false;
+    const int64_t count = w1 - w0;
+    const bool track_par =
+        allow_par_fallback && count >= 64 && count <= 1024;
+    constexpr float kSyncParFloor = 0.06f;
+    constexpr float kSyncParMin = 20.0f;
+    constexpr int64_t kSyncParGuard = 12;
+    float lag_metrics[1024];
+    if (track_par && profile.rx_sync_par_only) {
+        const auto peak = rxopt::scan_raw_sync(
+            filter, rx + w0, static_cast<size_t>(count), lag_metrics);
+        const bool accepted = rxopt::raw_lag_par_passes(
+            lag_metrics, static_cast<size_t>(count), peak, kSyncParGuard, 1,
+            kSyncParMin, profile.rx_sync_par_three_samples);
+        const int64_t bp = w0 + static_cast<int64_t>(peak.lag);
+        // Keep the normalized metric for downstream tracking and the
+        // locked probe-width heuristic. Only score the winner.
+        float normalized = 0.0f;
+        if (accepted || raw_max_out)
+            normalized = detail::normalized_correlation_power(
+                peak.corr, window_power_8acc(rx + bp, L), Et);
+        if (raw_max_out)
+            *raw_max_out = normalized;
+        if (!accepted)
+            return false;
+        st.raw_par_hit = true;
+        *pos = bp;
+        *met = normalized;
+        *corr_out = peak.corr;
+        return true;
+    }
+    const auto peak = rxopt::scan_normalized_sync(
+        filter, rx + w0, static_cast<size_t>(count),
+        window_power_8acc(rx + w0, L), Et, track_par ? lag_metrics : nullptr);
+    const float bm = peak.metric;
+    const int64_t bp = w0 + static_cast<int64_t>(peak.lag);
+    // Report the window's raw maximum before the acceptance gate: the
+    // low-SNR early-stop decisions below need to know how far the best
+    // candidate was from the threshold, not just whether it passed.
+    if (raw_max_out)
+        *raw_max_out = bm;
+    if (bm < min_metric) {
+        bool par_accept = false;
+        if (track_par && bm >= kSyncParFloor) {
+            double bg_sum = 0.0;
+            int64_t bg_cnt = 0;
+            const int64_t bp_idx = bp - w0;
+            for (int64_t idx = 0; idx < count; ++idx) {
+                if (std::abs(idx - bp_idx) > kSyncParGuard) {
+                    bg_sum += static_cast<double>(lag_metrics[idx]);
+                    ++bg_cnt;
+                }
+            }
+            if (bg_cnt > 0) {
+                const double bg_mean =
+                    std::max(bg_sum / static_cast<double>(bg_cnt), 1e-9);
+                par_accept =
+                    (static_cast<double>(bm) / bg_mean) >= kSyncParMin;
+            }
+        }
+        if (!par_accept)
+            return false;
+    }
+    *pos = bp;
+    *met = bm;
+    *corr_out = peak.corr;
+    return true;
+}
+
+// Anti-false-alarm floor for the local K=4 fast fold (see try_fold_acquire's
+// fast_only gate).  peak_metrics in fold_anchor_fit are AMPLITUDE-normalized
+// (|corr|/sqrt(E*Et)); 16-group K=4 anchors at -12/-14 dB sit ~0.3-0.5 while
+// 4-symbol-folded noise sits ~0.045, so 0.08 is a strict anti-false-alarm floor.
+constexpr float kFoldFastAnchorMedianFloor = 0.08f;
+
+// ---- K-symbol periodic-fold acquisition -----------------------------------
+// Reached ONLY after every single-symbol path failed.  The fold costs
+// ~1 ms (fold + full-window correlation), so it must never run on a packet
+// the normal path already acquired.  Both strategies share this helper;
+// only the search window differs (bounded ROI vs a capped acquisition
+// margin), and the fold keeps the absolute position because it folds over
+// the window rather than into one symbol period.
+//
+// `fast_only` is the low-SNR local K=4 fast path (optimization A): it never
+// probes the CFO phase or escalates to K=64, and it additionally requires a
+// confirmed leading edge plus >= 4 anchor groups with a plausible anchor
+// median.  A fast-only rejection clears everything it wrote and leaves the
+// caller to fall through to the ORIGINAL wide/TM-1/coarse/grid/full-fold path
+// unchanged.  `fast_only == false` is the original, gate-free behaviour.
+bool try_fold_acquire(TimingEnv& env,
+                      AcquisitionState& st,
+                      int64_t centre,
+                      int64_t radius,
+                      bool fast_only)
+{
+    const auto& profile = env.profile;
+    auto& out = env.out;
+    auto& scratch = env.scratch;
+    const auto& pf = env.pf;
+    const size_t L = env.L;
+    const float Et = pf.Et;
+    const auto* sparse_tmpl = pf.sparse;
+    const auto* shaped_tmpl = pf.shaped;
+    const auto& real_tmpl = *pf.real;
+    // A previous packet's shadow CFO grid must never survive into this call.
+    scratch.timing_fold_cfo_samples.clear();
+    scratch.timing_fold_cfo_corr.clear();
+    auto acquire_fold = [&](size_t max_syms, double phase) {
+        return detail::fold_acquire(
+            env.rx, env.n, centre, centre - radius, centre + radius,
+            scratch.work.data(), L, Et, real_tmpl,
+            max_syms, profile.preamble_repetitions,
+            detail::kFoldThreshold, phase,
+            sparse_tmpl, &scratch.fold_buf, shaped_tmpl,
+            &scratch.timing_fold_lag_metrics);
+    };
+    // Fast K=4 coherent fold first: immune to typical CFO (< 5 deg over
+    // 4 us) and avoids probe_fold_phase overhead; falls back to K=64
+    // only when K=4 + PAR misses.
+    constexpr size_t kFoldFastSymbols = 4;
+    double fold_phase = 0.0;
+    auto fold = acquire_fold(kFoldFastSymbols, 0.0);
+    if (!fold.ok && !fast_only) {
+        const auto phase_probe = detail::probe_fold_phase(
+            env.rx, env.n, centre, profile.preamble_repetitions);
+        const double coarse_phase = phase_probe.phase();
+        const bool could_alias = std::abs(coarse_phase) >=
+            M_PI / detail::kFoldAnchorGroupSymbols;
+        fold_phase = could_alias && phase_probe.coherent()
+            ? coarse_phase : 0.0;
+        fold = acquire_fold(detail::kFoldMaxSymbols, fold_phase);
+        if (!fold.ok && !could_alias &&
+            std::abs(coarse_phase) >= M_PI / (2 * detail::kFoldMaxSymbols) &&
+            phase_probe.coherent()) {
+            fold_phase = coarse_phase;
+            fold = acquire_fold(detail::kFoldMaxSymbols, fold_phase);
+        }
+    }
+    if (!fold.ok)
+        return false;
+    // ---- Absolute-symbol disambiguation ------------------------------
+    // The preamble is 256 VERBATIM copies of one SYNC symbol, so the fold
+    // metric is exactly P-periodic: `fold.start` is only the grid phase
+    // nearest the seed, and the live frontend seed is accurate to a few
+    // SYMBOLS (measured -6.5..+4.4 SYNC periods at -14 dB in-band), not a
+    // few samples.  The one non-periodic feature available before the SFD
+    // is the preamble's leading edge: immediately before the true start
+    // there is noise (every acquisition window carries a pre-guard), while
+    // every other candidate has a SYNC before it.  Score each candidate by
+    // metric(c) - metric(c-P) and take the best.  At -14 dB in-band the
+    // single-SYNC metric is ~0.038 against ~0.001 in noise.
+    int64_t fold_start = fold.start;
+    const auto edge = detail::disambiguate_fold_leading_edge(
+        env.rx, env.n, pf.filter, L, Et, fold, radius,
+        scratch.timing_fold_cand_metrics);
+    if (fast_only) {
+        // The local fast attempt only accepts an unambiguous leading edge;
+        // `crossed` is equivalent to max_here >= 0.003f (a noise-only window
+        // never produces a slot above the 0.003 floor).
+        //
+        // Scan-boundary guard: fold_acquire clamps the window to +/-P/2 around
+        // the seed, so a seed that is DEEP INSIDE the preamble yields a strong
+        // periodic fold hit at a symbol-shifted origin, and
+        // disambiguate_fold_leading_edge only scans max_j = radius/P + 2
+        // candidates.  In that late-seed case the very FIRST scanned candidate
+        // already clears the edge threshold, so edge.start lands exactly on the
+        // scan-window boundary fold.start - max_j*P -- not on the real packet
+        // start.  Accepting it would skip the coarse scan + backtrack and lose
+        // the packet, so a crossing at the first candidate means the true
+        // leading edge was not observed inside this window: reject the fast
+        // attempt and let the original wide/coarse/grid/full-K=64 path (whose
+        // 40-symbol backtrack does handle late seeds) run.  This costs only
+        // speed for large late seeds, never recall.
+        const int64_t P = static_cast<int64_t>(kQm35SamplesPerSymbol);
+        const int64_t max_j = radius / P + 2;
+        const int64_t boundary = fold.start - max_j * P;
+        if (!edge.crossed || edge.start <= boundary) {
+            out.peak_samples.clear();
+            out.peak_metrics.clear();
+            out.peak_corr.clear();
+            return false;
+        }
+        fold_start = edge.start;
+    } else if (edge.max_here >= 0.003f) {
+        fold_start = edge.start;
+    }
+    // Period/origin from the 16-SYMBOL super-anchor fit.  A degenerate fit
+    // still leaves a usable origin (the refined fold argmax) with the
+    // nominal period, so the packet is not thrown away for a fit failure.
+    double period_fit = static_cast<double>(kQm35SamplesPerSymbol);
+    int64_t origin_fit = fold_start;
+    const size_t groups = std::min<size_t>(
+        64,
+        profile.preamble_repetitions / detail::kFoldAnchorGroupSymbols);
+    bool anchor_fit_ok = false;
+    if (groups >= 2) {
+        anchor_fit_ok = detail::fold_anchor_fit(
+            env.rx, env.n, fold_start, scratch.work.data(), L, Et,
+            real_tmpl, groups, &period_fit,
+            &origin_fit, out.peak_samples, out.peak_metrics,
+            out.peak_corr, fold_phase,
+            sparse_tmpl, &scratch.fold_sup_buf, shaped_tmpl,
+            &scratch.timing_fold_cfo_samples,
+            &scratch.timing_fold_cfo_corr);
+        if (!anchor_fit_ok) {
+            out.peak_samples.clear();
+            out.peak_metrics.clear();
+            out.peak_corr.clear();
+        }
+    }
+    if (fast_only) {
+        // Strict anti-false-alarm gate (see kFoldFastAnchorMedianFloor):
+        // a valid period fit, at least four measured anchors, and a median
+        // anchor amplitude above the 4-symbol-folded noise floor.  Any
+        // failure clears what fold_anchor_fit wrote and falls through to the
+        // original acquisition path.
+        if (!anchor_fit_ok || out.peak_samples.size() < 4) {
+            out.peak_samples.clear();
+            out.peak_metrics.clear();
+            out.peak_corr.clear();
+            scratch.timing_fold_cfo_samples.clear();
+            scratch.timing_fold_cfo_corr.clear();
+            return false;
+        }
+        const size_t n_peaks = out.peak_metrics.size();
+        std::array<float, detail::kFoldAnchorMaxGroups> median_buf{};
+        const size_t cnt = std::min(n_peaks, median_buf.size());
+        std::copy_n(out.peak_metrics.begin(), cnt, median_buf.begin());
+        std::nth_element(median_buf.begin(),
+                         median_buf.begin() + static_cast<ptrdiff_t>(cnt / 2),
+                         median_buf.begin() + static_cast<ptrdiff_t>(cnt));
+        if (!(median_buf[cnt / 2] >= kFoldFastAnchorMedianFloor)) {
+            out.peak_samples.clear();
+            out.peak_metrics.clear();
+            out.peak_corr.clear();
+            scratch.timing_fold_cfo_samples.clear();
+            scratch.timing_fold_cfo_corr.clear();
+            return false;
+        }
+    } else if (out.peak_samples.empty()) {
+        out.peak_samples.push_back(fold_start +
+                                   static_cast<int64_t>(L) - 1);
+        out.peak_metrics.push_back(fold.metric);
+        out.peak_corr.push_back(fold.corr);
+    }
+    out.measured_period = period_fit;
+    out.fold_phase_per_symbol = fold_phase;
+    out.preamble_start_sample = origin_fit;
+    out.metric = fold.metric;
+    st.first_start = fold_start;
+    st.first_metric = fold.metric;
+    st.first_corr = fold.corr;
+    st.first_hit_k = 0;
+    st.fold_used = true;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// SyncStrategy::LockedBounded acquisition
+// ---------------------------------------------------------------------------
+// Locked tracking contract: the target lock predicted this origin, so only a
+// bounded ROI around the seed is legal.  A miss is a tracking failure -- never
+// a wide scan and never a long backtrack.
+bool acquire_locked_bounded(TimingEnv& env,
+                            AcquisitionState& st,
+                            int64_t seed_start)
+{
+    const auto& profile = env.profile;
+    auto& out = env.out;
+    const size_t L = env.L;
+    const float thr = profile.radar_verification_threshold;
+    ++out.bounded_attempts;
+    if (seed_start < 0) {
+        ++out.bounded_failures;
+        return false;
+    }
+    const int64_t roi = std::max<int64_t>(
+        1, static_cast<int64_t>(profile.locked_roi_samples));
+    out.bounded_roi_samples = static_cast<size_t>(roi);
+    // Probe the predicted SYNC first, then a bounded number of inner SYNCs
+    // on the known symbol grid.  A weak startup SYNC must not cost the
+    // packet, but the probe set stays finite: this is NOT a scan.
+    const size_t inner = profile.locked_inner_symbols;
+    int64_t pos = -1;
+    float met = 0.0f;
+    std::complex<float> corr(0.0f, 0.0f);
+    size_t used_inner = 0;
+    bool found = false;
+    // Low-SNR early stop.  m = 0 keeps the full ROI (it is the predicted
+    // SYNC, so a large residual must still be catchable).  If it misses
+    // AND its raw window maximum is far below the PAR floor, the whole
+    // leading region is deep-noise / deep-low-SNR, not merely mis-seeded:
+    // the locked residual is a few samples, so the inner SYNCs can then be
+    // probed at +/-32 instead of +/-roi (4 x 513 -> 4 x 65 correlations).
+    // Anything this skips is still covered by the tail probe and, failing
+    // that, by the fold -- both of which keep the full ROI.
+    float m0_raw_max = 0.0f;
+    for (size_t m = 0; m <= inner; ++m) {
+        const int64_t want =
+            static_cast<int64_t>(seed_start) +
+            static_cast<int64_t>(m) * static_cast<int64_t>(kQm35SamplesPerSymbol);
+        if (want + static_cast<int64_t>(L) >
+            static_cast<int64_t>(env.n))
+            break;
+        const bool narrow_inner = (m != 0) && (m0_raw_max < kLockedInnerNarrowRawGate);
+        const int64_t inner_rad =
+            narrow_inner ? std::min<int64_t>(roi, 32) : roi;
+        float raw_max = 0.0f;
+        bool inner_hit = false;
+        if (m == 0 && roi > 32) {
+            // Steady-state lock residual is a few samples.  Probe +/-32
+            // first (65 lags, the PAR background minimum) and only pay for
+            // the full +/-roi scan when that misses.  A miss keeps the old
+            // behaviour exactly, including m0_raw_max for the early-stop
+            // heuristic below.
+            inner_hit = local_best(env, st, want, 32, thr, &pos, &met, &corr,
+                                   /*allow_par_fallback=*/true, &raw_max);
+            if (!inner_hit) {
+                float wide_raw = 0.0f;
+                inner_hit = local_best(env, st, want, roi, thr, &pos, &met,
+                                       &corr, /*allow_par_fallback=*/true,
+                                       &wide_raw);
+                raw_max = std::max(raw_max, wide_raw);
+            }
+        } else {
+            inner_hit = local_best(env, st, want, inner_rad, thr, &pos, &met,
+                                   &corr, /*allow_par_fallback=*/true,
+                                   &raw_max);
+        }
+        if (inner_hit) {
+            used_inner = m;
+            found = true;
+            break;
+        }
+        if (m == 0) {
+            m0_raw_max = raw_max;
+            out.inner_probe_raw_max = raw_max;
+        }
+    }
+    // Failure path only.  The leading SYNCs are all below threshold --
+    // typically a burst interferer parked on the first symbols while the
+    // tail of the preamble is clean (measured on the 5.2 m capture:
+    // first_5_max 0.029..0.053, med_tail_32_255 0.14..0.20).  The old code
+    // declared a tracking failure without ever looking past
+    // `locked_inner_symbols`.  Keep the bounded ROI (the grid is known, so
+    // only the residual is unknown) and probe sparse tail anchors on the
+    // symbol grid.
+    //
+    // The threshold is the TRACKING threshold, not the acquisition one: a
+    // low-SNR tail sits at 0.14..0.20, well under
+    // radar_verification_threshold (0.25) but far above the per-SYNC
+    // tracking floor.  The neighbour gate is what keeps a +/-roi false
+    // alarm from being accepted at this lower threshold.
+    const float tail_thr =
+        std::min(profile.radar_verification_threshold, 0.08f);
+    const size_t reps = profile.preamble_repetitions;
+    const size_t step =
+        std::max<size_t>(1, profile.locked_tail_probe_step);
+    const size_t need_confirm =
+        std::max<size_t>(1, profile.locked_tail_probe_confirm);
+    // Two probe widths.  The locked residual is a few samples, so the
+    // narrow (+/-32) sweep finds a clean tail cheaply.  The wide sweep
+    // (+/-roi) only matters when the residual is larger than the narrow
+    // window -- and it costs 32 x 513 = 16,416 single-SYMBOL correlations,
+    // so it is NOT run before the fold: the fold covers the identical
+    // window with a 64-SYMBOL coherent gain (~18 dB more sensitive) and is
+    // the correct rescue in that regime.  The wide sweep is therefore the
+    // last resort, reached only when the fold itself could not rescue the
+    // packet.  Measured at -12 dB in-band (200 packets): the narrow sweep
+    // never produced a confirmable hit and the fold rescued every packet,
+    // so this ordering removes ~1.2 ms/packet of doomed work without
+    // changing any outcome.
+    auto tail_sweep = [&](int64_t trad) {
+        for (size_t m = inner + 1; m < reps; m += step) {
+            const int64_t want = static_cast<int64_t>(seed_start) +
+                static_cast<int64_t>(m) *
+                    static_cast<int64_t>(kQm35SamplesPerSymbol);
+            if (want + static_cast<int64_t>(L) >
+                static_cast<int64_t>(env.n))
+                break;
+            ++out.tail_probe_attempts;
+            int64_t cpos = -1;
+            float cmet = 0.0f;
+            std::complex<float> ccorr(0.0f, 0.0f);
+            float raw_max = 0.0f;
+            const bool hit =
+                local_best(env, st, want, trad, tail_thr, &cpos, &cmet,
+                           &ccorr, /*allow_par_fallback=*/true, &raw_max);
+            if (raw_max > out.tail_probe_raw_max)
+                out.tail_probe_raw_max = raw_max;
+            if (!hit)
+                continue;
+            if (cmet > out.tail_probe_best_metric)
+                out.tail_probe_best_metric = cmet;
+            // Consistency gate: a real grid hit is confirmed by its
+            // neighbouring SYMBOLS.  A false alarm (wrong lag inside the
+            // ROI) is not, so probing continues instead of locking onto a
+            // bogus origin.
+            size_t confirm = 0;
+            const int64_t nb_delta[3] = {1, 2, -1};
+            for (int64_t d : nb_delta) {
+                const int64_t nb = static_cast<int64_t>(m) + d;
+                if (nb < 0 || nb >= static_cast<int64_t>(reps))
+                    continue;
+                const int64_t nb_want =
+                    static_cast<int64_t>(seed_start) +
+                    nb * static_cast<int64_t>(kQm35SamplesPerSymbol);
+                if (nb_want + static_cast<int64_t>(L) >
+                    static_cast<int64_t>(env.n))
+                    continue;
+                int64_t np = -1;
+                float nm = 0.0f;
+                std::complex<float> nc(0.0f, 0.0f);
+                float nb_raw = 0.0f;
+                const bool nb_hit =
+                    local_best(env, st, nb_want, trad, tail_thr, &np, &nm,
+                               &nc, /*allow_par_fallback=*/false, &nb_raw);
+                if (nb_raw > out.tail_probe_raw_max)
+                    out.tail_probe_raw_max = nb_raw;
+                if (nb_hit)
+                    ++confirm;
+            }
+            if (confirm < need_confirm)
+                continue;
+            ++out.tail_probe_hits;
+            out.tail_probe_k = static_cast<int64_t>(m);
+            pos = cpos;
+            met = cmet;
+            corr = ccorr;
+            used_inner = m;
+            found = true;
+            return;
+        }
+    };
+    if (!found && profile.locked_tail_probe)
+        tail_sweep(std::min<int64_t>(roi, 32));
+    if (!found) {
+        // Low-SNR fallback: every single-symbol probe inside the bounded
+        // ROI missed.  The fold keeps the same bounded window -- it is not
+        // an escalation to a wide scan.
+        //
+        // Gate: LockedBounded's failure-path rescue is a single opt-out
+        // tier.  `locked_tail_probe == false` is how a caller asks for the
+        // original hard-fail tracking contract (no rescue at all), so the
+        // fold honours the same switch instead of silently replacing the
+        // tail probe with a different rescue.  qa_uwb_demod_core's
+        // "tail probe rescues leading interference" case pins that
+        // contract: with rescue disabled the packet MUST stay lost.
+        const bool fold_ok =
+            profile.locked_tail_probe &&
+            try_fold_acquire(env, st, static_cast<int64_t>(seed_start), roi,
+                             /*fast_only=*/false);
+        if (!fold_ok && profile.locked_tail_probe) {
+            // Last resort (see the note above): the fold could not rescue
+            // this packet either, so the wide single-SYMBOL sweep is the
+            // only remaining option.  Paying its cost here cannot slow down
+            // any packet the fold already handles.
+            tail_sweep(roi);
+        }
+        if (!fold_ok && !found) {
+            ++out.bounded_failures;
+            return false;
+        }
+    }
+    if (!st.fold_used) {
+        // Convert the inner-SYNC hit back to the packet start on the grid.
+        st.first_start = pos - static_cast<int64_t>(used_inner) *
+                                static_cast<int64_t>(kQm35SamplesPerSymbol);
+        st.first_hit_k = used_inner;
+        st.first_metric = met;
+        st.first_corr = corr;
+        if (used_inner != 0)
+            ++out.bounded_inner_used;
+    }
+    ++out.bounded_success;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// SyncStrategy::AcquireLegacy acquisition
+// ---------------------------------------------------------------------------
+bool acquire_unbounded_seed(TimingEnv& env,
+                            AcquisitionState& st,
+                            int64_t seed_start)
+{
+    const auto& profile = env.profile;
+    auto& out = env.out;
+    auto& scratch = env.scratch;
+    const auto& pf = env.pf;
+    const size_t L = env.L;
+    const float Et = pf.Et;
+    const float thr = profile.radar_verification_threshold;
+    const int64_t seed =
+        (seed_start >= 0) ? seed_start
+                          : (int64_t)(env.roi_start +
+                                      (env.roi_end - env.roi_start) / 2);
+    st.acq_seed = seed;
+    const int64_t margin =
+        static_cast<int64_t>(profile.timing_search_margin);
+    const int64_t stride = std::max<int64_t>(
+        1, static_cast<int64_t>(profile.timing_coarse_stride));
+    const int64_t j_lo = std::max<int64_t>(0, seed - margin);
+    const int64_t j_hi =
+        std::min<int64_t>(static_cast<int64_t>(env.n) - static_cast<int64_t>(L),
+                          seed + margin);
+
+    auto consider = [&](int64_t pos, float met, std::complex<float> corr) {
+        if (met >= thr && met > st.first_metric) {
+            st.first_metric = met;
+            st.first_start = pos;
+            st.first_corr = corr;
+        }
+    };
+
+    // MATLAB detectSeededPreamble: prefer a narrow FULL-RATE search around
+    // the seed (max(256, ceil(symbolLength/32)) samples each side).  A wide
+    // stride-S coarse scan can miss a narrow symbol-0 peak (sub-symbol seed
+    // offset) and then prefer a later STRONGER SYNC -- exactly what made
+    // the DW1000 preamble_start land ~6 SYNCs late.  The seed-nearby
+    // result is authoritative; the wide scan is only a fallback.
+    bool seed_acquired = false;
+    const int64_t legacy_seed_radius =
+        std::max<int64_t>(256, stride);
+    if (profile.timing_seed_refine_radius != 0) {
+        const int64_t narrow = rxopt::seed_refine_radius(
+            profile.timing_seed_refine_radius, stride);
+        if (narrow < legacy_seed_radius) {
+            const auto narrow_begin = std::chrono::steady_clock::now();
+            int64_t pos = -1;
+            float met = 0.0f;
+            std::complex<float> corr(0.0f, 0.0f);
+            // PAR fallback is enabled on the two NARROW local searches
+            // only.  A 256-SYNC preamble at -4..-8 dB in-band SNR has
+            // every SYNC peak above 0.08 with PAR 232..253, but only
+            // 11-24 of 256 clear the 0.25 absolute threshold, so the
+            // absolute gate alone loses the packet.  The wide stride scan
+            // and the whole-SYNC grid probes stay absolute-only: at
+            // thousands of lags a pure-noise false alarm would clear any
+            // PAR gate.
+            const bool narrow_ok =
+                local_best(env, st, seed, narrow, thr, &pos, &met, &corr,
+                           /*allow_par_fallback=*/true);
+            out.seed_search_us = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - narrow_begin).count());
+            ++out.seed_refine_narrow_attempts;
+            if (narrow_ok) {
+                st.first_start = pos;
+                st.first_metric = met;
+                st.first_corr = corr;
+                seed_acquired = true;
+                ++out.seed_refine_narrow_success;
+            } else {
+                ++out.seed_refine_fallbacks;
+            }
+        }
+    }
+    if (!seed_acquired) {
+        // Legacy first seeded refine.  Also the fallback after a failed
+        // narrow search: a recovered packet must not be lost just because
+        // the local peak was outside the narrow radius.
+        int64_t pos = -1;
+        float met = 0.0f;
+        std::complex<float> corr(0.0f, 0.0f);
+        if (local_best(env, st, seed, legacy_seed_radius, thr, &pos, &met,
+                       &corr, /*allow_par_fallback=*/true)) {
+            st.first_start = pos;
+            st.first_metric = met;
+            st.first_corr = corr;
+            seed_acquired = true;
+        }
+    }
+
+    // ---- Low-SNR local K=4 fold fast path (optimization A) --------------
+    // The single-symbol paths above miss at -12/-14 dB in-band, but the live
+    // frontend seed is still good to a few SYMBOLS.  A local K=4 coherent fold
+    // over seed +/- min(margin, 8192) buys +6 dB and costs one 1016-lag
+    // correlation (~15-20 us); when it is confirmed by the leading-edge
+    // disambiguation and the sparse anchor fit, the entire TM-1 / +/-131072
+    // coarse scan / whole-SYNC grid / K=64 fold tail is skipped for this
+    // packet.  Any rejection falls through to that original path untouched.
+    // No seed (blind search) or the wide interval probe (SIC fast-fail) keep
+    // their existing behaviour and never enter here.
+    if (!seed_acquired &&
+        profile.sync_strategy == SyncStrategy::AcquireLegacy &&
+        seed_start >= 0 && !profile.rx_wide_interval_probe) {
+        const int64_t fast_radius = std::min<int64_t>(margin, 8192);
+        if (try_fold_acquire(env, st, seed_start, fast_radius,
+                             /*fast_only=*/true))
+            return true;
+    }
+
+    // ---- Wide-window interval probe (K-symbol local fold) --------------
+    // Reached only for AcquireLegacy when the blind search spans many
+    // SYMBOL periods.  Each probe coherently folds K SYNC periods
+    // (+3 dB at K=2, +6 dB at K=4) and correlates over one period.
+    // The coarse probe grid only skips *start* positions, never a whole
+    // preamble: a probe
+    // anywhere inside the preamble still sees the same P-periodic code
+    // (its peak lag resolves back to a true symbol boundary), so the
+    // normal backtrack / SYNC-train / SFD path recovers the origin.
+    //
+    // On an all-miss, the historical stride-14 coarse scan, whole-SYNC
+    // grid and fold rescue are skipped so an SIC candidate that contains
+    // no target preamble fails fast to L0_Bypass instead of paying the
+    // full wide acquisition.  rx_wide_probe_fallback restores the old
+    // behaviour for callers that prefer recall over latency.
+    if (!seed_acquired && profile.rx_wide_interval_probe) {
+        const int64_t P = static_cast<int64_t>(kQm35SamplesPerSymbol);
+        if (P > 0 && j_hi - j_lo >= 16 * P) {
+            const size_t fold_k = std::max<size_t>(
+                2, std::min<size_t>(profile.rx_wide_probe_fold_symbols, 4));
+            size_t step_symbols = profile.rx_wide_probe_step_symbols
+                ? profile.rx_wide_probe_step_symbols : 42;
+            const size_t m_cap = std::max<size_t>(
+                8, profile.preamble_repetitions / 3);
+            step_symbols = std::min(step_symbols, m_cap);
+            if (profile.preamble_repetitions > fold_k)
+                step_symbols = std::min(
+                    step_symbols, profile.preamble_repetitions - fold_k);
+            else
+                step_symbols = 0;
+            // The probe may land up to `step_symbols` into the preamble;
+            // the backtrack must be able to walk that far back.
+            if (profile.timing_max_backtrack_symbols > 0)
+                step_symbols = std::min(step_symbols,
+                                        profile.timing_max_backtrack_symbols);
+            const int64_t last_probe =
+                std::min(j_hi,
+                         static_cast<int64_t>(env.n) -
+                             static_cast<int64_t>(fold_k) * P -
+                             static_cast<int64_t>(L) + 1);
+            if (step_symbols > 0 && last_probe >= j_lo) {
+                const int64_t step =
+                    static_cast<int64_t>(step_symbols) * P;
+                int64_t best_pos = -1;
+                float best_met = -1.0f;
+                std::complex<float> best_corr(0.0f, 0.0f);
+                int64_t last_scanned = -1;
+                auto probe_one = [&](int64_t p) {
+                    if (p == last_scanned)
+                        return;
+                    last_scanned = p;
+                    const auto r = detail::fold_probe_acquire(
+                        env.rx, env.n, p, scratch.work.data(), L, Et,
+                        *pf.real, fold_k, thr,
+                        pf.sparse, &scratch.fold_buf, pf.shaped);
+                    if (r.ok && r.start >= j_lo && r.start <= j_hi &&
+                        r.metric > best_met) {
+                        best_met = r.metric;
+                        best_pos = r.start;
+                        best_corr = r.corr;
+                    }
+                };
+                for (int64_t p = j_lo; p <= last_probe; p += step)
+                    probe_one(p);
+                probe_one(last_probe);
+                if (best_pos >= 0) {
+                    st.first_start = best_pos;
+                    st.first_metric = best_met;
+                    st.first_corr = best_corr;
+                    seed_acquired = true;
+                } else if (!profile.rx_wide_probe_fallback) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    // ---- Phase probe + symbol-grid acquisition (TM-1) ------------------
+    // The preamble is N verbatim copies of one P=1016-sample SYNC symbol.
+    // A window of P consecutive lags therefore contains one code-phase
+    // match, so the exact sample phase can be recovered from a handful of
+    // probe windows instead of correlating all 2*margin lags.  A strict
+    // threshold keeps this zero-risk: if the probe does not see a solid
+    // SYNC (low SNR, packet outside the probes), everything below falls
+    // through to the original coarse scan unchanged.
+    //
+    // Cheap pre-gate: the frontend seed is accurate to a few SYMBOLS, so
+    // the code phase at the seed is preserved and one single-lag dot tells
+    // us whether this window is deep noise.  The 0.2 floor is close to the
+    // tracking threshold on purpose: at -12/-14 dB the single-SYNC metric
+    // is ~0.04-0.1, so the three P-length probes (which would all fail)
+    // are skipped and the fold path is not slowed down by them.
+    float probe_gate = -1.0f;
+    {
+        const int64_t gp = std::min(std::max(seed, j_lo), j_hi);
+        if (gp >= 0 && gp + static_cast<int64_t>(L) <=
+                           static_cast<int64_t>(env.n)) {
+            const auto acc = pf.filter.dot(env.rx + gp);
+            probe_gate = detail::normalized_correlation_power(
+                acc, window_power_8acc(env.rx + gp, L), Et);
+        }
+    }
+    if (probe_gate >= 0.2f && !seed_acquired && j_hi > j_lo &&
+        j_hi - j_lo >= 2 * static_cast<int64_t>(kQm35SamplesPerSymbol)) {
+        const int64_t P = static_cast<int64_t>(kQm35SamplesPerSymbol);
+        int64_t probes[3];
+        size_t nprobe = 0;
+        auto push_probe = [&](int64_t p) {
+            if (p < j_lo || p > j_hi)
+                return;
+            if (p + static_cast<int64_t>(L) + 64 > static_cast<int64_t>(env.n))
+                return;
+            if (nprobe < 3)
+                probes[nprobe++] = p;
+        };
+        push_probe(std::min(std::max(seed, j_lo), j_hi));
+        if (margin >= 32 * P) {
+            push_probe(seed - 32 * P);
+            push_probe(seed + 32 * P);
+        }
+        float best_probe = -1.0f;
+        int64_t anchor = -1;
+        for (size_t i = 0; i < nprobe; ++i) {
+            const int64_t p = probes[i];
+            const int64_t avail =
+                static_cast<int64_t>(env.n) - static_cast<int64_t>(L) - p + 1;
+            const size_t lags = static_cast<size_t>(
+                std::min<int64_t>(P, std::max<int64_t>(0, avail)));
+            if (lags < 64)
+                continue;
+            const auto pk = rxopt::scan_normalized_sync(
+                pf.filter, env.rx + p, lags,
+                window_power_8acc(env.rx + p, L), Et);
+            if (pk.metric > best_probe) {
+                best_probe = pk.metric;
+                anchor = p + static_cast<int64_t>(pk.lag);
+            }
+        }
+        if (anchor >= 0 && best_probe >= thr) {
+            // Same phase modulo P for every SYNC, so only the symbol grid
+            // remains: ~2*margin/P grid points at +/-2 samples each.
+            const int64_t rem = ((anchor - j_lo) % P + P) % P;
+            for (int64_t want = j_lo + rem; want <= j_hi; want += P) {
+                int64_t pos = -1;
+                float met = 0.0f;
+                std::complex<float> corr(0.0f, 0.0f);
+                if (local_best(env, st, want, 2, thr, &pos, &met, &corr))
+                    consider(pos, met, corr);
+            }
+            if (st.first_start >= 0)
+                seed_acquired = true;
+        }
+    }
+
+    // (a) Coarse scan (fallback only) -- batched SIMD when stride is 1 or 2,
+    // sliding power conjugate dots at stride otherwise.
+    const auto coarse_begin = std::chrono::steady_clock::now();
+    if (!seed_acquired && j_hi > j_lo) {
+        float best_coarse_m = -1.0f;
+        int64_t best_coarse_j = j_lo;
+        std::complex<float> best_coarse_c(0.0f, 0.0f);
+        if (stride == 1) {
+            const size_t lag_count = static_cast<size_t>(j_hi - j_lo + 1);
+            const auto pk = rxopt::scan_normalized_sync(
+                pf.filter, env.rx + j_lo, lag_count,
+                window_power_8acc(env.rx + j_lo, L), Et);
+            best_coarse_j = j_lo + static_cast<int64_t>(pk.lag);
+            best_coarse_m = pk.metric;
+            best_coarse_c = pk.corr;
+        } else if (stride == 2 && pf.sparse && !pf.shaped && (L % 2 == 0)) {
+            const size_t half_lags =
+                static_cast<size_t>((j_hi - j_lo) / 2 + 1);
+            const size_t half_len = L / 2;
+            const size_t even_count = (half_lags - 1) + half_len;
+            scratch.corr.resize(even_count);
+            rxopt::pack_even_complex(env.rx + j_lo, even_count,
+                                     scratch.corr.data());
+            rxopt::ensure_half_rate_sparse_template(
+                *pf.sparse, scratch.half_cir_template);
+            const rxopt::SyncMatchedFilter half_filter(
+                nullptr, half_len, nullptr, &scratch.half_cir_template);
+            const auto pk = rxopt::scan_normalized_sync(
+                half_filter, scratch.corr.data(), half_lags,
+                window_power_8acc(scratch.corr.data(), half_len), Et);
+            best_coarse_j = j_lo + static_cast<int64_t>(pk.lag) * 2;
+            best_coarse_c = pk.corr;
+            best_coarse_m = detail::normalized_correlation_power(
+                pk.corr, window_power_8acc(env.rx + best_coarse_j, L), Et);
+        } else {
+            float pw = window_power_8acc(env.rx + j_lo, L);
+            // Slide the window power forward by `cnt` samples with eight
+            // independent accumulators, so the two |x|^2 streams vectorise and
+            // only ONE serial float add per stride block remains.  The
+            // per-sample form of this update was the single most expensive loop
+            // in low-SNR acquisition: 262,144 iterations (the live search
+            // margin is +-131,072 samples) at ~8 cycles each = ~2.2 ms/packet,
+            // 85% of the whole acquisition search.  The sum is mathematically
+            // identical; only the float association order changes.
+            auto advance_power = [&](int64_t j, int64_t cnt) {
+                const float* a =
+                    reinterpret_cast<const float*>(env.rx + j + static_cast<int64_t>(L));
+                const float* b = reinterpret_cast<const float*>(env.rx + j);
+                const size_t m = static_cast<size_t>(2 * cnt);
+                float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+                float s4 = 0.f, s5 = 0.f, s6 = 0.f, s7 = 0.f;
+                size_t i = 0;
+                for (; i + 8 <= m; i += 8) {
+                    s0 += a[i + 0] * a[i + 0] - b[i + 0] * b[i + 0];
+                    s1 += a[i + 1] * a[i + 1] - b[i + 1] * b[i + 1];
+                    s2 += a[i + 2] * a[i + 2] - b[i + 2] * b[i + 2];
+                    s3 += a[i + 3] * a[i + 3] - b[i + 3] * b[i + 3];
+                    s4 += a[i + 4] * a[i + 4] - b[i + 4] * b[i + 4];
+                    s5 += a[i + 5] * a[i + 5] - b[i + 5] * b[i + 5];
+                    s6 += a[i + 6] * a[i + 6] - b[i + 6] * b[i + 6];
+                    s7 += a[i + 7] * a[i + 7] - b[i + 7] * b[i + 7];
+                }
+                float s = ((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7));
+                for (; i < m; ++i)
+                    s += a[i] * a[i] - b[i] * b[i];
+                pw += s;
+            };
+            for (int64_t j = j_lo; j <= j_hi; j += stride) {
+                const auto acc = pf.filter.dot(env.rx + j);
+                const float m = detail::normalized_correlation_power(acc, pw, Et);
+                if (m > best_coarse_m) {
+                    best_coarse_m = m;
+                    best_coarse_j = j;
+                    best_coarse_c = acc;
+                }
+                const int64_t cnt = std::min<int64_t>(stride, j_hi + 1 - j);
+                // Only slide when another search lag remains: the final
+                // advance would read rx[j + L] one complex sample past the
+                // n-sample window (and its value is never consumed).
+                if (j + cnt <= j_hi)
+                    advance_power(j, cnt);
+            }
+        }
+        out.coarse_search_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - coarse_begin).count());
+        // (b) Fine refine around the coarse peak.
+        int64_t pos = -1;
+        float met = 0.0f;
+        std::complex<float> corr(0.0f, 0.0f);
+        if (local_best(env, st, best_coarse_j, stride, thr, &pos, &met, &corr))
+            consider(pos, met, corr);
+        else if (best_coarse_m >= thr)
+            consider(best_coarse_j, best_coarse_m, best_coarse_c);
+    }
+
+    // (c) Whole-SYNC grid probes (fallback only; covers a seed that lands
+    // mid-preamble and a sub-symbol confirmation that must not replace an
+    // SFD-refined anchor with a stronger neighbouring SYNC).
+    if (!seed_acquired) {
+        int64_t pos = -1;
+        float met = 0.0f;
+        std::complex<float> corr(0.0f, 0.0f);
+        const int64_t grid_half = margin / kQm35SamplesPerSymbol;
+        for (int64_t n_sym = -grid_half; n_sym <= grid_half; ++n_sym) {
+            if (local_best(env, st, seed + n_sym * static_cast<int64_t>(
+                                           kQm35SamplesPerSymbol),
+                           8, thr, &pos, &met, &corr))
+                consider(pos, met, corr);
+        }
+    }
+    if (st.first_start < 0) {
+        // Low-SNR fallback: narrow seed refine, legacy seed refine, stride
+        // coarse scan and whole-SYNC grid probes all missed.  Fold over a
+        // capped acquisition window (never the full 40k margin: the fold
+        // cost grows with the window and the seed is already close).
+        if (!try_fold_acquire(env, st, seed, std::min<int64_t>(margin, 8192),
+                              /*fast_only=*/false))
+            return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// LockedBounded grid tracking: sparse anchors + single point
+// ---------------------------------------------------------------------------
+// The locked contract already knows the symbol grid (the target lock
+// predicted this origin), so the only unknowns are the residual origin and
+// the residual period.  Measure a sparse set of SYNC anchors with the
+// normal +/-track_radius search, fit period+origin from the anchors, then
+// evaluate every other SYNC with ONE correlation at start+round(k*period).
+// The peak train keeps the same meaning (CFO needs peak_corr phases, CIR
+// needs the fitted period), at ~1/17 of the per-symbol search cost.
+// measured_period MUST come from the anchor fit: it feeds
+// integer_chip_grid()/spc_ppm and the fused-CMF admission, so a period
+// that degenerates to the nominal 1016 would silently disable the
+// fractional-grid fallback for an untrimmed clock.
+bool track_locked_grid(TimingEnv& env,
+                       AcquisitionState& st,
+                       int64_t start,
+                       int64_t period,
+                       double* grid_period,
+                       int64_t* grid_start)
+{
+    const auto& profile = env.profile;
+    auto& out = env.out;
+    auto& scratch = env.scratch;
+    const size_t L = env.L;
+    const float Et = env.pf.Et;
+    const size_t reps = profile.preamble_repetitions;
+    const size_t first_hit_k = st.first_hit_k;
+    const float first_metric = st.first_metric;
+    const std::complex<float> first_corr = st.first_corr;
+    if (reps < 8)
+        return false;
+    const float gthr =
+        std::min(profile.radar_verification_threshold, 0.08f);
+    const int64_t arad = std::max<int64_t>(
+        8, static_cast<int64_t>(profile.timing_track_radius));
+    const double nominal = static_cast<double>(period);
+
+    // Sparse anchor set on the symbol grid: the confirmed first SYNC, the
+    // last SYNC of the train, and evenly spaced points in between.
+    std::array<size_t, 32> ak{};
+    size_t na = 0;
+    ak[na++] = first_hit_k;
+    const size_t last_k = reps - 1;
+    if (last_k > first_hit_k) {
+        const size_t want_anchors = std::min<size_t>(
+            std::max<size_t>(4, profile.locked_grid_anchor_count), ak.size());
+        const size_t intervals = (want_anchors > 1) ? (want_anchors - 1) : 1;
+        const double span = static_cast<double>(last_k - first_hit_k);
+        for (size_t i = 1; i <= intervals && na < ak.size(); ++i) {
+            const size_t k = first_hit_k + static_cast<size_t>(std::llround(
+                span * static_cast<double>(i) /
+                static_cast<double>(intervals)));
+            if (k != ak[na - 1])
+                ak[na++] = k;
+        }
+    }
+
+    // One least-squares pass over the anchors: peak(k) = start + k*period,
+    // in the same symbol-END convention as the legacy fit.
+    auto fit_anchors = [&](double period_hint, int64_t start_hint,
+                           int64_t radius, double* period_out,
+                           int64_t* start_out, float* median_out,
+                           size_t* hits_out) -> bool {
+        detail::LinearFit fit;
+        std::array<float, 32> mets{};
+        size_t hits = 0;
+        size_t kmin = 0, kmax = 0;
+        for (size_t i = 0; i < na; ++i) {
+            const size_t k = ak[i];
+            const int64_t want = start_hint + static_cast<int64_t>(
+                std::llround(static_cast<double>(k) * period_hint));
+            if (want < 0 ||
+                want + static_cast<int64_t>(L) > static_cast<int64_t>(env.n))
+                continue;
+            ++out.grid_anchor_attempts;
+            int64_t pos = -1;
+            float met = 0.0f;
+            std::complex<float> c(0.0f, 0.0f);
+            if (!local_best(env, st, want, radius, gthr, &pos, &met, &c))
+                continue;
+            const double x = static_cast<double>(k);
+            const double y = static_cast<double>(pos + (int64_t)(L - 1));
+            fit.add(x, y);
+            if (hits == 0) {
+                kmin = k;
+                kmax = k;
+            } else {
+                kmin = std::min(kmin, k);
+                kmax = std::max(kmax, k);
+            }
+            mets[hits++] = met;
+        }
+        *hits_out = hits;
+        if (hits < std::max<size_t>(2, profile.locked_grid_min_anchors))
+            return false;
+        if (kmax - kmin < 8)
+            return false; // anchors too bunched to measure a slope
+        const double denom = fit.determinant();
+        if (!(std::abs(denom) > 1e-9))
+            return false;
+        const double p = fit.slope(denom);
+        if (!std::isfinite(p) || !(p > 0.0))
+            return false;
+        const double intercept_end = fit.intercept(p);
+        *period_out = p;
+        *start_out = std::max<int64_t>(
+            0, static_cast<int64_t>(std::llround(intercept_end)) -
+                   static_cast<int64_t>(L - 1));
+        std::sort(mets.begin(), mets.begin() + hits);
+        *median_out = mets[hits / 2];
+        return true;
+    };
+
+    double p1 = nominal;
+    int64_t s1 = start;
+    float med1 = 0.0f;
+    size_t hits1 = 0;
+    if (!fit_anchors(nominal, start, arad, &p1, &s1, &med1, &hits1))
+        return false;
+    // A fitted period outside 0.5% of the nominal work-grid SYNC period
+    // means the anchors did not land on the expected symbol indices.
+    if (std::abs(p1 - nominal) > 0.005 * nominal)
+        return false;
+    double p2 = p1;
+    int64_t s2 = s1;
+    float med2 = med1;
+    size_t hits2 = hits1;
+    // Second pass only when the nominal grid would put the last anchor
+    // more than 4 samples off (an untrimmed clock).  With a trimmed
+    // crystal the first pass is already unbiased and this costs nothing.
+    if (std::abs(p1 - nominal) * static_cast<double>(last_k) > 4.0) {
+        if (!fit_anchors(p1, s1, std::max<int64_t>(arad, 16), &p2, &s2,
+                         &med2, &hits2))
+            return false;
+        if (std::abs(p2 - nominal) > 0.005 * nominal)
+            return false;
+    }
+    out.grid_anchor_hits = static_cast<uint32_t>(hits2);
+
+    // Single-point stage: evaluate eight consecutive lags around the fitted
+    // grid position and keep the best.  The 8-lag kernel has independent
+    // accumulators and is far cheaper per lag than the single-lag kernel
+    // (which is one long FMA dependency chain), so eight lags cost barely
+    // more than one -- and taking the argmax keeps the peak positions and
+    // the CFO phases identical to the legacy per-SYNC search instead of
+    // pinning them to the fitted grid.
+    scratch.metric.assign(reps, 0.0f);
+    size_t valid = 0;
+    // Least-squares accumulators over every refined peak (see the final
+    // fit note after the loop).
+    detail::LinearFit final_fit;
+    size_t fn = 0;
+    for (size_t k = 0; k < reps; ++k) {
+        if (k == first_hit_k) {
+            // The bounded probe already measured this SYNC with a real
+            // +/-roi search; keep that measurement instead of
+            // re-projecting it onto the fitted grid.
+            scratch.metric[k] = first_metric;
+            ++out.grid_single_points;
+            if (first_metric >= gthr) {
+                ++valid;
+                out.peak_samples.push_back(start + static_cast<int64_t>(L - 1));
+                out.peak_metrics.push_back(first_metric);
+                out.peak_corr.push_back(first_corr);
+                const double x = static_cast<double>(k);
+                const double y = static_cast<double>(start + (int64_t)(L - 1));
+                final_fit.add(x, y);
+                ++fn;
+            }
+            continue;
+        }
+        const int64_t centre = s2 + static_cast<int64_t>(
+            std::llround(static_cast<double>(k) * p2));
+        int64_t base = centre - 3;
+        int nl = 8;
+        if (base + 7 + static_cast<int64_t>(L) > static_cast<int64_t>(env.n)) {
+            // Window edge: fall back to the single lag at the prediction
+            // so the last SYNCs are still measured.
+            if (centre + static_cast<int64_t>(L) >
+                static_cast<int64_t>(env.n))
+                continue;
+            base = centre;
+            nl = 1;
+        }
+        if (base < 0)
+            continue;
+        float pw = window_power_8acc(env.rx + base, L);
+        rxopt::MatchedFilterPeak peak;
+        env.pf.filter.for_each_lag(env.rx + base, static_cast<size_t>(nl),
+                                   [&](size_t lag, std::complex<float> corr, bool) {
+            if (lag != 0)
+                pw += std::norm(env.rx[base + lag - 1 + L]) -
+                      std::norm(env.rx[base + lag - 1]);
+            const float metric = detail::normalized_correlation_power(corr, pw, Et);
+            if (lag == 0 || metric > peak.metric)
+                peak = { lag, metric, corr };
+        });
+        const int64_t want = base + static_cast<int64_t>(peak.lag);
+        const float m = peak.metric;
+        scratch.metric[k] = m;
+        ++out.grid_single_points;
+        if (m < gthr)
+            continue;
+        ++valid;
+        out.peak_samples.push_back(want + static_cast<int64_t>(L - 1));
+        out.peak_metrics.push_back(m);
+        out.peak_corr.push_back(peak.corr);
+        const double x = static_cast<double>(k);
+        const double y = static_cast<double>(want + (int64_t)(L - 1));
+        final_fit.add(x, y);
+        ++fn;
+    }
+    out.grid_single_valid = static_cast<uint32_t>(valid);
+    if (valid < 4)
+        return false;
+    // Grid sanity: if the fitted grid does not land on real peaks, the
+    // single-point metrics collapse relative to the anchor peaks.  Use the
+    // 90th percentile so a weak (interfered) part of the preamble does not
+    // by itself reject a correct grid.
+    if (reps <= 512) {
+        const size_t idx = static_cast<size_t>(
+            0.9 * static_cast<double>(reps - 1));
+        std::nth_element(scratch.metric.begin(),
+                         scratch.metric.begin() + idx,
+                         scratch.metric.end());
+        if (!(scratch.metric[idx] >= 0.5f * med2))
+            return false;
+    }
+    // Final period/origin: least squares over EVERY refined peak, which is
+    // exactly the estimator the legacy 256-point fit uses.  The anchors are
+    // the bootstrap that puts the single-point windows in the right place
+    // (and the fallback if this fit is degenerate); they are not the final
+    // estimate, because a 16-anchor fit is ~4x noisier than the legacy
+    // 256-point fit and that noise measurably flips marginal payloads
+    // (measured: 1 packet / 2000 at 2.5 m).  The refined positions are real
+    // argmax measurements, NOT the quantised grid, so measured_period stays
+    // a genuine measurement and integer_chip_grid()/spc_ppm keeps working.
+    if (fn >= 8) {
+        const double denom = final_fit.determinant();
+        if (std::abs(denom) > 1e-9) {
+            const double pr = final_fit.slope(denom);
+            const double intercept_end = final_fit.intercept(pr);
+            if (std::isfinite(pr) && pr > 0.0 &&
+                std::abs(pr - p2) <= 0.01) { // 10 ppm sanity vs anchors
+                p2 = pr;
+                s2 = std::max<int64_t>(
+                    0, static_cast<int64_t>(std::llround(intercept_end)) -
+                           static_cast<int64_t>(L - 1));
+            }
+        }
+    }
+    *grid_period = p2;
+    *grid_start = s2;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Legacy per-SYMBOL SYNC train
+// ---------------------------------------------------------------------------
+// Track all SYNC starts: expected = start + k*period, then convert each to
+// symbol-END convention (start + L - 1) to match the detector / MATLAB.
+// When bounded inner-SYNC probing hit symbol `first_hit_k > 0`, anchor the
+// first peak at its true symbol coordinate and continue from `first_hit_k + 1`
+// rather than restarting at k=1 (which already failed).  Also allow up to 2
+// consecutive missed SYNCs so a brief 1-2 symbol interference dip does not
+// prematurely truncate the 256-symbol train.
+void track_sync_train(TimingEnv& env,
+                      AcquisitionState& st,
+                      int64_t start,
+                      int64_t period,
+                      size_t backtracked_symbols)
+{
+    const auto& profile = env.profile;
+    auto& out = env.out;
+    auto& scratch = env.scratch;
+    const size_t L = env.L;
+    const bool bounded = profile.sync_strategy == SyncStrategy::LockedBounded;
+    std::vector<size_t>& peak_indices = scratch.timing_peak_indices;
+    constexpr size_t kMaxConsecutiveSyncMisses = 2;
+    // One tracking pass at a given floor.  `weak` selects the 0.08 floor
+    // LockedBounded already uses for its tail probe; the legacy absolute
+    // threshold is used otherwise.
+    auto track_train = [&](bool weak) {
+        out.peak_samples.clear();
+        out.peak_metrics.clear();
+        out.peak_corr.clear();
+        peak_indices.clear();
+        const int64_t first_hit_start =
+            start + static_cast<int64_t>(st.first_hit_k) * period;
+        out.peak_samples.push_back(first_hit_start +
+                                   static_cast<int64_t>(L - 1));
+        out.peak_metrics.push_back(st.first_metric);
+        out.peak_corr.push_back(st.first_corr);
+        peak_indices.push_back(st.first_hit_k);
+        size_t consecutive_misses = 0;
+        for (size_t k = st.first_hit_k + 1;
+             k < profile.preamble_repetitions; ++k) {
+            const int64_t want = start + static_cast<int64_t>(k * period);
+            int64_t pk = -1;
+            float pm = 0.0f;
+            std::complex<float> pk_corr(0.0f, 0.0f);
+            const float tracking_threshold =
+                (bounded || weak)
+                    ? std::min(profile.radar_verification_threshold,
+                               bounded ? 0.08f : 0.06f)
+                    : ((k < backtracked_symbols)
+                           ? 0.7f * profile.radar_verification_threshold
+                           : profile.radar_verification_threshold);
+            const int64_t track_rad =
+                (bounded && consecutive_misses > 0)
+                    ? std::max<int64_t>(
+                          12, static_cast<int64_t>(
+                                  profile.timing_track_radius))
+                    : static_cast<int64_t>(profile.timing_track_radius);
+            if (!local_best(env, st, want, track_rad, tracking_threshold, &pk,
+                            &pm, &pk_corr)) {
+                ++consecutive_misses;
+                if (!bounded &&
+                    consecutive_misses > kMaxConsecutiveSyncMisses)
+                    break; // lost the train
+                continue;
+            }
+            consecutive_misses = 0;
+            out.peak_samples.push_back(pk + static_cast<int64_t>(L - 1));
+            out.peak_metrics.push_back(pm);
+            out.peak_corr.push_back(pk_corr);
+            peak_indices.push_back(k);
+        }
+        return out.peak_samples.size();
+    };
+    // First pass at the legacy threshold: high-SNR packets are complete
+    // here and pay nothing.  Only a train that the absolute threshold
+    // truncated (a low-SNR acquisition whose SYNCs all sit at the same
+    // sub-threshold level) is retried at the 0.08 floor.  Without this the
+    // packet is lost one stage later anyway (fit_cfo needs >= 4 peaks and
+    // stage_cir_softchips needs more than cir_skip_initial_repetitions).
+    const size_t min_peaks =
+        std::max<size_t>(4, profile.min_valid_peaks);
+    size_t tracked = track_train(false);
+    if (!bounded && tracked < min_peaks)
+        tracked = track_train(true);
+    (void)tracked;
+}
+
+} // namespace
 
 bool stage_timing(const std::complex<float>* rx,
                   size_t n,
@@ -35,869 +1396,38 @@ bool stage_timing(const std::complex<float>* rx,
         return false;
     }
 
-    // The sparse path never reads the dense template, so building it would be
-    // pure waste (copy + L2 normalize + duplicate real taps on every call).
-    // Only the dense path materializes the normalized template, and the real
-    // duplicate is reused when its content key matches.
-    const auto* sparse_tmpl = detail::prepare_sparse_sync_template(profile, L, scratch);
-    // MF-4: factorize the dense template into (r * code) * p.  This replaces
-    // the dense matched filter (same metric scale, same lag convention, same
-    // pulse-matched gain) at a fraction of its cost; it does not change the
-    // sparse path's peak-sample convention.  The builder rejects any template
-    // that is not code*p, so a custom waveform silently keeps its old path.
-    // The code template is needed even when the sparse timing path is off.
-    const rxopt::ShapedSparseTemplate* shaped_tmpl = nullptr;
-    if (profile.rx_timing_shaped_sparse && L == 2 * kQm35ChipsPerSymbol) {
-        const rxopt::SparseCirTemplate* code_tmpl = sparse_tmpl;
-        if (!code_tmpl) {
-            if (scratch.cached_seq.code_index != profile.code_index ||
-                scratch.cached_seq.pcode.empty())
-                scratch.cached_seq.update(profile.code_index, profile.sfd_mode);
-            const auto& pcode = scratch.cached_seq.pcode;
-            rxopt::ensure_sparse_cir_template(pcode.data(), pcode.size(),
-                                              scratch.cir_template);
-            if (scratch.cir_template.code_energy > 0.0f)
-                code_tmpl = &scratch.cir_template;
-        }
-        if (code_tmpl)
-            shaped_tmpl = rxopt::ensure_shaped_sparse_template(
-                template_wf.data(), L, *code_tmpl,
-                scratch.shaped_sync_template);
-    }
-    float dense_Et = 0.0f;
-    if (!sparse_tmpl && !shaped_tmpl) {
-        scratch.work.assign(template_wf.begin(), template_wf.end());
-        openuwb::core::uwb_l2_normalize(scratch.work);
-        dense_Et = openuwb::core::uwb_template_energy(scratch.work);
-        rxopt::ensure_real_sync_template(scratch.work,
-                                         scratch.real_sync_template);
-    }
-    const float Et = shaped_tmpl
-        ? shaped_tmpl->energy
-        : (sparse_tmpl ? sparse_tmpl->code_energy : dense_Et);
-    const auto& real = scratch.real_sync_template;
-    const rxopt::SyncMatchedFilter filter(
-        scratch.work.data(), L, real.is_real ? real.taps_dup.data() : nullptr,
-        sparse_tmpl, true, shaped_tmpl);
+    TimingEnv env{ rx, n, L, profile, template_wf, scratch, out,
+                   prepare_timing_filter(profile, template_wf, scratch) };
 
     // Determine the ROI around the seed (absolute coordinates).
-    size_t roi_start = 0;
-    size_t roi_end = n;
+    env.roi_start = 0;
+    env.roi_end = static_cast<int64_t>(n);
     if (seed_start >= 0) {
         const int64_t seed = seed_start;
         const int64_t margin = static_cast<int64_t>(profile.timing_search_margin);
         const int64_t lo = std::max<int64_t>(0, seed - margin);
         const int64_t hi =
             std::min<int64_t>(static_cast<int64_t>(n), seed + margin + (int64_t)L);
-        roi_start = static_cast<size_t>(lo);
-        roi_end = static_cast<size_t>(hi);
+        env.roi_start = lo;
+        env.roi_end = hi;
     }
 
-    // Local normalized-correlation helper over a small window around `want`:
-    // finds the SYNC START that best matches the template, returns position,
-    // metric, and the complex matched-filter value at the best position (the
-    // CFO stage uses its phase).
-    bool raw_par_hit = false;
-    auto local_best = [&](int64_t want, int64_t radius, float min_metric,
-                          int64_t* pos, float* met,
-                          std::complex<float>* corr_out,
-                          bool allow_par_fallback = false,
-                          float* raw_max_out = nullptr) -> bool {
-        const int64_t w0 = std::max<int64_t>(0, want - radius);
-        const int64_t w1 =
-            std::min<int64_t>(static_cast<int64_t>(n) - static_cast<int64_t>(L),
-                              want + radius);
-        if (w1 <= w0)
-            return false;
-        const int64_t count = w1 - w0;
-        const bool track_par =
-            allow_par_fallback && count >= 64 && count <= 1024;
-        constexpr float kSyncParFloor = 0.06f;
-        constexpr float kSyncParMin = 20.0f;
-        constexpr int64_t kSyncParGuard = 12;
-        float lag_metrics[1024];
-        if (track_par && profile.rx_sync_par_only) {
-            const auto peak = rxopt::scan_raw_sync(
-                filter, rx + w0, static_cast<size_t>(count), lag_metrics);
-            const bool accepted = rxopt::raw_lag_par_passes(
-                lag_metrics, static_cast<size_t>(count), peak, kSyncParGuard, 1,
-                kSyncParMin, profile.rx_sync_par_three_samples);
-            const int64_t bp = w0 + static_cast<int64_t>(peak.lag);
-            // Keep the normalized metric for downstream tracking and the
-            // locked probe-width heuristic. Only score the winner.
-            float normalized = 0.0f;
-            if (accepted || raw_max_out)
-                normalized = detail::normalized_correlation_power(
-                    peak.corr, window_power_8acc(rx + bp, L), Et);
-            if (raw_max_out)
-                *raw_max_out = normalized;
-            if (!accepted)
-                return false;
-            raw_par_hit = true;
-            *pos = bp;
-            *met = normalized;
-            *corr_out = peak.corr;
-            return true;
-        }
-        const auto peak = rxopt::scan_normalized_sync(
-            filter, rx + w0, static_cast<size_t>(count),
-            window_power_8acc(rx + w0, L), Et, track_par ? lag_metrics : nullptr);
-        const float bm = peak.metric;
-        const int64_t bp = w0 + static_cast<int64_t>(peak.lag);
-        // Report the window's raw maximum before the acceptance gate: the
-        // low-SNR early-stop decisions below need to know how far the best
-        // candidate was from the threshold, not just whether it passed.
-        if (raw_max_out)
-            *raw_max_out = bm;
-        if (bm < min_metric) {
-            bool par_accept = false;
-            if (track_par && bm >= kSyncParFloor) {
-                double bg_sum = 0.0;
-                int64_t bg_cnt = 0;
-                const int64_t bp_idx = bp - w0;
-                for (int64_t idx = 0; idx < count; ++idx) {
-                    if (std::abs(idx - bp_idx) > kSyncParGuard) {
-                        bg_sum += static_cast<double>(lag_metrics[idx]);
-                        ++bg_cnt;
-                    }
-                }
-                if (bg_cnt > 0) {
-                    const double bg_mean =
-                        std::max(bg_sum / static_cast<double>(bg_cnt), 1e-9);
-                    par_accept =
-                        (static_cast<double>(bm) / bg_mean) >= kSyncParMin;
-                }
-            }
-            if (!par_accept)
-                return false;
-        }
-        *pos = bp;
-        *met = bm;
-        *corr_out = peak.corr;
-        return true;
-    };
-
-    // Locate the first SYNC start near the seed.  MATLAB detectSeededPreamble
-    // searches only max(64, ceil(symbolLength/32)) samples around the seed at
-    // full rate and tracks from the strongest hit there; the wide stride-S
-    // coarse scan is retained only as a fallback when the seed-narrow search
-    // fails (a seed that lands a whole SYNC or more off the true start).
-    int64_t first_start = -1;
-    size_t first_hit_k = 0;
-    float first_metric = 0.0f;
-    std::complex<float> first_corr(0.0f, 0.0f);
-    const float thr = profile.radar_verification_threshold;
+    // Locate the first SYNC start near the seed.
+    AcquisitionState st;
+    st.acq_seed = seed_start;
     const bool bounded = profile.sync_strategy == SyncStrategy::LockedBounded;
-
-    // ---- On-demand K-symbol periodic-fold acquisition ---------------------
-    // Reached ONLY after every single-symbol path failed.  The fold costs
-    // ~1 ms (fold + full-window correlation), so it must never run on a packet
-    // the normal path already acquired.  Both strategies share this helper;
-    // only the search window differs (bounded ROI vs a capped acquisition
-    // margin), and the fold keeps the absolute position because it folds over
-    // the window rather than into one symbol period.
-    bool fold_used = false;
-    // Non-bounded acquisition seed, hoisted so the post-train fold retry below
-    // can reuse the same window.
-    int64_t acq_seed = seed_start;
-    auto try_fold_acquire = [&](int64_t centre, int64_t radius) -> bool {
-        auto acquire_fold = [&](size_t max_syms, double phase) {
-            return detail::fold_acquire(
-                rx, n, centre, centre - radius, centre + radius,
-                scratch.work.data(), L, Et, scratch.real_sync_template,
-                max_syms, profile.preamble_repetitions,
-                detail::kFoldThreshold, phase,
-                sparse_tmpl, &scratch.fold_buf, shaped_tmpl);
-        };
-        // Fast K=4 coherent fold first: immune to typical CFO (< 5 deg over
-        // 4 us) and avoids probe_fold_phase overhead; falls back to K=64
-        // only when K=4 + PAR misses.
-        constexpr size_t kFoldFastSymbols = 4;
-        double fold_phase = 0.0;
-        auto fold = acquire_fold(kFoldFastSymbols, 0.0);
-        if (!fold.ok) {
-            const auto phase_probe = detail::probe_fold_phase(
-                rx, n, centre, profile.preamble_repetitions);
-            const double coarse_phase = phase_probe.phase();
-            const bool could_alias = std::abs(coarse_phase) >=
-                M_PI / detail::kFoldAnchorGroupSymbols;
-            fold_phase = could_alias && phase_probe.coherent()
-                ? coarse_phase : 0.0;
-            fold = acquire_fold(detail::kFoldMaxSymbols, fold_phase);
-            if (!fold.ok && !could_alias &&
-                std::abs(coarse_phase) >= M_PI / (2 * detail::kFoldMaxSymbols) &&
-                phase_probe.coherent()) {
-                fold_phase = coarse_phase;
-                fold = acquire_fold(detail::kFoldMaxSymbols, fold_phase);
-            }
-        }
-        if (!fold.ok)
-            return false;
-        // ---- Absolute-symbol disambiguation ------------------------------
-        // The preamble is 256 VERBATIM copies of one SYNC symbol, so the fold
-        // metric is exactly P-periodic: `fold.start` is only the grid phase
-        // nearest the seed, and the live frontend seed is accurate to a few
-        // SYMBOLS (measured -6.5..+4.4 SYNC periods at -14 dB in-band), not a
-        // few samples.  The one non-periodic feature available before the SFD
-        // is the preamble's leading edge: immediately before the true start
-        // there is noise (every acquisition window carries a pre-guard), while
-        // every other candidate has a SYNC before it.  Score each candidate by
-        // metric(c) - metric(c-P) and take the best.  At -14 dB in-band the
-        // single-SYNC metric is ~0.038 against ~0.001 in noise.
-        int64_t fold_start = fold.start;
-        {
-            const int64_t P = static_cast<int64_t>(kQm35SamplesPerSymbol);
-            const int64_t max_j = radius / P + 2;
-            auto ss_metric = [&](int64_t pos) -> float {
-                if (pos < 0 ||
-                    pos + static_cast<int64_t>(L) > static_cast<int64_t>(n))
-                    return -1.0f;
-                const float pw = window_power_8acc(rx + pos, L);
-                const auto acc = filter.dot(rx + pos);
-                return detail::normalized_correlation_power(acc, pw, Et);
-            };
-            // One pass over the candidate grid: the same metrics are needed
-            // twice (once for the strongest slot, once for the first crossing
-            // of the leading-edge threshold), and each is a full single-SYMBOL
-            // correlation.  Caching them halves this cost.
-            const size_t ncand = static_cast<size_t>(2 * max_j + 1);
-            std::vector<float> cand_metric(ncand, -1.0f);
-            float max_here = 0.0f;
-            for (size_t i = 0; i < ncand; ++i) {
-                const int64_t j = static_cast<int64_t>(i) -
-                                  static_cast<int64_t>(max_j);
-                const float m = ss_metric(fold.start + j * P);
-                cand_metric[i] = m;
-                if (m > 0.0f)
-                    max_here = std::max(max_here, m);
-            }
-            // Leading-edge detection: scan the candidate grid from EARLY to
-            // LATE and take the first slot whose single-SYNC metric clears a
-            // noise/signal threshold.  Every slot before the true start is
-            // noise (~0.001 at -14 dB) and every slot after it is a SYNC
-            // (~0.038), so the first crossing IS the packet start.  The
-            // threshold is relative to the strongest slot seen (a noise-only
-            // window would otherwise never cross) and floored at 0.003, which
-            // is ~3x the largest of 21 exponential noise metrics (1/L * ln21).
-            const float edge_thr = std::max(0.003f, 0.2f * max_here);
-            for (size_t i = 0; i < ncand; ++i) {
-                const float here = cand_metric[i];
-                if (here < 0.0f)
-                    continue;
-                if (here >= edge_thr) {
-                    const int64_t j = static_cast<int64_t>(i) -
-                                      static_cast<int64_t>(max_j);
-                    fold_start = fold.start + j * P;
-                    break;
-                }
-            }
-        }
-        // Period/origin from the 16-SYMBOL super-anchor fit.  A degenerate fit
-        // still leaves a usable origin (the refined fold argmax) with the
-        // nominal period, so the packet is not thrown away for a fit failure.
-        double period_fit = static_cast<double>(kQm35SamplesPerSymbol);
-        int64_t origin_fit = fold_start;
-        const size_t groups = std::min<size_t>(
-            64,
-            profile.preamble_repetitions / detail::kFoldAnchorGroupSymbols);
-        if (groups >= 2) {
-            if (!detail::fold_anchor_fit(
-                    rx, n, fold_start, scratch.work.data(), L, Et,
-                    scratch.real_sync_template, groups, &period_fit,
-                    &origin_fit, out.peak_samples, out.peak_metrics,
-                    out.peak_corr, fold_phase,
-                    sparse_tmpl, &scratch.fold_sup_buf, shaped_tmpl)) {
-                out.peak_samples.clear();
-                out.peak_metrics.clear();
-                out.peak_corr.clear();
-            }
-        }
-        if (out.peak_samples.empty()) {
-            out.peak_samples.push_back(fold_start +
-                                       static_cast<int64_t>(L) - 1);
-            out.peak_metrics.push_back(fold.metric);
-            out.peak_corr.push_back(fold.corr);
-        }
-        out.measured_period = period_fit;
-        out.fold_phase_per_symbol = fold_phase;
-        out.preamble_start_sample = origin_fit;
-        out.metric = fold.metric;
-        first_start = fold_start;
-        first_metric = fold.metric;
-        first_corr = fold.corr;
-        first_hit_k = 0;
-        fold_used = true;
-        return true;
-    };
-
     if (bounded) {
-        // Locked tracking contract: the target lock predicted this origin, so
-        // only a bounded ROI around the seed is legal.  A miss is a tracking
-        // failure -- never a wide scan and never a long backtrack.
-        ++out.bounded_attempts;
-        if (seed_start < 0) {
-            ++out.bounded_failures;
+        if (!acquire_locked_bounded(env, st, seed_start)) {
             finish_timing_profile();
             return false;
         }
-        const int64_t roi = std::max<int64_t>(
-            1, static_cast<int64_t>(profile.locked_roi_samples));
-        out.bounded_roi_samples = static_cast<size_t>(roi);
-        // Probe the predicted SYNC first, then a bounded number of inner SYNCs
-        // on the known symbol grid.  A weak startup SYNC must not cost the
-        // packet, but the probe set stays finite: this is NOT a scan.
-        const size_t inner = profile.locked_inner_symbols;
-        int64_t pos = -1;
-        float met = 0.0f;
-        std::complex<float> corr(0.0f, 0.0f);
-        size_t used_inner = 0;
-        bool found = false;
-        // Low-SNR early stop.  m = 0 keeps the full ROI (it is the predicted
-        // SYNC, so a large residual must still be catchable).  If it misses
-        // AND its raw window maximum is far below the PAR floor, the whole
-        // leading region is deep-noise / deep-low-SNR, not merely mis-seeded:
-        // the locked residual is a few samples, so the inner SYNCs can then be
-        // probed at +/-32 instead of +/-roi (4 x 513 -> 4 x 65 correlations).
-        // Anything this skips is still covered by the tail probe and, failing
-        // that, by the fold -- both of which keep the full ROI.
-        float m0_raw_max = 0.0f;
-        for (size_t m = 0; m <= inner; ++m) {
-            const int64_t want =
-                static_cast<int64_t>(seed_start) +
-                static_cast<int64_t>(m) * static_cast<int64_t>(kQm35SamplesPerSymbol);
-            if (want + static_cast<int64_t>(L) >
-                static_cast<int64_t>(n))
-                break;
-            const bool narrow_inner = (m != 0) && (m0_raw_max < kLockedInnerNarrowRawGate);
-            const int64_t inner_rad =
-                narrow_inner ? std::min<int64_t>(roi, 32) : roi;
-            float raw_max = 0.0f;
-            bool inner_hit = false;
-            if (m == 0 && roi > 32) {
-                // Steady-state lock residual is a few samples.  Probe +/-32
-                // first (65 lags, the PAR background minimum) and only pay for
-                // the full +/-roi scan when that misses.  A miss keeps the old
-                // behaviour exactly, including m0_raw_max for the early-stop
-                // heuristic below.
-                inner_hit = local_best(want, 32, thr, &pos, &met, &corr,
-                                       /*allow_par_fallback=*/true, &raw_max);
-                if (!inner_hit) {
-                    float wide_raw = 0.0f;
-                    inner_hit = local_best(want, roi, thr, &pos, &met, &corr,
-                                           /*allow_par_fallback=*/true,
-                                           &wide_raw);
-                    raw_max = std::max(raw_max, wide_raw);
-                }
-            } else {
-                inner_hit = local_best(want, inner_rad, thr, &pos, &met, &corr,
-                                       /*allow_par_fallback=*/true, &raw_max);
-            }
-            if (inner_hit) {
-                used_inner = m;
-                found = true;
-                break;
-            }
-            if (m == 0) {
-                m0_raw_max = raw_max;
-                out.inner_probe_raw_max = raw_max;
-            }
-        }
-        // Failure path only.  The leading SYNCs are all below threshold --
-        // typically a burst interferer parked on the first symbols while the
-        // tail of the preamble is clean (measured on the 5.2 m capture:
-        // first_5_max 0.029..0.053, med_tail_32_255 0.14..0.20).  The old code
-        // declared a tracking failure without ever looking past
-        // `locked_inner_symbols`.  Keep the bounded ROI (the grid is known, so
-        // only the residual is unknown) and probe sparse tail anchors on the
-        // symbol grid.
-        //
-        // The threshold is the TRACKING threshold, not the acquisition one: a
-        // low-SNR tail sits at 0.14..0.20, well under
-        // radar_verification_threshold (0.25) but far above the per-SYNC
-        // tracking floor.  The neighbour gate is what keeps a +/-roi false
-        // alarm from being accepted at this lower threshold.
-        const float tail_thr =
-            std::min(profile.radar_verification_threshold, 0.08f);
-        const size_t reps = profile.preamble_repetitions;
-        const size_t step =
-            std::max<size_t>(1, profile.locked_tail_probe_step);
-        const size_t need_confirm =
-            std::max<size_t>(1, profile.locked_tail_probe_confirm);
-        // Two probe widths.  The locked residual is a few samples, so the
-        // narrow (+/-32) sweep finds a clean tail cheaply.  The wide sweep
-        // (+/-roi) only matters when the residual is larger than the narrow
-        // window -- and it costs 32 x 513 = 16,416 single-SYMBOL correlations,
-        // so it is NOT run before the fold: the fold covers the identical
-        // window with a 64-SYMBOL coherent gain (~18 dB more sensitive) and is
-        // the correct rescue in that regime.  The wide sweep is therefore the
-        // last resort, reached only when the fold itself could not rescue the
-        // packet.  Measured at -12 dB in-band (200 packets): the narrow sweep
-        // never produced a confirmable hit and the fold rescued every packet,
-        // so this ordering removes ~1.2 ms/packet of doomed work without
-        // changing any outcome.
-        auto tail_sweep = [&](int64_t trad) {
-            for (size_t m = inner + 1; m < reps; m += step) {
-                const int64_t want = static_cast<int64_t>(seed_start) +
-                    static_cast<int64_t>(m) *
-                        static_cast<int64_t>(kQm35SamplesPerSymbol);
-                if (want + static_cast<int64_t>(L) > static_cast<int64_t>(n))
-                    break;
-                ++out.tail_probe_attempts;
-                int64_t cpos = -1;
-                float cmet = 0.0f;
-                std::complex<float> ccorr(0.0f, 0.0f);
-                float raw_max = 0.0f;
-                const bool hit =
-                    local_best(want, trad, tail_thr, &cpos, &cmet, &ccorr,
-                               /*allow_par_fallback=*/true, &raw_max);
-                if (raw_max > out.tail_probe_raw_max)
-                    out.tail_probe_raw_max = raw_max;
-                if (!hit)
-                    continue;
-                if (cmet > out.tail_probe_best_metric)
-                    out.tail_probe_best_metric = cmet;
-                // Consistency gate: a real grid hit is confirmed by its
-                // neighbouring SYMBOLS.  A false alarm (wrong lag inside the
-                // ROI) is not, so probing continues instead of locking onto a
-                // bogus origin.
-                size_t confirm = 0;
-                const int64_t nb_delta[3] = {1, 2, -1};
-                for (int64_t d : nb_delta) {
-                    const int64_t nb = static_cast<int64_t>(m) + d;
-                    if (nb < 0 || nb >= static_cast<int64_t>(reps))
-                        continue;
-                    const int64_t nb_want =
-                        static_cast<int64_t>(seed_start) +
-                        nb * static_cast<int64_t>(kQm35SamplesPerSymbol);
-                    if (nb_want + static_cast<int64_t>(L) >
-                        static_cast<int64_t>(n))
-                        continue;
-                    int64_t np = -1;
-                    float nm = 0.0f;
-                    std::complex<float> nc(0.0f, 0.0f);
-                    float nb_raw = 0.0f;
-                    const bool nb_hit =
-                        local_best(nb_want, trad, tail_thr, &np, &nm, &nc,
-                                   /*allow_par_fallback=*/false, &nb_raw);
-                    if (nb_raw > out.tail_probe_raw_max)
-                        out.tail_probe_raw_max = nb_raw;
-                    if (nb_hit)
-                        ++confirm;
-                }
-                if (confirm < need_confirm)
-                    continue;
-                ++out.tail_probe_hits;
-                out.tail_probe_k = static_cast<int64_t>(m);
-                pos = cpos;
-                met = cmet;
-                corr = ccorr;
-                used_inner = m;
-                found = true;
-                return;
-            }
-        };
-        if (!found && profile.locked_tail_probe)
-            tail_sweep(std::min<int64_t>(roi, 32));
-        if (!found) {
-            // Low-SNR fallback: every single-symbol probe inside the bounded
-            // ROI missed.  The fold keeps the same bounded window -- it is not
-            // an escalation to a wide scan.
-            //
-            // Gate: LockedBounded's failure-path rescue is a single opt-out
-            // tier.  `locked_tail_probe == false` is how a caller asks for the
-            // original hard-fail tracking contract (no rescue at all), so the
-            // fold honours the same switch instead of silently replacing the
-            // tail probe with a different rescue.  qa_uwb_demod_core's
-            // "tail probe rescues leading interference" case pins that
-            // contract: with rescue disabled the packet MUST stay lost.
-            const bool fold_ok =
-                profile.locked_tail_probe &&
-                try_fold_acquire(
-                    static_cast<int64_t>(seed_start),
-                    std::max<int64_t>(1, static_cast<int64_t>(
-                                             profile.locked_roi_samples)));
-            if (!fold_ok && profile.locked_tail_probe) {
-                // Last resort (see the note above): the fold could not rescue
-                // this packet either, so the wide single-SYMBOL sweep is the
-                // only remaining option.  Paying its cost here cannot slow down
-                // any packet the fold already handles.
-                tail_sweep(roi);
-            }
-            if (!fold_ok && !found) {
-                ++out.bounded_failures;
-                finish_timing_profile();
-                return false;
-            }
-        }
-        if (!fold_used) {
-            // Convert the inner-SYNC hit back to the packet start on the grid.
-            first_start = pos - static_cast<int64_t>(used_inner) *
-                                    static_cast<int64_t>(kQm35SamplesPerSymbol);
-            first_hit_k = used_inner;
-            first_metric = met;
-            first_corr = corr;
-            if (used_inner != 0)
-                ++out.bounded_inner_used;
-        }
-        ++out.bounded_success;
     } else {
-        const int64_t seed =
-            (seed_start >= 0) ? seed_start
-                              : (int64_t)(roi_start + (roi_end - roi_start) / 2);
-        acq_seed = seed;
-        const int64_t margin =
-            static_cast<int64_t>(profile.timing_search_margin);
-        const int64_t stride = std::max<int64_t>(
-            1, static_cast<int64_t>(profile.timing_coarse_stride));
-        const int64_t j_lo = std::max<int64_t>(0, seed - margin);
-        const int64_t j_hi =
-            std::min<int64_t>(static_cast<int64_t>(n) - static_cast<int64_t>(L),
-                              seed + margin);
-
-        auto consider = [&](int64_t pos, float met, std::complex<float> corr) {
-            if (met >= thr && met > first_metric) {
-                first_metric = met;
-                first_start = pos;
-                first_corr = corr;
-            }
-        };
-
-        // MATLAB detectSeededPreamble: prefer a narrow FULL-RATE search around
-        // the seed (max(256, ceil(symbolLength/32)) samples each side).  A wide
-        // stride-S coarse scan can miss a narrow symbol-0 peak (sub-symbol seed
-        // offset) and then prefer a later STRONGER SYNC -- exactly what made
-        // the DW1000 preamble_start land ~6 SYNCs late.  The seed-nearby
-        // result is authoritative; the wide scan is only a fallback.
-        bool seed_acquired = false;
-        const int64_t legacy_seed_radius =
-            std::max<int64_t>(256, stride);
-        if (profile.timing_seed_refine_radius != 0) {
-            const int64_t narrow = rxopt::seed_refine_radius(
-                profile.timing_seed_refine_radius, stride);
-            if (narrow < legacy_seed_radius) {
-                const auto narrow_begin = std::chrono::steady_clock::now();
-                int64_t pos = -1;
-                float met = 0.0f;
-                std::complex<float> corr(0.0f, 0.0f);
-                // PAR fallback is enabled on the two NARROW local searches
-                // only.  A 256-SYNC preamble at -4..-8 dB in-band SNR has
-                // every SYNC peak above 0.08 with PAR 232..253, but only
-                // 11-24 of 256 clear the 0.25 absolute threshold, so the
-                // absolute gate alone loses the packet.  The wide stride scan
-                // and the whole-SYNC grid probes stay absolute-only: at
-                // thousands of lags a pure-noise false alarm would clear any
-                // PAR gate.
-                const bool narrow_ok =
-                    local_best(seed, narrow, thr, &pos, &met, &corr,
-                               /*allow_par_fallback=*/true);
-                out.seed_search_us = static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - narrow_begin).count());
-                ++out.seed_refine_narrow_attempts;
-                if (narrow_ok) {
-                    first_start = pos;
-                    first_metric = met;
-                    first_corr = corr;
-                    seed_acquired = true;
-                    ++out.seed_refine_narrow_success;
-                } else {
-                    ++out.seed_refine_fallbacks;
-                }
-            }
-        }
-        if (!seed_acquired) {
-            // Legacy first seeded refine.  Also the fallback after a failed
-            // narrow search: a recovered packet must not be lost just because
-            // the local peak was outside the narrow radius.
-            int64_t pos = -1;
-            float met = 0.0f;
-            std::complex<float> corr(0.0f, 0.0f);
-            if (local_best(seed, legacy_seed_radius, thr, &pos, &met, &corr,
-                           /*allow_par_fallback=*/true)) {
-                first_start = pos;
-                first_metric = met;
-                first_corr = corr;
-                seed_acquired = true;
-            }
-        }
-
-        // ---- Wide-window interval probe (K-symbol local fold) --------------
-        // Reached only for AcquireLegacy when the blind search spans many
-        // SYMBOL periods.  Each probe coherently folds K SYNC periods
-        // (+3 dB at K=2, +6 dB at K=4) and correlates over one period.
-        // The coarse probe grid only skips *start* positions, never a whole
-        // preamble: a probe
-        // anywhere inside the preamble still sees the same P-periodic code
-        // (its peak lag resolves back to a true symbol boundary), so the
-        // normal backtrack / SYNC-train / SFD path recovers the origin.
-        //
-        // On an all-miss, the historical stride-14 coarse scan, whole-SYNC
-        // grid and fold rescue are skipped so an SIC candidate that contains
-        // no target preamble fails fast to L0_Bypass instead of paying the
-        // full wide acquisition.  rx_wide_probe_fallback restores the old
-        // behaviour for callers that prefer recall over latency.
-        if (!seed_acquired && profile.rx_wide_interval_probe) {
-            const int64_t P = static_cast<int64_t>(kQm35SamplesPerSymbol);
-            if (P > 0 && j_hi - j_lo >= 16 * P) {
-                const size_t fold_k = std::max<size_t>(
-                    2, std::min<size_t>(profile.rx_wide_probe_fold_symbols, 4));
-                size_t step_symbols = profile.rx_wide_probe_step_symbols
-                    ? profile.rx_wide_probe_step_symbols : 42;
-                const size_t m_cap = std::max<size_t>(
-                    8, profile.preamble_repetitions / 3);
-                step_symbols = std::min(step_symbols, m_cap);
-                if (profile.preamble_repetitions > fold_k)
-                    step_symbols = std::min(
-                        step_symbols, profile.preamble_repetitions - fold_k);
-                else
-                    step_symbols = 0;
-                // The probe may land up to `step_symbols` into the preamble;
-                // the backtrack must be able to walk that far back.
-                if (profile.timing_max_backtrack_symbols > 0)
-                    step_symbols = std::min(step_symbols,
-                                            profile.timing_max_backtrack_symbols);
-                const int64_t last_probe =
-                    std::min(j_hi,
-                             static_cast<int64_t>(n) -
-                                 static_cast<int64_t>(fold_k) * P -
-                                 static_cast<int64_t>(L) + 1);
-                if (step_symbols > 0 && last_probe >= j_lo) {
-                    const int64_t step =
-                        static_cast<int64_t>(step_symbols) * P;
-                    int64_t best_pos = -1;
-                    float best_met = -1.0f;
-                    std::complex<float> best_corr(0.0f, 0.0f);
-                    int64_t last_scanned = -1;
-                    auto probe_one = [&](int64_t p) {
-                        if (p == last_scanned)
-                            return;
-                        last_scanned = p;
-                        const auto r = detail::fold_probe_acquire(
-                            rx, n, p, scratch.work.data(), L, Et,
-                            scratch.real_sync_template, fold_k, thr,
-                            sparse_tmpl, &scratch.fold_buf, shaped_tmpl);
-                        if (r.ok && r.start >= j_lo && r.start <= j_hi &&
-                            r.metric > best_met) {
-                            best_met = r.metric;
-                            best_pos = r.start;
-                            best_corr = r.corr;
-                        }
-                    };
-                    for (int64_t p = j_lo; p <= last_probe; p += step)
-                        probe_one(p);
-                    probe_one(last_probe);
-                    if (best_pos >= 0) {
-                        first_start = best_pos;
-                        first_metric = best_met;
-                        first_corr = best_corr;
-                        seed_acquired = true;
-                    } else if (!profile.rx_wide_probe_fallback) {
-                        finish_timing_profile();
-                        return false;
-                    }
-                }
-            }
-        }
-
-        // ---- Phase probe + symbol-grid acquisition (TM-1) ------------------
-        // The preamble is N verbatim copies of one P=1016-sample SYNC symbol.
-        // A window of P consecutive lags therefore contains one code-phase
-        // match, so the exact sample phase can be recovered from a handful of
-        // probe windows instead of correlating all 2*margin lags.  A strict
-        // threshold keeps this zero-risk: if the probe does not see a solid
-        // SYNC (low SNR, packet outside the probes), everything below falls
-        // through to the original coarse scan unchanged.
-        //
-        // Cheap pre-gate: the frontend seed is accurate to a few SYMBOLS, so
-        // the code phase at the seed is preserved and one single-lag dot tells
-        // us whether this window is deep noise.  The 0.2 floor is close to the
-        // tracking threshold on purpose: at -12/-14 dB the single-SYNC metric
-        // is ~0.04-0.1, so the three P-length probes (which would all fail)
-        // are skipped and the fold path is not slowed down by them.
-        float probe_gate = -1.0f;
-        {
-            const int64_t gp = std::min(std::max(seed, j_lo), j_hi);
-            if (gp >= 0 && gp + static_cast<int64_t>(L) <=
-                               static_cast<int64_t>(n)) {
-                const auto acc = filter.dot(rx + gp);
-                probe_gate = detail::normalized_correlation_power(
-                    acc, window_power_8acc(rx + gp, L), Et);
-            }
-        }
-        if (probe_gate >= 0.2f && !seed_acquired && j_hi > j_lo &&
-            j_hi - j_lo >= 2 * static_cast<int64_t>(kQm35SamplesPerSymbol)) {
-            const int64_t P = static_cast<int64_t>(kQm35SamplesPerSymbol);
-            int64_t probes[3];
-            size_t nprobe = 0;
-            auto push_probe = [&](int64_t p) {
-                if (p < j_lo || p > j_hi)
-                    return;
-                if (p + static_cast<int64_t>(L) + 64 > static_cast<int64_t>(n))
-                    return;
-                if (nprobe < 3)
-                    probes[nprobe++] = p;
-            };
-            push_probe(std::min(std::max(seed, j_lo), j_hi));
-            if (margin >= 32 * P) {
-                push_probe(seed - 32 * P);
-                push_probe(seed + 32 * P);
-            }
-            float best_probe = -1.0f;
-            int64_t anchor = -1;
-            for (size_t i = 0; i < nprobe; ++i) {
-                const int64_t p = probes[i];
-                const int64_t avail =
-                    static_cast<int64_t>(n) - static_cast<int64_t>(L) - p + 1;
-                const size_t lags = static_cast<size_t>(
-                    std::min<int64_t>(P, std::max<int64_t>(0, avail)));
-                if (lags < 64)
-                    continue;
-                const auto pk = rxopt::scan_normalized_sync(
-                    filter, rx + p, lags, window_power_8acc(rx + p, L), Et);
-                if (pk.metric > best_probe) {
-                    best_probe = pk.metric;
-                    anchor = p + static_cast<int64_t>(pk.lag);
-                }
-            }
-            if (anchor >= 0 && best_probe >= thr) {
-                // Same phase modulo P for every SYNC, so only the symbol grid
-                // remains: ~2*margin/P grid points at +/-2 samples each.
-                const int64_t rem = ((anchor - j_lo) % P + P) % P;
-                for (int64_t want = j_lo + rem; want <= j_hi; want += P) {
-                    int64_t pos = -1;
-                    float met = 0.0f;
-                    std::complex<float> corr(0.0f, 0.0f);
-                    if (local_best(want, 2, thr, &pos, &met, &corr))
-                        consider(pos, met, corr);
-                }
-                if (first_start >= 0)
-                    seed_acquired = true;
-            }
-        }
-
-        // (a) Coarse scan (fallback only) -- batched SIMD when stride is 1 or 2,
-        // sliding power conjugate dots at stride otherwise.
-        const auto coarse_begin = std::chrono::steady_clock::now();
-        if (!seed_acquired && j_hi > j_lo) {
-            float best_coarse_m = -1.0f;
-            int64_t best_coarse_j = j_lo;
-            std::complex<float> best_coarse_c(0.0f, 0.0f);
-            if (stride == 1) {
-                const size_t lag_count = static_cast<size_t>(j_hi - j_lo + 1);
-                const auto pk = rxopt::scan_normalized_sync(
-                    filter, rx + j_lo, lag_count,
-                    window_power_8acc(rx + j_lo, L), Et);
-                best_coarse_j = j_lo + static_cast<int64_t>(pk.lag);
-                best_coarse_m = pk.metric;
-                best_coarse_c = pk.corr;
-            } else if (stride == 2 && sparse_tmpl && !shaped_tmpl && (L % 2 == 0)) {
-                const size_t half_lags =
-                    static_cast<size_t>((j_hi - j_lo) / 2 + 1);
-                const size_t half_len = L / 2;
-                const size_t even_count = (half_lags - 1) + half_len;
-                scratch.corr.resize(even_count);
-                rxopt::pack_even_complex(rx + j_lo, even_count,
-                                         scratch.corr.data());
-                rxopt::ensure_half_rate_sparse_template(
-                    *sparse_tmpl, scratch.half_cir_template);
-                const rxopt::SyncMatchedFilter half_filter(
-                    nullptr, half_len, nullptr, &scratch.half_cir_template);
-                const auto pk = rxopt::scan_normalized_sync(
-                    half_filter, scratch.corr.data(), half_lags,
-                    window_power_8acc(scratch.corr.data(), half_len), Et);
-                best_coarse_j = j_lo + static_cast<int64_t>(pk.lag) * 2;
-                best_coarse_c = pk.corr;
-                best_coarse_m = detail::normalized_correlation_power(
-                    pk.corr, window_power_8acc(rx + best_coarse_j, L), Et);
-            } else {
-                float pw = window_power_8acc(rx + j_lo, L);
-                // Slide the window power forward by `cnt` samples with eight
-                // independent accumulators, so the two |x|^2 streams vectorise and
-                // only ONE serial float add per stride block remains.  The
-                // per-sample form of this update was the single most expensive loop
-                // in low-SNR acquisition: 262,144 iterations (the live search
-                // margin is +-131,072 samples) at ~8 cycles each = ~2.2 ms/packet,
-                // 85% of the whole acquisition search.  The sum is mathematically
-                // identical; only the float association order changes.
-                auto advance_power = [&](int64_t j, int64_t cnt) {
-                    const float* a =
-                        reinterpret_cast<const float*>(rx + j + static_cast<int64_t>(L));
-                    const float* b = reinterpret_cast<const float*>(rx + j);
-                    const size_t m = static_cast<size_t>(2 * cnt);
-                    float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
-                    float s4 = 0.f, s5 = 0.f, s6 = 0.f, s7 = 0.f;
-                    size_t i = 0;
-                    for (; i + 8 <= m; i += 8) {
-                        s0 += a[i + 0] * a[i + 0] - b[i + 0] * b[i + 0];
-                        s1 += a[i + 1] * a[i + 1] - b[i + 1] * b[i + 1];
-                        s2 += a[i + 2] * a[i + 2] - b[i + 2] * b[i + 2];
-                        s3 += a[i + 3] * a[i + 3] - b[i + 3] * b[i + 3];
-                        s4 += a[i + 4] * a[i + 4] - b[i + 4] * b[i + 4];
-                        s5 += a[i + 5] * a[i + 5] - b[i + 5] * b[i + 5];
-                        s6 += a[i + 6] * a[i + 6] - b[i + 6] * b[i + 6];
-                        s7 += a[i + 7] * a[i + 7] - b[i + 7] * b[i + 7];
-                    }
-                    float s = ((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7));
-                    for (; i < m; ++i)
-                        s += a[i] * a[i] - b[i] * b[i];
-                    pw += s;
-                };
-                for (int64_t j = j_lo; j <= j_hi; j += stride) {
-                    const auto acc = filter.dot(rx + j);
-                    const float m = detail::normalized_correlation_power(acc, pw, Et);
-                    if (m > best_coarse_m) {
-                        best_coarse_m = m;
-                        best_coarse_j = j;
-                        best_coarse_c = acc;
-                    }
-                    const int64_t cnt = std::min<int64_t>(stride, j_hi + 1 - j);
-                    // Only slide when another search lag remains: the final
-                    // advance would read rx[j + L] one complex sample past the
-                    // n-sample window (and its value is never consumed).
-                    if (j + cnt <= j_hi)
-                        advance_power(j, cnt);
-                }
-            }
-            out.coarse_search_us = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - coarse_begin).count());
-            // (b) Fine refine around the coarse peak.
-            int64_t pos = -1;
-            float met = 0.0f;
-            std::complex<float> corr(0.0f, 0.0f);
-            if (local_best(best_coarse_j, stride, thr, &pos, &met, &corr))
-                consider(pos, met, corr);
-            else if (best_coarse_m >= thr)
-                consider(best_coarse_j, best_coarse_m, best_coarse_c);
-        }
-
-        // (c) Whole-SYNC grid probes (fallback only; covers a seed that lands
-        // mid-preamble and a sub-symbol confirmation that must not replace an
-        // SFD-refined anchor with a stronger neighbouring SYNC).
-        if (!seed_acquired) {
-            int64_t pos = -1;
-            float met = 0.0f;
-            std::complex<float> corr(0.0f, 0.0f);
-            const int64_t grid_half = margin / kQm35SamplesPerSymbol;
-            for (int64_t n_sym = -grid_half; n_sym <= grid_half; ++n_sym) {
-                if (local_best(seed + n_sym * static_cast<int64_t>(
-                                               kQm35SamplesPerSymbol),
-                               8, thr, &pos, &met, &corr))
-                    consider(pos, met, corr);
-            }
-        }
-        if (first_start < 0) {
-            // Low-SNR fallback: narrow seed refine, legacy seed refine, stride
-            // coarse scan and whole-SYNC grid probes all missed.  Fold over a
-            // capped acquisition window (never the full 40k margin: the fold
-            // cost grows with the window and the seed is already close).
-            if (!try_fold_acquire(
-                    seed, std::min<int64_t>(margin, 8192))) {
-                finish_timing_profile();
-                return false;
-            }
+        if (!acquire_unbounded_seed(env, st, seed_start)) {
+            finish_timing_profile();
+            return false;
         }
     }
+
     // A real QM35825 has a repeatable startup transient: the first few SYNCs
     // can score below the normal verification threshold, so the detector seeds
     // the first strong SYNC.  Once locked, walk backwards on the known grid
@@ -911,7 +1441,7 @@ bool stage_timing(const std::complex<float>* rx,
     // 0.7*0.25 anyway.
     size_t backtracked_symbols = 0;
     const size_t backtrack_limit =
-        (fold_used || (bounded && !profile.locked_allow_backtrack))
+        (st.fold_used || (bounded && !profile.locked_allow_backtrack))
             ? 0
             : profile.timing_max_backtrack_symbols;
     for (size_t back = 0; back < backtrack_limit; ++back) {
@@ -919,286 +1449,46 @@ bool stage_timing(const std::complex<float>* rx,
         float previous_metric = 0.0f;
         std::complex<float> previous_corr(0.0f, 0.0f);
         const float relaxed = 0.7f * profile.radar_verification_threshold;
-        if (local_best(first_start - static_cast<int64_t>(kQm35SamplesPerSymbol),
+        if (local_best(env, st, st.first_start -
+                                      static_cast<int64_t>(kQm35SamplesPerSymbol),
                        8, relaxed, &previous_start, &previous_metric,
                        &previous_corr)) {
-            first_start = previous_start;
-            first_metric = previous_metric;
-            first_corr = previous_corr;
+            st.first_start = previous_start;
+            st.first_metric = previous_metric;
+            st.first_corr = previous_corr;
             ++backtracked_symbols;
         } else
             break;
     }
     out.backtrack_symbols = static_cast<uint32_t>(backtracked_symbols);
-    const int64_t start = first_start;
+    const int64_t start = st.first_start;
     if (start < 0) {
         finish_timing_profile();
         return false;
     }
     const int64_t period = static_cast<int64_t>(kQm35SamplesPerSymbol);
 
-    // ---- LockedBounded grid tracking: sparse anchors + single point --------
-    // The locked contract already knows the symbol grid (the target lock
-    // predicted this origin), so the only unknowns are the residual origin and
-    // the residual period.  Measure a sparse set of SYNC anchors with the
-    // normal +/-track_radius search, fit period+origin from the anchors, then
-    // evaluate every other SYNC with ONE correlation at start+round(k*period).
-    // The peak train keeps the same meaning (CFO needs peak_corr phases, CIR
-    // needs the fitted period), at ~1/17 of the per-symbol search cost.
-    // measured_period MUST come from the anchor fit: it feeds
-    // integer_chip_grid()/spc_ppm and the fused-CMF admission, so a period
-    // that degenerates to the nominal 1016 would silently disable the
-    // fractional-grid fallback for an untrimmed clock.
     bool grid_applied = false;
     double grid_period = static_cast<double>(period);
     int64_t grid_start = start;
-    auto grid_track = [&]() -> bool {
-        const size_t reps = profile.preamble_repetitions;
-        if (reps < 8)
-            return false;
-        const float gthr =
-            std::min(profile.radar_verification_threshold, 0.08f);
-        const int64_t arad = std::max<int64_t>(
-            8, static_cast<int64_t>(profile.timing_track_radius));
-        const double nominal = static_cast<double>(period);
-
-        // Sparse anchor set on the symbol grid: the confirmed first SYNC, the
-        // last SYNC of the train, and evenly spaced points in between.
-        std::array<size_t, 32> ak{};
-        size_t na = 0;
-        ak[na++] = first_hit_k;
-        const size_t last_k = reps - 1;
-        if (last_k > first_hit_k) {
-            const size_t want_anchors = std::min<size_t>(
-                std::max<size_t>(4, profile.locked_grid_anchor_count), ak.size());
-            const size_t intervals = (want_anchors > 1) ? (want_anchors - 1) : 1;
-            const double span = static_cast<double>(last_k - first_hit_k);
-            for (size_t i = 1; i <= intervals && na < ak.size(); ++i) {
-                const size_t k = first_hit_k + static_cast<size_t>(std::llround(
-                    span * static_cast<double>(i) /
-                    static_cast<double>(intervals)));
-                if (k != ak[na - 1])
-                    ak[na++] = k;
-            }
-        }
-
-        // One least-squares pass over the anchors: peak(k) = start + k*period,
-        // in the same symbol-END convention as the legacy fit.
-        auto fit_anchors = [&](double period_hint, int64_t start_hint,
-                               int64_t radius, double* period_out,
-                               int64_t* start_out, float* median_out,
-                               size_t* hits_out) -> bool {
-            detail::LinearFit fit;
-            std::array<float, 32> mets{};
-            size_t hits = 0;
-            size_t kmin = 0, kmax = 0;
-            for (size_t i = 0; i < na; ++i) {
-                const size_t k = ak[i];
-                const int64_t want = start_hint + static_cast<int64_t>(
-                    std::llround(static_cast<double>(k) * period_hint));
-                if (want < 0 ||
-                    want + static_cast<int64_t>(L) > static_cast<int64_t>(n))
-                    continue;
-                ++out.grid_anchor_attempts;
-                int64_t pos = -1;
-                float met = 0.0f;
-                std::complex<float> c(0.0f, 0.0f);
-                if (!local_best(want, radius, gthr, &pos, &met, &c))
-                    continue;
-                const double x = static_cast<double>(k);
-                const double y = static_cast<double>(pos + (int64_t)(L - 1));
-                fit.add(x, y);
-                if (hits == 0) {
-                    kmin = k;
-                    kmax = k;
-                } else {
-                    kmin = std::min(kmin, k);
-                    kmax = std::max(kmax, k);
-                }
-                mets[hits++] = met;
-            }
-            *hits_out = hits;
-            if (hits < std::max<size_t>(2, profile.locked_grid_min_anchors))
-                return false;
-            if (kmax - kmin < 8)
-                return false; // anchors too bunched to measure a slope
-            const double denom = fit.determinant();
-            if (!(std::abs(denom) > 1e-9))
-                return false;
-            const double p = fit.slope(denom);
-            if (!std::isfinite(p) || !(p > 0.0))
-                return false;
-            const double intercept_end = fit.intercept(p);
-            *period_out = p;
-            *start_out = std::max<int64_t>(
-                0, static_cast<int64_t>(std::llround(intercept_end)) -
-                       static_cast<int64_t>(L - 1));
-            std::sort(mets.begin(), mets.begin() + hits);
-            *median_out = mets[hits / 2];
-            return true;
-        };
-
-        double p1 = nominal;
-        int64_t s1 = start;
-        float med1 = 0.0f;
-        size_t hits1 = 0;
-        if (!fit_anchors(nominal, start, arad, &p1, &s1, &med1, &hits1))
-            return false;
-        // A fitted period outside 0.5% of the nominal work-grid SYNC period
-        // means the anchors did not land on the expected symbol indices.
-        if (std::abs(p1 - nominal) > 0.005 * nominal)
-            return false;
-        double p2 = p1;
-        int64_t s2 = s1;
-        float med2 = med1;
-        size_t hits2 = hits1;
-        // Second pass only when the nominal grid would put the last anchor
-        // more than 4 samples off (an untrimmed clock).  With a trimmed
-        // crystal the first pass is already unbiased and this costs nothing.
-        if (std::abs(p1 - nominal) * static_cast<double>(last_k) > 4.0) {
-            if (!fit_anchors(p1, s1, std::max<int64_t>(arad, 16), &p2, &s2,
-                             &med2, &hits2))
-                return false;
-            if (std::abs(p2 - nominal) > 0.005 * nominal)
-                return false;
-        }
-        out.grid_anchor_hits = static_cast<uint32_t>(hits2);
-
-        // Single-point stage: evaluate eight consecutive lags around the fitted
-        // grid position and keep the best.  The 8-lag kernel has independent
-        // accumulators and is far cheaper per lag than the single-lag kernel
-        // (which is one long FMA dependency chain), so eight lags cost barely
-        // more than one -- and taking the argmax keeps the peak positions and
-        // the CFO phases identical to the legacy per-SYNC search instead of
-        // pinning them to the fitted grid.
-        scratch.metric.assign(reps, 0.0f);
-        size_t valid = 0;
-        // Least-squares accumulators over every refined peak (see the final
-        // fit note after the loop).
-        detail::LinearFit final_fit;
-        size_t fn = 0;
-        for (size_t k = 0; k < reps; ++k) {
-            if (k == first_hit_k) {
-                // The bounded probe already measured this SYNC with a real
-                // +/-roi search; keep that measurement instead of
-                // re-projecting it onto the fitted grid.
-                scratch.metric[k] = first_metric;
-                ++out.grid_single_points;
-                if (first_metric >= gthr) {
-                    ++valid;
-                    out.peak_samples.push_back(start + static_cast<int64_t>(L - 1));
-                    out.peak_metrics.push_back(first_metric);
-                    out.peak_corr.push_back(first_corr);
-                    const double x = static_cast<double>(k);
-                    const double y = static_cast<double>(start + (int64_t)(L - 1));
-                    final_fit.add(x, y);
-                    ++fn;
-                }
-                continue;
-            }
-            const int64_t centre = s2 + static_cast<int64_t>(
-                std::llround(static_cast<double>(k) * p2));
-            int64_t base = centre - 3;
-            int nl = 8;
-            if (base + 7 + static_cast<int64_t>(L) > static_cast<int64_t>(n)) {
-                // Window edge: fall back to the single lag at the prediction
-                // so the last SYNCs are still measured.
-                if (centre + static_cast<int64_t>(L) >
-                    static_cast<int64_t>(n))
-                    continue;
-                base = centre;
-                nl = 1;
-            }
-            if (base < 0)
-                continue;
-            float pw = window_power_8acc(rx + base, L);
-            rxopt::MatchedFilterPeak peak;
-            filter.for_each_lag(rx + base, static_cast<size_t>(nl),
-                                [&](size_t lag, std::complex<float> corr, bool) {
-                if (lag != 0)
-                    pw += std::norm(rx[base + lag - 1 + L]) -
-                          std::norm(rx[base + lag - 1]);
-                const float metric = detail::normalized_correlation_power(corr, pw, Et);
-                if (lag == 0 || metric > peak.metric)
-                    peak = { lag, metric, corr };
-            });
-            const int64_t want = base + static_cast<int64_t>(peak.lag);
-            const float m = peak.metric;
-            scratch.metric[k] = m;
-            ++out.grid_single_points;
-            if (m < gthr)
-                continue;
-            ++valid;
-            out.peak_samples.push_back(want + static_cast<int64_t>(L - 1));
-            out.peak_metrics.push_back(m);
-            out.peak_corr.push_back(peak.corr);
-            const double x = static_cast<double>(k);
-            const double y = static_cast<double>(want + (int64_t)(L - 1));
-            final_fit.add(x, y);
-            ++fn;
-        }
-        out.grid_single_valid = static_cast<uint32_t>(valid);
-        if (valid < 4)
-            return false;
-        // Grid sanity: if the fitted grid does not land on real peaks, the
-        // single-point metrics collapse relative to the anchor peaks.  Use the
-        // 90th percentile so a weak (interfered) part of the preamble does not
-        // by itself reject a correct grid.
-        if (reps <= 512) {
-            const size_t idx = static_cast<size_t>(
-                0.9 * static_cast<double>(reps - 1));
-            std::nth_element(scratch.metric.begin(),
-                             scratch.metric.begin() + idx,
-                             scratch.metric.end());
-            if (!(scratch.metric[idx] >= 0.5f * med2))
-                return false;
-        }
-        // Final period/origin: least squares over EVERY refined peak, which is
-        // exactly the estimator the legacy 256-point fit uses.  The anchors are
-        // the bootstrap that puts the single-point windows in the right place
-        // (and the fallback if this fit is degenerate); they are not the final
-        // estimate, because a 16-anchor fit is ~4x noisier than the legacy
-        // 256-point fit and that noise measurably flips marginal payloads
-        // (measured: 1 packet / 2000 at 2.5 m).  The refined positions are real
-        // argmax measurements, NOT the quantised grid, so measured_period stays
-        // a genuine measurement and integer_chip_grid()/spc_ppm keeps working.
-        if (fn >= 8) {
-            const double denom = final_fit.determinant();
-            if (std::abs(denom) > 1e-9) {
-                const double pr = final_fit.slope(denom);
-                const double intercept_end = final_fit.intercept(pr);
-                if (std::isfinite(pr) && pr > 0.0 &&
-                    std::abs(pr - p2) <= 0.01) { // 10 ppm sanity vs anchors
-                    p2 = pr;
-                    s2 = std::max<int64_t>(
-                        0, static_cast<int64_t>(std::llround(intercept_end)) -
-                               static_cast<int64_t>(L - 1));
-                }
-            }
-        }
-        grid_period = p2;
-        grid_start = s2;
-        grid_applied = true;
-        return true;
-    };
-    if (bounded && profile.locked_grid_timing && !fold_used) {
-        if (!grid_track()) {
+    if (bounded && profile.locked_grid_timing && !st.fold_used) {
+        if (!track_locked_grid(env, st, start, period, &grid_period,
+                               &grid_start)) {
             ++out.grid_fallbacks;
             out.peak_samples.clear();
             out.peak_metrics.clear();
             out.peak_corr.clear();
+        } else {
+            grid_applied = true;
         }
     }
 
-    // Track all SYNC starts: expected = start + k*period, then convert each to
-    // symbol-END convention (start + L - 1) to match the detector / MATLAB.
-    // When bounded inner-SYNC probing hit symbol `first_hit_k > 0`, anchor the
-    // first peak at its true symbol coordinate and continue from `first_hit_k + 1`
-    // rather than restarting at k=1 (which already failed).  Also allow up to 2
-    // consecutive missed SYNCs so a brief 1-2 symbol interference dip does not
-    // prematurely truncate the 256-symbol train.
-    std::vector<size_t> peak_indices;
-    peak_indices.reserve(profile.preamble_repetitions);
+    // Hot-path zero allocation: the tracked-peak repetition indices reuse the
+    // worker scratch buffer (cleared here exactly as the old local vector was)
+    // instead of constructing a per-packet std::vector.
+    std::vector<size_t>& peak_indices = scratch.timing_peak_indices;
+    peak_indices.clear();
+
     // LockedBounded's per-SYMBOL tracking floor.  A first peak below it cannot
     // be the head of a usable train: the tail probe already swept 32 tail
     // symbols at exactly this floor and found nothing confirmable, so running
@@ -1211,74 +1501,10 @@ bool stage_timing(const std::complex<float>* rx,
     const float bounded_track_floor =
         std::min(profile.radar_verification_threshold, 0.08f);
     const bool skip_doomed_bounded_train =
-        bounded && profile.locked_tail_probe && !grid_applied && !fold_used &&
-        (first_metric < bounded_track_floor);
-    if (!grid_applied && !fold_used && !skip_doomed_bounded_train) {
-        constexpr size_t kMaxConsecutiveSyncMisses = 2;
-        // One tracking pass at a given floor.  `weak` selects the 0.08 floor
-        // LockedBounded already uses for its tail probe; the legacy absolute
-        // threshold is used otherwise.
-        auto track_train = [&](bool weak) {
-            out.peak_samples.clear();
-            out.peak_metrics.clear();
-            out.peak_corr.clear();
-            peak_indices.clear();
-            const int64_t first_hit_start =
-                start + static_cast<int64_t>(first_hit_k) * period;
-            out.peak_samples.push_back(first_hit_start +
-                                       static_cast<int64_t>(L - 1));
-            out.peak_metrics.push_back(first_metric);
-            out.peak_corr.push_back(first_corr);
-            peak_indices.push_back(first_hit_k);
-            size_t consecutive_misses = 0;
-            for (size_t k = first_hit_k + 1;
-                 k < profile.preamble_repetitions; ++k) {
-                const int64_t want = start + static_cast<int64_t>(k * period);
-                int64_t pk = -1;
-                float pm = 0.0f;
-                std::complex<float> pk_corr(0.0f, 0.0f);
-                const float tracking_threshold =
-                    (bounded || weak)
-                        ? std::min(profile.radar_verification_threshold,
-                                   bounded ? 0.08f : 0.06f)
-                        : ((k < backtracked_symbols)
-                               ? 0.7f * profile.radar_verification_threshold
-                               : profile.radar_verification_threshold);
-                const int64_t track_rad =
-                    (bounded && consecutive_misses > 0)
-                        ? std::max<int64_t>(
-                              12, static_cast<int64_t>(
-                                      profile.timing_track_radius))
-                        : static_cast<int64_t>(profile.timing_track_radius);
-                if (!local_best(want, track_rad, tracking_threshold, &pk, &pm,
-                                &pk_corr)) {
-                    ++consecutive_misses;
-                    if (!bounded &&
-                        consecutive_misses > kMaxConsecutiveSyncMisses)
-                        break; // lost the train
-                    continue;
-                }
-                consecutive_misses = 0;
-                out.peak_samples.push_back(pk + static_cast<int64_t>(L - 1));
-                out.peak_metrics.push_back(pm);
-                out.peak_corr.push_back(pk_corr);
-                peak_indices.push_back(k);
-            }
-            return out.peak_samples.size();
-        };
-        // First pass at the legacy threshold: high-SNR packets are complete
-        // here and pay nothing.  Only a train that the absolute threshold
-        // truncated (a low-SNR acquisition whose SYNCs all sit at the same
-        // sub-threshold level) is retried at the 0.08 floor.  Without this the
-        // packet is lost one stage later anyway (fit_cfo needs >= 4 peaks and
-        // stage_cir_softchips needs more than cir_skip_initial_repetitions).
-        const size_t min_peaks =
-            std::max<size_t>(4, profile.min_valid_peaks);
-        size_t tracked = track_train(false);
-        if (!bounded && tracked < min_peaks)
-            tracked = track_train(true);
-        (void)tracked;
-    }
+        bounded && profile.locked_tail_probe && !grid_applied && !st.fold_used &&
+        (st.first_metric < bounded_track_floor);
+    if (!grid_applied && !st.fold_used && !skip_doomed_bounded_train)
+        track_sync_train(env, st, start, period, backtracked_symbols);
 
     // ---- Post-train fold retry -------------------------------------------
     // "All single-symbol paths failed" is also observable one stage later: at
@@ -1294,7 +1520,7 @@ bool stage_timing(const std::complex<float>* rx,
     // where it belongs.
     const bool allow_post_train_fold = !bounded || profile.locked_tail_probe;
     size_t min_train_peaks = std::max<size_t>(4, profile.min_valid_peaks);
-    if (raw_par_hit && profile.rx_par_confirm) {
+    if (st.raw_par_hit && profile.rx_par_confirm) {
         // A weak single-SYNC PAR hit may start tracking with too few phase
         // points for a stable CFO estimate. Give the existing fold a chance
         // to build its coherent anchors in that case.
@@ -1302,10 +1528,10 @@ bool stage_timing(const std::complex<float>* rx,
             min_train_peaks,
             std::min(profile.cfo_min_fit_repetitions, profile.preamble_repetitions));
     }
-    if (allow_post_train_fold && !fold_used && !grid_applied &&
+    if (allow_post_train_fold && !st.fold_used && !grid_applied &&
         out.peak_samples.size() < min_train_peaks) {
         const int64_t fold_centre =
-            bounded ? static_cast<int64_t>(seed_start) : acq_seed;
+            bounded ? static_cast<int64_t>(seed_start) : st.acq_seed;
         const int64_t fold_radius = bounded
             ? std::max<int64_t>(1, static_cast<int64_t>(profile.locked_roi_samples))
             : std::min<int64_t>(static_cast<int64_t>(profile.timing_search_margin),
@@ -1317,7 +1543,8 @@ bool stage_timing(const std::complex<float>* rx,
             out.peak_samples.clear();
             out.peak_metrics.clear();
             out.peak_corr.clear();
-            if (!try_fold_acquire(fold_centre, fold_radius)) {
+            if (!try_fold_acquire(env, st, fold_centre, fold_radius,
+                                  /*fast_only=*/false)) {
                 out.peak_samples = std::move(saved_ps);
                 out.peak_metrics = std::move(saved_pm);
                 out.peak_corr = std::move(saved_pc);
@@ -1326,11 +1553,11 @@ bool stage_timing(const std::complex<float>* rx,
     }
 
     out.detected_peaks = out.peak_samples.size();
-    out.sync_peaks_folded = fold_used;
-    if (fold_used)
+    out.sync_peaks_folded = st.fold_used;
+    if (st.fold_used)
         out.cir_grid_repetitions = profile.preamble_repetitions;
     out.expected_peaks = profile.preamble_repetitions;
-    out.metric = first_metric;
+    out.metric = st.first_metric;
 
     // Linear fit of peak positions vs repetition index -> measured period and
     // the preamble start.  peak(k) = start + k*period  =>  least squares
@@ -1339,7 +1566,7 @@ bool stage_timing(const std::complex<float>* rx,
     // (2)), i.e. the start is derived from the WHOLE tracked train rather than
     // the first peak, so a slightly-off first peak does not bias the origin.
     const size_t np = out.peak_samples.size();
-    if (fold_used) {
+    if (st.fold_used) {
         // measured_period / preamble_start_sample were already set by the
         // fold path's 16-super-anchor fit (see try_fold_acquire).  The legacy
         // per-SYNC train never ran, so there is nothing to refit here.
@@ -1418,1028 +1645,6 @@ normalized_mf(const std::complex<float>* rx,
     return best;
 }
 
-FoldPhaseProbe probe_fold_phase(const std::complex<float>* rx,
-                                size_t n,
-                                int64_t centre,
-                                size_t repetitions)
-{
-    const size_t sym = kQm35SamplesPerSymbol;
-    if (repetitions < 32)
-        return {};
-    const int64_t lo = centre + static_cast<int64_t>((repetitions / 4) * sym);
-    if (lo < 0 || static_cast<size_t>(lo) >= n ||
-        n - static_cast<size_t>(lo) <= sym)
-        return {};
-    const size_t count = std::min(std::min<size_t>(repetitions / 2, 128) * sym,
-                                  n - static_cast<size_t>(lo) - sym);
-    if (count < 16 * sym)
-        return {};
-    const auto a = rx + lo;
-    FoldPhaseProbe probe;
-    probe.samples = a;
-    probe.count = count;
-    probe.corr = timing_conjugate_dot(a + sym, a, count);
-    probe.ea = timing_conjugate_dot(a, a, count).real();
-    float head = 0.0f;
-    float tail = 0.0f;
-    for (size_t i = 0; i < sym; ++i) {
-        head += std::norm(a[i]);
-        tail += std::norm(a[count + i]);
-    }
-    probe.eb = probe.ea - head + tail;
-    return probe;
-}
-
-FoldAcquireResult fold_acquire(const std::complex<float>* rx,
-                               size_t n,
-                               int64_t centre,
-                               int64_t w0_in,
-                               int64_t w1_in,
-                               const std::complex<float>* tmpl,
-                               size_t L,
-                               float Et,
-                               const rxopt::RealSyncTemplate& real_tmpl,
-                               size_t max_symbols,
-                               size_t preamble_repetitions,
-                               float threshold,
-                               double phase_per_symbol,
-                               const rxopt::SparseCirTemplate* sparse_tmpl,
-                               std::vector<std::complex<float>>* fold_buf,
-                               const rxopt::ShapedSparseTemplate* shaped_tmpl)
-{
-    FoldAcquireResult res;
-    const int64_t P = static_cast<int64_t>(kQm35SamplesPerSymbol);
-    const int64_t Li = static_cast<int64_t>(L);
-    const bool have_sparse = sparse_tmpl && sparse_tmpl->code_energy > 0.0f;
-    const bool have_shaped = shaped_tmpl && shaped_tmpl->valid;
-    if (!rx || L == 0 || n < L || (!tmpl && !have_sparse && !have_shaped))
-        return res;
-
-    int64_t w0 = std::max<int64_t>(0, w0_in);
-    int64_t w1 = std::min<int64_t>(w1_in, static_cast<int64_t>(n) - Li);
-    if (w1 < w0)
-        return res;
-
-    // The deepest sample the fold touches is w1 + L - 1 + (K-1)*P, so the
-    // buffer must hold K whole symbol periods starting at w0.
-    const int64_t room = static_cast<int64_t>(n) - w0 - Li;
-    if (room < 0)
-        return res;
-    int64_t k_eff = std::min<int64_t>(static_cast<int64_t>(max_symbols),
-                                      room / P + 1);
-    // Folding past the end of the preamble only adds noise, never signal.
-    k_eff = std::min<int64_t>(k_eff,
-                              static_cast<int64_t>(preamble_repetitions));
-    const int64_t min_syms = std::min<int64_t>(
-        static_cast<int64_t>(kFoldMinSymbols),
-        static_cast<int64_t>(max_symbols));
-    if (k_eff < min_syms)
-        return res;
-    w1 = std::min<int64_t>(w1, static_cast<int64_t>(n) - Li - (k_eff - 1) * P);
-    if (w1 < w0)
-        return res;
-
-    // Only lags inside +/-P/2 of the seed can be selected (see the note below),
-    // so the fold and the correlation only have to cover that sub-window.
-    // Clamping here instead of inside the correlation loop shrinks the fold
-    // accumulation by the same factor: under AcquireLegacy the search radius is
-    // 8192 samples, i.e. span 16384 -> 1016 lags (-93.8%), and every discarded
-    // lag was unreachable by the argmax anyway.  `room` / `k_eff` above are
-    // still derived from the ORIGINAL w0 so the fold depth (and therefore the
-    // folded vector itself) is unchanged.
-    const int64_t half_period = P / 2;
-    const int64_t c0 = std::max<int64_t>(w0, centre - half_period);
-    const int64_t c1 = std::min<int64_t>(w1, centre + half_period);
-    if (c1 < c0)
-        return res; // the seed lies entirely outside the legal window
-    w0 = c0;
-    w1 = c1;
-
-    const int64_t span = w1 - w0;
-    const size_t fold_len = static_cast<size_t>(span + Li);
-    // Reuse the worker buffer when the caller provides one: the fold path runs
-    // at most once per packet, but it is also reached on retries, and a
-    // per-packet allocation is pure allocator traffic on the low-SNR path.
-    std::vector<std::complex<float>> local_folded;
-    std::vector<std::complex<float>>& folded =
-        fold_buf ? *fold_buf : local_folded;
-    if (folded.size() < fold_len)
-        folded.resize(fold_len);
-    std::fill(folded.begin(), folded.begin() + fold_len,
-              std::complex<float>(0.0f, 0.0f));
-    for (int64_t k = 0; k < k_eff; ++k)
-        fold_accumulate(folded.data(), rx + w0 + k * P, fold_len,
-                        -k * phase_per_symbol);
-
-    const float* real_taps = real_tmpl.is_real && real_tmpl.length == L
-        ? real_tmpl.taps_dup.data() : nullptr;
-    const rxopt::SyncMatchedFilter filter(tmpl, L, real_taps, sparse_tmpl,
-                                          true, shaped_tmpl);
-    if (shaped_tmpl && shaped_tmpl->valid)
-        Et = shaped_tmpl->energy;
-    else if (sparse_tmpl && sparse_tmpl->code_energy > 0.0f)
-        Et = sparse_tmpl->code_energy;
-    const size_t lags = static_cast<size_t>(span + 1);
-    std::vector<float> lag_metrics(lags, 0.0f);
-    const auto peak = rxopt::scan_normalized_sync(
-        filter, folded.data(), lags, window_power_8acc(folded.data(), L), Et,
-        lag_metrics.data());
-
-    res.symbols_folded = static_cast<size_t>(k_eff);
-    res.window_lags = lags;
-    bool accepted = (peak.metric >= threshold);
-    if (!accepted && peak.metric >= 0.015f) {
-        constexpr int64_t kFoldParGuard = 40;
-        constexpr double kFoldParMin = 17.7827941; // 12.5 dB
-        double bg_sum = 0.0;
-        size_t bg_cnt = 0;
-        const int64_t pk_i = static_cast<int64_t>(peak.lag);
-        for (size_t i = 0; i < lags; ++i) {
-            if (std::abs(static_cast<int64_t>(i) - pk_i) > kFoldParGuard) {
-                bg_sum += static_cast<double>(lag_metrics[i]);
-                ++bg_cnt;
-            }
-        }
-        if (bg_cnt >= 64) {
-            const double bg_mean =
-                std::max(bg_sum / static_cast<double>(bg_cnt), 1e-12);
-            accepted = (static_cast<double>(peak.metric) / bg_mean) >= kFoldParMin;
-        }
-    }
-    if (!accepted)
-        return res;
-    res.ok = true;
-    res.start = w0 + static_cast<int64_t>(peak.lag);
-    res.metric = peak.metric;
-    res.corr = peak.corr;
-    return res;
-}
-
-FoldAcquireResult fold_probe_acquire(
-    const std::complex<float>* rx,
-    size_t n,
-    int64_t probe,
-    const std::complex<float>* tmpl,
-    size_t L,
-    float Et,
-    const rxopt::RealSyncTemplate& real_tmpl,
-    size_t fold_symbols,
-    float threshold,
-    const rxopt::SparseCirTemplate* sparse_tmpl,
-    std::vector<std::complex<float>>* fold_buf,
-    const rxopt::ShapedSparseTemplate* shaped_tmpl)
-{
-    FoldAcquireResult res;
-    const int64_t P = static_cast<int64_t>(kQm35SamplesPerSymbol);
-    const int64_t Li = static_cast<int64_t>(L);
-    const bool have_sparse = sparse_tmpl && sparse_tmpl->code_energy > 0.0f;
-    const bool have_shaped = shaped_tmpl && shaped_tmpl->valid;
-    if (!rx || L == 0 || n < L || fold_symbols == 0 || probe < 0 ||
-        (!tmpl && !have_sparse && !have_shaped))
-        return res;
-    if (fold_symbols > static_cast<size_t>(P))
-        fold_symbols = static_cast<size_t>(P);
-    const int64_t K = static_cast<int64_t>(fold_symbols);
-    // Buffer covers one period of possible start phases plus the template.
-    const int64_t fold_len = P + Li - 1;
-    // The deepest sample is probe + (K-1)*P + fold_len - 1.
-    if (probe + K * P + Li - 1 > static_cast<int64_t>(n))
-        return res;
-
-    std::vector<std::complex<float>> local_folded;
-    std::vector<std::complex<float>>& folded =
-        fold_buf ? *fold_buf : local_folded;
-    const size_t flen = static_cast<size_t>(fold_len);
-    if (folded.size() < flen)
-        folded.resize(flen);
-    std::fill(folded.begin(), folded.begin() + flen,
-              std::complex<float>(0.0f, 0.0f));
-    for (int64_t k = 0; k < K; ++k)
-        fold_accumulate(folded.data(), rx + probe + k * P, flen, 0.0);
-
-    const float* real_taps = real_tmpl.is_real && real_tmpl.length == L
-        ? real_tmpl.taps_dup.data() : nullptr;
-    const rxopt::SyncMatchedFilter filter(tmpl, L, real_taps, sparse_tmpl,
-                                          true, shaped_tmpl);
-    if (shaped_tmpl && shaped_tmpl->valid)
-        Et = shaped_tmpl->energy;
-    else if (sparse_tmpl && sparse_tmpl->code_energy > 0.0f)
-        Et = sparse_tmpl->code_energy;
-    const auto peak = rxopt::scan_normalized_sync(
-        filter, folded.data(), static_cast<size_t>(P),
-        window_power_8acc(folded.data(), L), Et);
-
-    res.symbols_folded = fold_symbols;
-    res.window_lags = static_cast<size_t>(P);
-    if (!(peak.metric >= threshold))
-        return res;
-    res.ok = true;
-    res.start = probe + static_cast<int64_t>(peak.lag);
-    res.metric = peak.metric;
-    res.corr = peak.corr;
-    return res;
-}
-
-bool fold_anchor_fit(const std::complex<float>* rx,
-                     size_t n,
-                     int64_t start,
-                     const std::complex<float>* tmpl,
-                     size_t L,
-                     float Et,
-                     const rxopt::RealSyncTemplate& real_tmpl,
-                     size_t groups,
-                     double* period_out,
-                     int64_t* preamble_start_out,
-                     std::vector<int64_t>& peak_samples,
-                     std::vector<float>& peak_metrics,
-                     std::vector<std::complex<float>>& peak_corr,
-                     double phase_per_symbol,
-                     const rxopt::SparseCirTemplate* sparse_tmpl,
-                     std::vector<std::complex<float>>* sup_buf,
-                     const rxopt::ShapedSparseTemplate* shaped_tmpl)
-{
-    peak_samples.clear();
-    peak_metrics.clear();
-    peak_corr.clear();
-    const int64_t P = static_cast<int64_t>(kQm35SamplesPerSymbol);
-    const int64_t Li = static_cast<int64_t>(L);
-    const int64_t refine = kFoldAnchorRefine;
-    const size_t sup_len = L + 2 * static_cast<size_t>(refine);
-    if (groups < 2 || L == 0 || !rx ||
-        (!tmpl && !(sparse_tmpl && sparse_tmpl->code_energy > 0.0f) &&
-         !(shaped_tmpl && shaped_tmpl->valid)))
-        return false;
-
-    std::vector<std::complex<float>> local_sup;
-    std::vector<std::complex<float>>& sup = sup_buf ? *sup_buf : local_sup;
-    if (sup.size() < sup_len)
-        sup.resize(sup_len);
-    const float* real_taps = real_tmpl.is_real && real_tmpl.length == L
-        ? real_tmpl.taps_dup.data() : nullptr;
-    const rxopt::SyncMatchedFilter filter(tmpl, L, real_taps, sparse_tmpl,
-                                          true, shaped_tmpl);
-    if (shaped_tmpl && shaped_tmpl->valid)
-        Et = shaped_tmpl->energy;
-    else if (sparse_tmpl && sparse_tmpl->code_energy > 0.0f)
-        Et = sparse_tmpl->code_energy;
-
-    LinearFit fit;
-    size_t used = 0;
-    for (size_t g = 0; g < groups; ++g) {
-        const int64_t base =
-            start + static_cast<int64_t>(g) *
-                        static_cast<int64_t>(kFoldAnchorGroupSymbols) * P -
-            refine;
-        if (base < 0)
-            continue;
-        if (base + static_cast<int64_t>(sup_len) +
-                static_cast<int64_t>(kFoldAnchorGroupSymbols - 1) * P >
-            static_cast<int64_t>(n))
-            continue;
-        std::fill(sup.begin(), sup.end(), std::complex<float>(0.0f, 0.0f));
-        for (int64_t j = 0; j < static_cast<int64_t>(kFoldAnchorGroupSymbols);
-             ++j)
-            fold_accumulate(sup.data(), rx + base + j * P, sup_len,
-                            -j * phase_per_symbol);
-        const auto peak = rxopt::scan_normalized_sync(
-            filter, sup.data(), sup_len - L + 1,
-            window_power_8acc(sup.data(), L), Et);
-        const int64_t pos = base + static_cast<int64_t>(peak.lag);
-        const double x = static_cast<double>(
-            static_cast<int64_t>(g) *
-            static_cast<int64_t>(kFoldAnchorGroupSymbols));
-        const double y = static_cast<double>(pos + Li - 1);
-        fit.add(x, y);
-        ++used;
-    }
-    if (used < 2)
-        return false;
-    const double denom = fit.determinant();
-    if (!(std::abs(denom) > 1e-9))
-        return false;
-    const double p = fit.slope(denom);
-    if (!std::isfinite(p) || !(p > 0.0))
-        return false;
-    // Same 0.5% sanity gate the LockedBounded anchor fit uses: a period that
-    // far off the nominal grid means the anchors did not land on the expected
-    // symbol indices at all.
-    if (std::abs(p - static_cast<double>(P)) > 0.005 * static_cast<double>(P))
-        return false;
-    const double intercept_end = fit.intercept(p);
-
-    // Sample complex correlation on the fitted linear timing grid rather than
-    // at each block's independent argmax lag, so multipath tap hopping within
-    // +-refine does not inject phase jumps into fit_cfo().  When the fitted
-    // drift across the preamble is < 1.5 samples, snap to the exact integer
-    // period P around the midpoint so llround() cannot step 1 sample across
-    // multipath taps mid-preamble.
-    const double span_syms = static_cast<double>(
-        (groups - 1) * kFoldAnchorGroupSymbols);
-    const double mid_x = 0.5 * span_syms;
-    const bool lock_integer_grid =
-        std::abs(p - static_cast<double>(P)) * span_syms < 1.5;
-    const int64_t grid_origin_end = std::llround(
-        intercept_end + (p - static_cast<double>(P)) * mid_x);
-    for (size_t g = 0; g < groups; ++g) {
-        const int64_t sym_idx = static_cast<int64_t>(g) *
-                                static_cast<int64_t>(kFoldAnchorGroupSymbols);
-        const double x = static_cast<double>(sym_idx);
-        const int64_t fitted_end = lock_integer_grid
-            ? (grid_origin_end + sym_idx * P)
-            : std::llround(intercept_end + p * x);
-        const int64_t fitted_start = fitted_end - (Li - 1);
-        if (fitted_start < 0)
-            continue;
-        if (fitted_start + Li +
-                static_cast<int64_t>(kFoldAnchorGroupSymbols - 1) * P >
-            static_cast<int64_t>(n))
-            continue;
-        std::fill(sup.begin(), sup.begin() + static_cast<ptrdiff_t>(L),
-                  std::complex<float>(0.0f, 0.0f));
-        for (int64_t j = 0; j < static_cast<int64_t>(kFoldAnchorGroupSymbols);
-             ++j)
-            fold_accumulate(sup.data(), rx + fitted_start + j * P, L,
-                            -j * phase_per_symbol);
-        const std::complex<float> corr = filter.dot(sup.data());
-        float rx_energy = 0.0f;
-        for (size_t k = 0; k < L; ++k)
-            rx_energy += std::norm(sup[k]);
-        const float denom_e = std::sqrt(std::max(1e-12f, rx_energy * Et));
-        const float metric =
-            denom_e > 0.0f ? std::abs(corr) / denom_e : 0.0f;
-        peak_samples.push_back(fitted_end);
-        peak_metrics.push_back(metric);
-        peak_corr.push_back(corr);
-    }
-    if (peak_samples.size() < 2)
-        return false;
-    *period_out = p;
-    *preamble_start_out = std::max<int64_t>(
-        0, static_cast<int64_t>(std::llround(intercept_end)) - (Li - 1));
-    return true;
-}
-
 } // namespace detail
 
 } // namespace openuwb::demod::core
-
-namespace openuwb::demod::rxopt {
-
-void build_real_sync_template(const std::vector<std::complex<float>>& template_wf,
-                              RealSyncTemplate& out)
-{
-    out.reset();
-    if (template_wf.empty())
-        return;
-    const size_t L = template_wf.size();
-    bool real_only = true;
-    for (size_t k = 0; k < L; ++k) {
-        if (std::abs(template_wf[k].imag()) > 1e-7f) {
-            real_only = false;
-            break;
-        }
-    }
-    out.is_real = real_only;
-    out.length = L;
-    if (real_only) {
-        out.taps_dup.resize(2 * L);
-        float e = 0.0f;
-        for (size_t k = 0; k < L; ++k) {
-            const float r = template_wf[k].real();
-            out.taps_dup[2 * k] = r;
-            out.taps_dup[2 * k + 1] = r;
-            e += r * r;
-        }
-        out.energy = e;
-    }
-}
-
-uint64_t
-sfd_template_key(const std::vector<std::complex<float>>& template_wf,
-                 const std::vector<int8_t>& sfd_sequence)
-{
-    static_assert(sizeof(float) == 4, "SFD cache key assumes 32-bit float");
-    uint64_t h = detail::kFnvOffsetBasis;
-    h = detail::fnv1a_u64(h, static_cast<uint64_t>(template_wf.size()));
-    for (const std::complex<float>& v : template_wf) {
-        uint32_t re_bits = 0;
-        uint32_t im_bits = 0;
-        const float re = v.real();
-        const float im = v.imag();
-        std::memcpy(&re_bits, &re, sizeof(re_bits));
-        std::memcpy(&im_bits, &im, sizeof(im_bits));
-        h = detail::fnv1a_u32(h, re_bits);
-        h = detail::fnv1a_u32(h, im_bits);
-    }
-    h = detail::fnv1a_u64(h, static_cast<uint64_t>(sfd_sequence.size()));
-    if (!sfd_sequence.empty())
-        h = detail::fnv1a_bytes(h, sfd_sequence.data(), sfd_sequence.size());
-    return h;
-}
-
-void
-build_sfd_template(const std::vector<std::complex<float>>& template_wf,
-                   const std::vector<int8_t>& sfd_sequence,
-                   std::vector<std::complex<float>>& out)
-{
-    out.clear();
-    const size_t sym = kQm35SamplesPerSymbol;
-    if (sfd_sequence.empty() || template_wf.size() < sym)
-        return; // the legacy loop would read past the template: fail closed
-    if (sfd_sequence.size() > std::numeric_limits<size_t>::max() / sym)
-        return;
-    out.resize(sfd_sequence.size() * sym);
-    for (size_t i = 0; i < sfd_sequence.size(); ++i) {
-        const int8_t s = sfd_sequence[i];
-        for (size_t k = 0; k < sym; ++k)
-            out[i * sym + k] =
-                std::complex<float>(static_cast<float>(s) * template_wf[k].real(),
-                                    static_cast<float>(s) * template_wf[k].imag());
-    }
-    openuwb::core::uwb_l2_normalize(out);
-}
-
-namespace {
-
-#if UWB_RXOPT_HAVE_AVX2
-// Local AVX2 three-operand subtract.  Sixteen complex samples per iteration
-// (4 x 256-bit) plus one 256-bit register and a scalar tail.  Both sources are
-// loaded before dst is stored, so dst == a stays safe.
-__attribute__((target("avx2")))
-void vector_sub3_complex_avx2(std::complex<float>* dst,
-                              const std::complex<float>* a,
-                              const std::complex<float>* b, size_t count)
-{
-    float* d = reinterpret_cast<float*>(dst);
-    const float* pa = reinterpret_cast<const float*>(a);
-    const float* pb = reinterpret_cast<const float*>(b);
-    size_t i = 0;
-    const size_t limit16 = count & ~size_t(15);
-    for (; i < limit16; i += 16) {
-        const __m256 a0 = _mm256_loadu_ps(pa + 2 * i);
-        const __m256 a1 = _mm256_loadu_ps(pa + 2 * i + 8);
-        const __m256 a2 = _mm256_loadu_ps(pa + 2 * i + 16);
-        const __m256 a3 = _mm256_loadu_ps(pa + 2 * i + 24);
-        const __m256 b0 = _mm256_loadu_ps(pb + 2 * i);
-        const __m256 b1 = _mm256_loadu_ps(pb + 2 * i + 8);
-        const __m256 b2 = _mm256_loadu_ps(pb + 2 * i + 16);
-        const __m256 b3 = _mm256_loadu_ps(pb + 2 * i + 24);
-        _mm256_storeu_ps(d + 2 * i, _mm256_sub_ps(a0, b0));
-        _mm256_storeu_ps(d + 2 * i + 8, _mm256_sub_ps(a1, b1));
-        _mm256_storeu_ps(d + 2 * i + 16, _mm256_sub_ps(a2, b2));
-        _mm256_storeu_ps(d + 2 * i + 24, _mm256_sub_ps(a3, b3));
-    }
-    for (; i + 4 <= count; i += 4) {
-        const __m256 va = _mm256_loadu_ps(pa + 2 * i);
-        const __m256 vb = _mm256_loadu_ps(pb + 2 * i);
-        _mm256_storeu_ps(d + 2 * i, _mm256_sub_ps(va, vb));
-    }
-    for (; i < count; ++i)
-        dst[i] = a[i] - b[i];
-}
-
-// Fused AVX2 dst = a - b + double energies.  Eight complex samples per
-// iteration (2 x 256-bit loads = four 128-bit halves per energy), four
-// independent __m256d accumulators per energy -- the same structure as
-// compute_roi_energies() in lib/sic/uwb_sic_unified.cc.  Squares are formed in
-// float and widened to double, matching that reference and the AVX-512 kernel.
-__attribute__((target("avx2")))
-void vector_sub3_energy_complex_avx2(std::complex<float>* dst,
-                                     const std::complex<float>* a,
-                                     const std::complex<float>* b,
-                                     size_t count, double& e_a,
-                                     double& e_dst)
-{
-    float* d = reinterpret_cast<float*>(dst);
-    const float* pa = reinterpret_cast<const float*>(a);
-    const float* pb = reinterpret_cast<const float*>(b);
-
-    __m256d ea0 = _mm256_setzero_pd();
-    __m256d ea1 = _mm256_setzero_pd();
-    __m256d ea2 = _mm256_setzero_pd();
-    __m256d ea3 = _mm256_setzero_pd();
-    __m256d ed0 = _mm256_setzero_pd();
-    __m256d ed1 = _mm256_setzero_pd();
-    __m256d ed2 = _mm256_setzero_pd();
-    __m256d ed3 = _mm256_setzero_pd();
-
-    size_t i = 0;
-    const size_t limit8 = count & ~size_t(7);
-    for (; i < limit8; i += 8) {
-        // Load a before overwriting dst, so dst == a is safe.
-        const __m256 va0 = _mm256_loadu_ps(pa + 2 * i);
-        const __m256 va1 = _mm256_loadu_ps(pa + 2 * i + 8);
-        const __m256 vb0 = _mm256_loadu_ps(pb + 2 * i);
-        const __m256 vb1 = _mm256_loadu_ps(pb + 2 * i + 8);
-        const __m256 vd0 = _mm256_sub_ps(va0, vb0);
-        const __m256 vd1 = _mm256_sub_ps(va1, vb1);
-        _mm256_storeu_ps(d + 2 * i, vd0);
-        _mm256_storeu_ps(d + 2 * i + 8, vd1);
-
-        const __m256 sa0 = _mm256_mul_ps(va0, va0);
-        const __m256 sa1 = _mm256_mul_ps(va1, va1);
-        const __m256 sd0 = _mm256_mul_ps(vd0, vd0);
-        const __m256 sd1 = _mm256_mul_ps(vd1, vd1);
-
-        ea0 = _mm256_add_pd(
-            ea0, _mm256_cvtps_pd(_mm256_castps256_ps128(sa0)));
-        ea1 = _mm256_add_pd(
-            ea1, _mm256_cvtps_pd(_mm256_extractf128_ps(sa0, 1)));
-        ea2 = _mm256_add_pd(
-            ea2, _mm256_cvtps_pd(_mm256_castps256_ps128(sa1)));
-        ea3 = _mm256_add_pd(
-            ea3, _mm256_cvtps_pd(_mm256_extractf128_ps(sa1, 1)));
-
-        ed0 = _mm256_add_pd(
-            ed0, _mm256_cvtps_pd(_mm256_castps256_ps128(sd0)));
-        ed1 = _mm256_add_pd(
-            ed1, _mm256_cvtps_pd(_mm256_extractf128_ps(sd0, 1)));
-        ed2 = _mm256_add_pd(
-            ed2, _mm256_cvtps_pd(_mm256_castps256_ps128(sd1)));
-        ed3 = _mm256_add_pd(
-            ed3, _mm256_cvtps_pd(_mm256_extractf128_ps(sd1, 1)));
-    }
-
-    alignas(32) double buf[4];
-    _mm256_storeu_pd(buf, _mm256_add_pd(_mm256_add_pd(ea0, ea1),
-                                        _mm256_add_pd(ea2, ea3)));
-    double sum_a = buf[0] + buf[1] + buf[2] + buf[3];
-    _mm256_storeu_pd(buf, _mm256_add_pd(_mm256_add_pd(ed0, ed1),
-                                        _mm256_add_pd(ed2, ed3)));
-    double sum_dst = buf[0] + buf[1] + buf[2] + buf[3];
-
-    for (; i < count; ++i) {
-        const float ar = pa[2 * i];
-        const float ai = pa[2 * i + 1];
-        const float dr = ar - pb[2 * i];
-        const float di = ai - pb[2 * i + 1];
-        d[2 * i] = dr;
-        d[2 * i + 1] = di;
-        sum_a += static_cast<double>(ar * ar) +
-                 static_cast<double>(ai * ai);
-        sum_dst += static_cast<double>(dr * dr) +
-                   static_cast<double>(di * di);
-    }
-
-    e_a = sum_a;
-    e_dst = sum_dst;
-}
-#endif
-
-} // namespace
-
-void vector_accumulate_complex(std::complex<float>* dst,
-                               const std::complex<float>* src,
-                               size_t count)
-{
-    if (count == 0)
-        return;
-#if UWB_SIMD_HAVE_AVX512
-    if (use_avx512(openuwb::core::simd::KernelGroup::Sync)) {
-        openuwb::core::simd::avx512::accumulate_cf32(dst, src, count);
-        return;
-    }
-#endif
-#if UWB_RXOPT_HAVE_AVX2
-    if (has_avx2_fma()) {
-        vector_accumulate_complex_avx2(dst, src, count);
-        return;
-    }
-#endif
-    for (size_t m = 0; m < count; ++m)
-        dst[m] += src[m];
-}
-
-void vector_sub_complex(std::complex<float>* dst,
-                        const std::complex<float>* src,
-                        size_t count)
-{
-    if (count == 0)
-        return;
-#if UWB_SIMD_HAVE_AVX512
-    if (use_avx512(openuwb::core::simd::KernelGroup::Sync)) {
-        openuwb::core::simd::avx512::sub_cf32(dst, src, count);
-        return;
-    }
-#endif
-#if UWB_RXOPT_HAVE_AVX2
-    if (has_avx2_fma()) {
-        vector_sub_complex_avx2(dst, src, count);
-        return;
-    }
-#endif
-    for (size_t m = 0; m < count; ++m)
-        dst[m] -= src[m];
-}
-
-void vector_sub3_complex(std::complex<float>* dst,
-                         const std::complex<float>* a,
-                         const std::complex<float>* b,
-                         size_t count)
-{
-    if (count == 0)
-        return;
-#if UWB_SIMD_HAVE_AVX512
-    if (use_avx512(openuwb::core::simd::KernelGroup::Sync)) {
-        openuwb::core::simd::avx512::sub3_cf32(dst, a, b, count);
-        return;
-    }
-#endif
-#if UWB_RXOPT_HAVE_AVX2
-    if (has_avx2_fma()) {
-        vector_sub3_complex_avx2(dst, a, b, count);
-        return;
-    }
-#endif
-    for (size_t m = 0; m < count; ++m)
-        dst[m] = a[m] - b[m];
-}
-
-void vector_sub3_energy_complex(std::complex<float>* dst,
-                                const std::complex<float>* a,
-                                const std::complex<float>* b, size_t count,
-                                double& e_a, double& e_dst)
-{
-    // Overwrite (never accumulate into) the caller's energies on entry.
-    e_a = 0.0;
-    e_dst = 0.0;
-    if (count == 0)
-        return;
-#if UWB_SIMD_HAVE_AVX512
-    if (use_avx512(openuwb::core::simd::KernelGroup::Sync)) {
-        openuwb::core::simd::avx512::sub3_energy_cf32(dst, a, b, count, &e_a,
-                                                      &e_dst);
-        return;
-    }
-#endif
-#if UWB_RXOPT_HAVE_AVX2
-    if (has_avx2_fma()) {
-        vector_sub3_energy_complex_avx2(dst, a, b, count, e_a, e_dst);
-        return;
-    }
-#endif
-    // Scalar double fallback: float squares widened to double, NaN/Inf
-    // propagate through the IEEE default so isfinite(e_dst) still fails.
-    double sum_a = 0.0;
-    double sum_dst = 0.0;
-    for (size_t m = 0; m < count; ++m) {
-        const float ar = a[m].real();
-        const float ai = a[m].imag();
-        const float dr = ar - b[m].real();
-        const float di = ai - b[m].imag();
-        dst[m] = std::complex<float>(dr, di);
-        sum_a += static_cast<double>(ar * ar) +
-                 static_cast<double>(ai * ai);
-        sum_dst += static_cast<double>(dr * dr) +
-                   static_cast<double>(di * di);
-    }
-    e_a = sum_a;
-    e_dst = sum_dst;
-}
-
-void vector_accumulate_scaled_complex(std::complex<float>* dst,
-                                      const std::complex<float>* src,
-                                      std::complex<float> alpha,
-                                      size_t count)
-{
-    if (count == 0)
-        return;
-#if UWB_RXOPT_HAVE_AVX2
-    if (has_avx2_fma()) {
-        vector_accumulate_scaled_complex_avx2(dst, src, alpha.real(),
-                                              alpha.imag(), count);
-        return;
-    }
-#endif
-    for (size_t j = 0; j < count; ++j)
-        dst[j] += alpha * src[j];
-}
-
-void vector_mul_complex(std::complex<float>* dst,
-                        const std::complex<float>* mul,
-                        size_t count)
-{
-    if (count == 0)
-        return;
-#if UWB_RXOPT_HAVE_AVX2
-    if (has_avx2_fma()) {
-        vector_mul_complex_avx2(dst, mul, count);
-        return;
-    }
-#endif
-    for (size_t j = 0; j < count; ++j)
-        dst[j] *= mul[j];
-}
-
-void vector_scale_complex(std::complex<float>* dst,
-                          float scale,
-                          size_t count)
-{
-    if (count == 0)
-        return;
-#if UWB_SIMD_HAVE_AVX512
-    if (use_avx512(openuwb::core::simd::KernelGroup::Sync)) {
-        openuwb::core::simd::avx512::scale_cf32(dst, scale, count);
-        return;
-    }
-#endif
-#if UWB_RXOPT_HAVE_AVX2
-    if (has_avx2_fma()) {
-        vector_scale_complex_avx2(dst, scale, count);
-        return;
-    }
-#endif
-    for (size_t m = 0; m < count; ++m)
-        dst[m] *= scale;
-}
-
-void fold_sfd_window(const std::complex<float>* rx_base,
-                     size_t sym,
-                     const int8_t* sfd_seq,
-                     size_t sfd_len,
-                     size_t fold_len,
-                     std::complex<float>* out)
-{
-    if (!rx_base || !sfd_seq || !out || sym == 0 || sfd_len == 0 || fold_len == 0)
-        return;
-#if UWB_SIMD_HAVE_AVX512
-    if (use_avx512(openuwb::core::simd::KernelGroup::Sync)) {
-        // Batched: the whole symbol loop runs inside the wide translation
-        // unit, so the fold pays one call instead of one per symbol.
-        openuwb::core::simd::avx512::fold_sfd_window(rx_base, sym, sfd_seq,
-                                                     sfd_len, fold_len, out);
-        return;
-    }
-#endif
-#if UWB_RXOPT_HAVE_AVX2
-    if (has_avx2_fma()) {
-        fold_sfd_window_avx2(rx_base, sym, sfd_seq, sfd_len, fold_len, out);
-        return;
-    }
-#endif
-    size_t idx[8];
-    int8_t sg[8];
-    bool have_out = false;
-    for (size_t chunk = 0; chunk < sfd_len; chunk += 8) {
-        const size_t chunk_end = std::min(chunk + 8, sfd_len);
-        size_t cnt = 0;
-        for (size_t i = chunk; i < chunk_end; ++i) {
-            if (sfd_seq[i] == 0)
-                continue;
-            idx[cnt] = i;
-            sg[cnt] = sfd_seq[i];
-            ++cnt;
-        }
-        if (cnt == 0)
-            continue;
-        const bool first_chunk = !have_out;
-        for (size_t k = 0; k < fold_len; ++k) {
-            size_t j = 0;
-            std::complex<float> acc;
-            if (first_chunk) {
-                const std::complex<float> v = rx_base[idx[0] * sym + k];
-                acc = (sg[0] == 1) ? v : std::complex<float>(0.0f, 0.0f) - v;
-                j = 1;
-            } else {
-                acc = out[k];
-            }
-            for (; j < cnt; ++j) {
-                const std::complex<float> v = rx_base[idx[j] * sym + k];
-                acc = (sg[j] == 1) ? acc + v : acc - v;
-            }
-            out[k] = acc;
-        }
-        have_out = true;
-    }
-    if (!have_out)
-        std::fill(out, out + fold_len, std::complex<float>(0.0f, 0.0f));
-}
-
-void build_rotation_ramp(double w, size_t count,
-                         std::complex<float>* table)
-{
-    if (count == 0)
-        return;
-    constexpr size_t kB = 1024;
-    const float s4r = static_cast<float>(std::cos(-4.0 * w));
-    const float s4i = static_cast<float>(std::sin(-4.0 * w));
-    for (size_t b0 = 0; b0 < count; b0 += kB) {
-        const size_t b1 = std::min(count, b0 + kB);
-        float cr[4], ci[4];
-        for (int c = 0; c < 4; ++c) {
-            const double ph = -w * static_cast<double>(b0 + c);
-            cr[c] = static_cast<float>(std::cos(ph));
-            ci[c] = static_cast<float>(std::sin(ph));
-        }
-        size_t i = b0;
-        for (; i + 4 <= b1; i += 4) {
-            for (int c = 0; c < 4; ++c) {
-                table[i + c] = std::complex<float>(cr[c], ci[c]);
-                const float nr = cr[c] * s4r - ci[c] * s4i;
-                const float ni = cr[c] * s4i + ci[c] * s4r;
-                cr[c] = nr;
-                ci[c] = ni;
-            }
-        }
-        for (; i < b1; ++i) {
-            const double ph = -w * static_cast<double>(i);
-            table[i] = std::complex<float>(static_cast<float>(std::cos(ph)),
-                                           static_cast<float>(std::sin(ph)));
-        }
-    }
-}
-
-void build_sparse_cir_template(const int8_t* code,
-                               size_t code_len,
-                               SparseCirTemplate& tmpl)
-{
-    tmpl.reset();
-    tmpl.key = cir_template_key(code, code_len);
-    const std::vector<int8_t> spread = BuildSampledCode(code, code_len);
-    tmpl.entries.reserve(code_len);
-    for (size_t j = 0; j < spread.size(); ++j) {
-        if (spread[j] != 0) {
-            const size_t pos = 2 * j;
-            tmpl.entries.push_back({ pos, spread[j] });
-            if (spread[j] > 0) {
-                tmpl.pos_offsets.push_back(2 * pos);
-                if (tmpl.pos_count < kMaxSparseCirOffsets)
-                    tmpl.pos_off[tmpl.pos_count++] =
-                        static_cast<uint16_t>(2 * pos);
-            } else {
-                tmpl.neg_offsets.push_back(2 * pos);
-                if (tmpl.neg_count < kMaxSparseCirOffsets)
-                    tmpl.neg_off[tmpl.neg_count++] =
-                        static_cast<uint16_t>(2 * pos);
-            }
-        }
-    }
-    tmpl.code_energy = static_cast<float>(tmpl.entries.size());
-}
-
-void build_half_rate_sparse_template(const SparseCirTemplate& full,
-                                     SparseCirTemplate& half)
-{
-    half.reset();
-    half.key = full.key ^ 0x9e3779b97f4a7c15ULL;
-    half.code_energy = full.code_energy;
-    half.entries.reserve(full.entries.size());
-    for (const auto& e : full.entries)
-        half.entries.push_back({ e.pos / 2, e.sign });
-    half.pos_offsets.reserve(full.pos_offsets.size());
-    for (const size_t off : full.pos_offsets)
-        half.pos_offsets.push_back(off / 2);
-    half.neg_offsets.reserve(full.neg_offsets.size());
-    for (const size_t off : full.neg_offsets)
-        half.neg_offsets.push_back(off / 2);
-    half.pos_count = full.pos_count;
-    for (size_t i = 0; i < full.pos_count; ++i)
-        half.pos_off[i] = static_cast<uint16_t>(full.pos_off[i] / 2);
-    half.neg_count = full.neg_count;
-    for (size_t i = 0; i < full.neg_count; ++i)
-        half.neg_off[i] = static_cast<uint16_t>(full.neg_off[i] / 2);
-}
-
-bool build_shaped_sparse_template(const std::complex<float>* tmpl,
-                                  size_t len,
-                                  const SparseCirTemplate& code,
-                                  ShapedSparseTemplate& out)
-{
-    out.reset();
-    if (!tmpl || len < 32 || code.entries.empty() ||
-        code.entries.size() > kMaxSparseCirOffsets)
-        return false;
-    const SparseCirEntry& first = code.entries.front();
-    const size_t base = first.pos;
-    const size_t last = code.entries.back().pos;
-    if (first.sign == 0 || base >= len || last >= len)
-        return false;
-    const size_t nt = std::min(ShapedSparseTemplate::kMaxPulse, len - last);
-    if (nt < 3)
-        return false;
-
-    double energy = 0.0;
-    double imag_energy = 0.0;
-    for (size_t k = 0; k < len; ++k) {
-        energy += static_cast<double>(std::norm(tmpl[k]));
-        imag_energy += static_cast<double>(tmpl[k].imag()) *
-                       static_cast<double>(tmpl[k].imag());
-    }
-    if (energy <= 0.0 || imag_energy > 1e-12 * energy)
-        return false;
-
-    // First pulse is uncontaminated up to the next chip (8 samples).
-    const float sign0 = static_cast<float>(first.sign);
-    for (size_t k = 0; k < nt; ++k)
-        out.pulse[k] = tmpl[base + k].real() / sign0;
-
-    // Reconstruction gate. The residual is the omitted pulse tail, which is
-    // ~0.3% of the energy for kPulse48; anything above 5% is not code*p.
-    double resid = 0.0;
-    for (const auto& e : code.entries) {
-        for (size_t k = 0; k < nt; ++k) {
-            const size_t idx = e.pos + k;
-            if (idx >= len)
-                break;
-            const double rec =
-                static_cast<double>(e.sign) * out.pulse[k];
-            const double d = rec - tmpl[idx].real();
-            resid += d * d;
-        }
-    }
-    if (!(resid <= 0.05 * energy))
-        return false;
-
-    out.code = code;
-    out.nt = static_cast<uint8_t>(nt);
-    out.energy = static_cast<float>(energy);
-    out.key = shaped_template_key(tmpl, len) ^ code.key;
-    out.valid = true;
-    return true;
-}
-
-const ShapedSparseTemplate* ensure_shaped_sparse_template(
-    const std::complex<float>* tmpl, size_t len,
-    const SparseCirTemplate& code, ShapedSparseTemplate& out)
-{
-    const uint64_t key = shaped_template_key(tmpl, len) ^ code.key;
-    if (out.valid && out.key == key)
-        return &out;
-    if (!build_shaped_sparse_template(tmpl, len, code, out))
-        return nullptr;
-    return &out;
-}
-
-MatchedFilterPeak scan_normalized_sync(const SyncMatchedFilter& filter,
-                                       const std::complex<float>* rx,
-                                       size_t lag_count,
-                                       float power,
-                                       float template_energy,
-                                       float* metrics)
-{
-    MatchedFilterPeak peak;
-    filter.for_each_lag(rx, lag_count, [&](size_t lag, std::complex<float> corr, bool) {
-        const float metric =
-            openuwb::core::normalized_correlation_power(corr, power, template_energy);
-        if (metrics)
-            metrics[lag] = metric;
-        if (metric > peak.metric)
-            peak = { lag, metric, corr };
-        if (lag + 1 < lag_count)
-            power += std::norm(rx[lag + filter.length()]) - std::norm(rx[lag]);
-    });
-    return peak;
-}
-
-MatchedFilterPeak scan_raw_sync(const SyncMatchedFilter& filter,
-                                const std::complex<float>* rx,
-                                size_t lag_count,
-                                float* powers)
-{
-    MatchedFilterPeak peak;
-    filter.for_each_lag(rx, lag_count, [&](size_t lag, std::complex<float> corr, bool) {
-        const float power = std::norm(corr);
-        powers[lag] = power;
-        if (power > peak.metric)
-            peak = { lag, power, corr };
-    });
-    return peak;
-}
-
-void correlate_cir_sparse_raw(const std::complex<float>* corr,
-                              const SparseCirTemplate& tmpl,
-                              size_t tap_count,
-                              std::complex<float>* values)
-{
-    if (tap_count == 0)
-        return;
-    const SyncMatchedFilter filter(nullptr, 0, nullptr, &tmpl);
-    filter.for_each_lag(corr, tap_count, [&](size_t lag, std::complex<float> acc, bool) {
-        values[lag] = acc;
-    });
-}
-
-void correlate_cir_sparse(const std::complex<float>* corr,
-                          const SparseCirTemplate& tmpl,
-                          size_t tap_count,
-                          std::complex<float>* values)
-{
-    if (tap_count == 0 || tmpl.code_energy <= 0.0f)
-        return;
-    correlate_cir_sparse_raw(corr, tmpl, tap_count, values);
-    for (size_t i = 0; i < tap_count; ++i)
-        values[i] /= tmpl.code_energy;
-}
-
-void correlate_cir_sparse(const std::complex<float>* corr,
-                          const SparseCirTemplate& tmpl,
-                          size_t tap_count,
-                          std::vector<std::complex<float>>& values)
-{
-    values.resize(tap_count);
-    if (tmpl.code_energy <= 0.0f || tap_count == 0)
-        return;
-    correlate_cir_sparse(corr, tmpl, tap_count, values.data());
-}
-
-} // namespace openuwb::demod::rxopt

@@ -381,6 +381,10 @@ bool refit_tail_cfo_and_rotate_anchored_prefix(
     // SYNC, so the whole preamble grid (minus the startup exclusion) is a
     // measured interval: no 40-SYMBOL tail retrack, no zero placeholders, and
     // a coherent baseline ~sqrt(232/40) longer than the old tail fit.
+    // TODO(cfo-perf): If Stage-3 latency (~50 us, ~40 us in 232-symbol SIMD
+    // sampling) becomes a bottleneck, consider stride-2 subsampling across the
+    // same 232-symbol span (116 symbols + 512-pt FFT, saving ~20-24 us while
+    // keeping +/-250 kHz unambiguous range; verify low-SNR CRLB / Std impact).
     const size_t n_rep = profile.preamble_repetitions;
     const size_t k_min = std::max<size_t>(8, profile.cfo_min_fit_repetitions);
     const size_t avail_skip = (n_rep > k_min) ? (n_rep - k_min) : 0;

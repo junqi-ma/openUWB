@@ -52,6 +52,27 @@ struct SfdAnchorConfig {
     Qm35825Profile cfo_anchor_profile;
 };
 
+// The derotation kernels (the vector block form and the legacy recurrence)
+// restart their phase from the FIRST sample of the requested range, so two
+// overlapping rotations started at different origins differ by up to ~2e-5.
+// Rounding every rotation outward to the kernel's 1024-sample absolute block
+// grid makes each output sample a pure function of its index, which is what
+// lets the SFD stage extend its coverage incrementally without perturbing the
+// bits it has already rotated.
+constexpr size_t kRotationAlign = 1024;
+
+SampleRange align_rotation_range(const SampleRange& range, size_t n)
+{
+    if (range.empty())
+        return range;
+    SampleRange aligned = range;
+    aligned.lo = (aligned.lo / kRotationAlign) * kRotationAlign;
+    const size_t hi_up =
+        ((aligned.hi + kRotationAlign - 1) / kRotationAlign) * kRotationAlign;
+    aligned.hi = std::min(n, hi_up);
+    return aligned;
+}
+
 RotationStepResult rotate_window_range(
     const std::complex<float>* rx,
     size_t n,
@@ -63,13 +84,59 @@ RotationStepResult rotate_window_range(
     DemodResult& res)
 {
     RotationStepResult step;
-    derotate_cfo_range(rx, n, profile, cfo_hz, range.lo, range.hi,
+    const SampleRange aligned = align_rotation_range(range, n);
+    derotate_cfo_range(rx, n, profile, cfo_hz, aligned.lo, aligned.hi,
                        scratch, step.rotate_us, step.kernel);
     res.stage_cfo_rotate_us += step.rotate_us;
     res.stage_cfo_rotation_kernels |= (step.kernel ? kernel_flag : 0u);
-    res.stage_cfo_rotated_samples += range.size();
+    res.stage_cfo_rotated_samples += aligned.size();
     ++res.stage_cfo_rotation_passes;
     return step;
+}
+
+uint64_t ensure_derotated_range(
+    const std::complex<float>* rx,
+    size_t n,
+    const Qm35825Profile& profile,
+    double cfo_hz,
+    int64_t req_lo,
+    int64_t req_hi,
+    SyncBootstrapState& sync_state,
+    DemodScratch& scratch,
+    DemodResult& res)
+{
+    const SampleRange req =
+        align_rotation_range(clamp_sample_range(req_lo, req_hi, n), n);
+    if (req.empty())
+        return 0;
+    DerotatedSpan& span = sync_state.derotated_span;
+    const bool compatible =
+        span.valid && span.cfo_hz == cfo_hz && span.phase_origin_sample == 0;
+    uint64_t total_us = 0;
+    if (!compatible) {
+        const RotationStepResult step = rotate_window_range(
+            rx, n, profile, cfo_hz, req, 2u, scratch, res);
+        total_us += step.rotate_us;
+        span = DerotatedSpan{req, cfo_hz, 0, true};
+        return total_us;
+    }
+    if (span.range.covers(req))
+        return 0;
+    if (req.lo < span.range.lo) {
+        const SampleRange gap{req.lo, std::min(req.hi, span.range.lo)};
+        if (!gap.empty())
+            total_us += rotate_window_range(
+                rx, n, profile, cfo_hz, gap, 2u, scratch, res).rotate_us;
+    }
+    if (req.hi > span.range.hi) {
+        const SampleRange gap{std::max(req.lo, span.range.hi), req.hi};
+        if (!gap.empty())
+            total_us += rotate_window_range(
+                rx, n, profile, cfo_hz, gap, 2u, scratch, res).rotate_us;
+    }
+    span.range.lo = std::min(span.range.lo, req.lo);
+    span.range.hi = std::max(span.range.hi, req.hi);
+    return total_us;
 }
 
 bool search_sfd_with_wide_rescue(
@@ -79,23 +146,19 @@ bool search_sfd_with_wide_rescue(
     const std::vector<int8_t>& sfd_seq,
     const std::vector<std::complex<float>>& template_wf,
     size_t sfd_len,
+    SyncBootstrapState& sync_state,
     DemodScratch& scratch,
     DemodResult& res)
 {
+    (void)sfd_len;
     return stage_sfd(
         scratch.derotated.data(), n, profile, res.timing, sfd_seq, template_wf,
-        res.sfd, scratch, [&]() {
-            SampleRange wide_range = compute_sfd_window_range(
-                n, res.timing, profile.preamble_repetitions, sfd_len, true);
-            if (profile.sync_strategy != SyncStrategy::LockedBounded &&
-                res.timing.preamble_start_sample >= 0) {
-                const size_t pre_lo =
-                    static_cast<size_t>(res.timing.preamble_start_sample);
-                if (pre_lo < wide_range.lo)
-                    wide_range.lo = pre_lo;
-            }
-            (void)rotate_window_range(
-                rx, n, profile, res.cfo.cfo_hz, wide_range, 2u, scratch, res);
+        res.sfd, scratch,
+        [&](size_t lo, size_t hi) {
+            (void)ensure_derotated_range(
+                rx, n, profile, res.cfo.cfo_hz,
+                static_cast<int64_t>(lo), static_cast<int64_t>(hi),
+                sync_state, scratch, res);
         });
 }
 
@@ -277,7 +340,8 @@ bool run_initial_cfo_and_bootstrap_sfd(
     scratch.initial_timing = res.timing;
     const auto sfd_bootstrap_t0 = std::chrono::steady_clock::now();
     const bool bootstrap_sfd_ok = search_sfd_with_wide_rescue(
-        rx, n, profile, sfd_seq, template_wf, sync_state.sfd_len, scratch, res);
+        rx, n, profile, sfd_seq, template_wf, sync_state.sfd_len, sync_state,
+        scratch, res);
     res.stage_sfd_bootstrap_us = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - sfd_bootstrap_t0).count());
@@ -574,7 +638,7 @@ bool anchor_and_verify_final_sfd(
         const auto sfd_final_t0 = std::chrono::steady_clock::now();
         const bool ok = search_sfd_with_wide_rescue(
             rx, n, profile, sfd_seq, template_wf, sync_state.sfd_len,
-            scratch, res);
+            sync_state, scratch, res);
         res.stage_sfd_final_us += static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - sfd_final_t0).count());
@@ -617,28 +681,11 @@ bool anchor_and_verify_final_sfd(
     } else {
         final_sfd_ok = run_final_sfd();
     }
-    if (!final_sfd_ok && profile.rx_seed_refine_tail) {
-        // The narrow tail seed can pick a wrong local peak and still pass the
-        // per-SYNC threshold.  On a final-SFD/period inconsistency, retry the
-        // complete tail -> CFO refit -> final SFD chain with the legacy radius.
-        ++res.stage_tail_retrack_fallbacks;
-        TimingResult retry_cfo;
-        if (run_tail_retrack_and_cfo_refit(
-                rx, n, profile, template_wf, integer_grid_ok, cfg, 0,
-                scratch, res, sync_state, retry_cfo)) {
-            // Preserve the first (narrow) chain's seed diagnostics: the
-            // radius-0 retry reports zero attempts of its own.
-            retry_cfo.seed_search_us += res.timing.seed_search_us;
-            retry_cfo.seed_refine_narrow_attempts +=
-                res.timing.seed_refine_narrow_attempts;
-            retry_cfo.seed_refine_narrow_success +=
-                res.timing.seed_refine_narrow_success;
-            retry_cfo.seed_refine_fallbacks +=
-                res.timing.seed_refine_fallbacks;
-            res.timing = std::move(retry_cfo);
-            final_sfd_ok = run_final_sfd();
-        }
-    }
+    // No legacy-radius retry on a failed final SFD.  The old retry re-ran the
+    // identical CFO refit on the same raw frame (`run_tail_retrack_and_cfo_refit`
+    // ignores its `seed_radius` argument, see its `(void)seed_radius;`) and then
+    // the identical final SFD on identically derotated data, so it could never
+    // change `final_sfd_ok`.
     res.sfd_final_windows = res.sfd.search_windows;
     res.sfd_final_coarse_correlations = res.sfd.coarse_correlations;
     res.sfd_final_fine_correlations = res.sfd.fine_correlations;

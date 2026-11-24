@@ -304,6 +304,9 @@ set(UWB_UNIT_QA_SOURCES
     # Timing Stage-1 refactor (2026-11-24): K=4 fold fast path, strict gates,
     # K=64 fallback and the warm-path zero-alloc contract. Appended last.
     ${UWB_UNIT_DIR}/phy/qa_uwb_timing_refactor.cc
+    # SFD Stage-3 refactor (2026-11-24): soft polarity rescue, 0.008 low
+    # floor, incremental derotation and the zero-alloc discrete grid.
+    ${UWB_UNIT_DIR}/phy/qa_uwb_sfd_refactor.cc
 )
 
 set(UWB_SHARDED_QA_BINARIES
@@ -740,6 +743,7 @@ foreach(_t IN ITEMS
     uwb_qa_uwb_rational_resampler_core.cc
     uwb_qa_uwb_resampler_transposed.cc
     uwb_qa_uwb_timing_refactor.cc
+    uwb_qa_uwb_sfd_refactor.cc
 )
     if(TEST ${_t})
         set_tests_properties(${_t} PROPERTIES LABELS "core;rx_sic")

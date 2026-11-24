@@ -18,6 +18,7 @@ if(UWB_ENABLE_RX)
         uwb_demod_timing.cc
         uwb_demod_timing_fold.cc
         uwb_demod_cfo_sfd.cc
+        uwb_demod_sfd.cc
         uwb_demod_cfo_sampler.cc
         uwb_demod_cfo_ml.cc
         uwb_demod_softchips_payload.cc

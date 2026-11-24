@@ -176,6 +176,15 @@ struct DemodScratch {
     // Buffer for SFD window pre-folding.
     std::vector<std::complex<float>> sfd_folded;
 
+    // Stage-3 SFD discrete-grid flat scratch.  The grid can evaluate up to 8
+    // distinct integer `round(k*period) - k*sym` deltas; each delta owns a
+    // `n_sym_slots`-wide slice (<= 511 grid candidates + <= 16 SFD symbols) of
+    // these flat buffers.  A warm packet therefore sizes the slices without
+    // allocating; the 8 * 544 reserve covers the worst case.
+    std::vector<std::complex<float>> sfd_grid_sym_corr;
+    std::vector<float> sfd_grid_sym_pwr;
+    std::vector<uint8_t> sfd_grid_sym_valid;
+
     // Retained initial timing for tail re-track conditional equivalence.
     TimingResult initial_timing;
 
@@ -305,6 +314,10 @@ struct DemodScratch {
         cir_avg_tail.reserve(2048);
         cir_phase_rot.reserve(2048);
         sfd_template.reserve(8 * kQm35SamplesPerSymbol);
+        sfd_folded.reserve(4 * kQm35SamplesPerSymbol);
+        sfd_grid_sym_corr.reserve(8 * 544);
+        sfd_grid_sym_pwr.reserve(8 * 544);
+        sfd_grid_sym_valid.reserve(8 * 544);
         cached_seq.pcode.reserve(kQm35CodeLength);
         cached_seq.sfd_seq.reserve(64);
         cached_seq.sampled_pcode.reserve(2 * kQm35ChipsPerSymbol);

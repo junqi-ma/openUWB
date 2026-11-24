@@ -14,6 +14,25 @@ namespace openuwb::demod::core {
 // around the expected position, then refine the preamble start.
 // ---------------------------------------------------------------------------
 
+// Range-aware variant: before the discrete integer-symbol grid reads a sample
+// interval it calls ensure_derotated(lo, hi) so the caller can incrementally
+// rotate only the uncovered gaps instead of re-rotating a wide window.  A
+// default-constructed callback is a no-op (the caller already rotated every
+// interval the search reads), so the narrow ±64 / ±4-symbol windows behave
+// exactly as before.
+bool stage_sfd(const std::complex<float>* rx,
+               size_t n,
+               const Qm35825Profile& profile,
+               const TimingResult& timing,
+               const std::vector<int8_t>& sfd_sequence,
+               const std::vector<std::complex<float>>& template_wf,
+               SfdResult& out,
+               DemodScratch& scratch,
+               const std::function<void(size_t, size_t)>& ensure_derotated);
+
+// Backward-compatible 9-parameter form.  The legacy `prepare_grid` callback is
+// invoked once, lazily, right before the first discrete-grid pass -- exactly
+// where the pre-refactor implementation called it.
 bool stage_sfd(const std::complex<float>* rx,
                size_t n,
                const Qm35825Profile& profile,

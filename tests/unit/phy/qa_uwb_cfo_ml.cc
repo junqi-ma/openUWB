@@ -772,7 +772,19 @@ BOOST_AUTO_TEST_CASE(test_cfo_sampler_simd_equivalence)
         }
 
         double max_diff = 0.0;
-        for (size_t q = 1; q + 3 + kQm35SamplesPerSymbol <= probe.size(); ++q) {
+        // `shaped_ternary_dot_4lag` reads max_code_sample_offset + 16 samples
+        // (one 16-lag sparse batch); the four single-lag calls only need
+        // max_code_sample_offset + 11.  Bound the probe with the batch contract
+        // so the AVX2/AVX-512 kernels never read past its end.
+        size_t max_code_off = 0;
+        for (uint16_t i = 0; i < shaped.code.pos_count; ++i)
+            max_code_off = std::max<size_t>(max_code_off,
+                                            shaped.code.pos_off[i] / 2);
+        for (uint16_t i = 0; i < shaped.code.neg_count; ++i)
+            max_code_off = std::max<size_t>(max_code_off,
+                                            shaped.code.neg_off[i] / 2);
+        const size_t batch_span = max_code_off + 16;
+        for (size_t q = 1; q + batch_span <= probe.size(); ++q) {
             std::complex<float> batch[4];
             rxopt::shaped_ternary_dot_4lag(probe.data() + q, shaped, batch);
             for (size_t j = 0; j < 4; ++j) {

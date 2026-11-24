@@ -851,7 +851,11 @@ bool stage_timing(const std::complex<float>* rx,
                         best_coarse_c = acc;
                     }
                     const int64_t cnt = std::min<int64_t>(stride, j_hi + 1 - j);
-                    advance_power(j, cnt);
+                    // Only slide when another search lag remains: the final
+                    // advance would read rx[j + L] one complex sample past the
+                    // n-sample window (and its value is never consumed).
+                    if (j + cnt <= j_hi)
+                        advance_power(j, cnt);
                 }
             }
             out.coarse_search_us = static_cast<uint64_t>(

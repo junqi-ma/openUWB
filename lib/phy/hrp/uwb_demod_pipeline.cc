@@ -99,6 +99,67 @@ bool search_sfd_with_wide_rescue(
         });
 }
 
+// ---------------------------------------------------------------------------
+// ML CFO helper (see docs/OpenCode执行方案_CFO估计架构重构_2026-11-24.md §2).
+//
+// Runs the complex-domain periodogram estimator on an SFD/timing-anchored
+// preamble window and publishes it through the public CfoResult so the rest of
+// the pipeline (rotation, refit contract, telemetry) is unchanged.
+// `peak_ref` only supplies the diagnostic first/last sample coordinates.
+// ---------------------------------------------------------------------------
+bool estimate_stage_cfo_ml(
+    const std::complex<float>* rx,
+    size_t n,
+    const Qm35825Profile& profile,
+    const std::vector<std::complex<float>>& template_wf,
+    int64_t origin_sample,
+    size_t symbol_begin,
+    size_t symbol_end,
+    bool has_cfo_hint,
+    double cfo_hint_hz,
+    const TimingResult& peak_ref,
+    DemodScratch& scratch,
+    CfoResult& out)
+{
+    if (rx == nullptr || origin_sample < 0 || symbol_end <= symbol_begin)
+        return false;
+    if (symbol_end - symbol_begin < 8)
+        return false;
+
+    CfoMlConfig cfg;
+    cfg.symbol_begin = symbol_begin;
+    cfg.symbol_end = symbol_end;
+    cfg.origin_sample = origin_sample;
+    cfg.nominal_period = static_cast<double>(kQm35SamplesPerSymbol);
+    cfg.period_hint = peak_ref.measured_period;
+    cfg.cfo_hint_hz = cfo_hint_hz;
+    cfg.has_cfo_hint = has_cfo_hint;
+    cfg.sfo_from_cfo = profile.rx_sfo_from_cfo;
+    cfg.carrier_freq_hz = profile.carrier_freq_hz;
+    cfg.sample_rate_hz = profile.sample_rate;
+    cfg.max_abs_cfo_hz = 0.0;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    CfoMlResult ml;
+    if (!estimate_cfo_ml(rx, n, profile, template_wf, cfg, scratch, ml) || !ml.ok)
+        return false;
+    const uint64_t fit_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+
+    out = CfoResult{};
+    out.ok = true;
+    out.cfo_hz = ml.cfo_hz;
+    out.peaks_used = ml.symbols_used;
+    out.skipped_peaks = symbol_begin;
+    if (peak_ref.peak_samples.size() > symbol_begin)
+        out.fit_first_peak_sample = peak_ref.peak_samples[symbol_begin];
+    if (!peak_ref.peak_samples.empty())
+        out.fit_last_peak_sample = peak_ref.peak_samples.back();
+    out.fit_us = fit_us;
+    return true;
+}
+
 bool run_initial_cfo_and_bootstrap_sfd(
     const std::complex<float>* rx,
     size_t n,
@@ -109,8 +170,22 @@ bool run_initial_cfo_and_bootstrap_sfd(
     DemodResult& res,
     SyncBootstrapState& sync_state)
 {
-    // Stage 2: CFO fit + bootstrap SFD search window rotation (Task A1)
-    if (!fit_cfo(rx, n, profile, res.timing, res.cfo, scratch)) {
+    // Stage 2: ML CFO fit + bootstrap SFD search window rotation (Task A1).
+    // The safe interior window keeps the startup transient and any leading
+    // acquisition error away from the estimator; a short/abnormal frame falls
+    // back to the legacy fit so every edge case stays covered.
+    const size_t n_rep = profile.preamble_repetitions;
+    const size_t margin = (n_rep >= 16) ? std::min<size_t>(32, n_rep / 8) : 0;
+    const size_t ml_begin = margin;
+    const size_t ml_end = n_rep - margin;
+    bool cfo_ok = false;
+    if (res.timing.preamble_start_sample >= 0 && ml_end > ml_begin) {
+        cfo_ok = estimate_stage_cfo_ml(
+            rx, n, profile, template_wf, res.timing.preamble_start_sample,
+            ml_begin, ml_end, /*has_cfo_hint=*/false, 0.0, res.timing,
+            scratch, res.cfo);
+    }
+    if (!cfo_ok && !fit_cfo(rx, n, profile, res.timing, res.cfo, scratch)) {
         clock.lap(res.stage_cfo_us, res.stage_total_us);
         res.stage_cfo_fit_us += res.cfo.fit_us;
         res.status = DemodStatus::CfoFailed;
@@ -190,201 +265,15 @@ bool run_initial_cfo_and_bootstrap_sfd(
     return true;
 }
 
-bool try_reuse_initial_tail_timing(
-    const TimingResult& initial_timing,
-    const Qm35825Profile& profile,
-    const Qm35825Profile& anchor,
-    const SfdAnchorConfig& cfg,
-    size_t seed_radius,
-    TimingResult& tail_timing)
-{
-    (void)seed_radius;
-    if (!initial_timing.ok || initial_timing.peak_samples.empty() ||
-        initial_timing.peak_metrics.size() != initial_timing.peak_samples.size() ||
-        initial_timing.peak_corr.size() != initial_timing.peak_samples.size() ||
-        cfg.template_len == 0 || cfg.tail_repetitions == 0 ||
-        cfg.tail_repetitions > cfg.full_repetitions ||
-        cfg.tail_first == 0 ||
-        profile.timing_track_radius != 8 ||
-        anchor.timing_track_radius != 8 ||
-        anchor.timing_max_backtrack_symbols != 0) {
-        return false;
-    }
-
-    // The SFD anchor predicts the whole tail grid to a few samples.  Match each
-    // expected tail SYNC against Stage 1's measured peaks with a +/-2 sample
-    // tolerance instead of requiring a complete, exactly aligned train.  This
-    // keeps the cheap path on packets where a leading SYNC was missed or the
-    // period fit is half a sample off, which used to force a second 40-SYNC
-    // stage_timing run.
-    const double period = (cfg.period_hint > 0.0)
-        ? cfg.period_hint
-        : static_cast<double>(kQm35SamplesPerSymbol);
-    const int64_t lm1 = static_cast<int64_t>(cfg.template_len) - 1;
-    const size_t npk = initial_timing.peak_samples.size();
-
-    std::vector<int64_t> samples;
-    std::vector<float> metrics;
-    std::vector<std::complex<float>> corrs;
-    std::vector<size_t> indices;
-    samples.reserve(cfg.tail_repetitions);
-    metrics.reserve(cfg.tail_repetitions);
-    corrs.reserve(cfg.tail_repetitions);
-    indices.reserve(cfg.tail_repetitions);
-
-    for (size_t k = cfg.tail_first; k < cfg.full_repetitions; ++k) {
-        const int64_t rel = static_cast<int64_t>(k - cfg.tail_first);
-        const int64_t expected_end =
-            cfg.tail_start + lm1 +
-            static_cast<int64_t>(std::llround(
-                static_cast<double>(rel) * period));
-        size_t best_idx = npk;
-        int64_t best_delta = 3;
-        for (size_t i = 0; i < npk; ++i) {
-            const int64_t delta =
-                std::llabs(initial_timing.peak_samples[i] - expected_end);
-            if (delta <= 2 && delta < best_delta) {
-                best_delta = delta;
-                best_idx = i;
-            }
-        }
-        if (best_idx == npk)
-            continue;
-        const float m = initial_timing.peak_metrics[best_idx];
-        if (!std::isfinite(m) ||
-            m < anchor.radar_verification_threshold)
-            continue;
-        samples.push_back(initial_timing.peak_samples[best_idx]);
-        metrics.push_back(m);
-        corrs.push_back(initial_timing.peak_corr[best_idx]);
-        indices.push_back(k);
-    }
-
-    const size_t matched = samples.size();
-    const size_t min_matched = cfg.tail_repetitions > 4
-        ? cfg.tail_repetitions - 4
-        : cfg.tail_repetitions;
-    if (matched < min_matched)
-        return false;
-
-    tail_timing = TimingResult{};
-    tail_timing.peak_samples = std::move(samples);
-    tail_timing.peak_metrics = std::move(metrics);
-    tail_timing.peak_corr = std::move(corrs);
-    tail_timing.detected_peaks = matched;
-    tail_timing.expected_peaks = cfg.tail_repetitions;
-    tail_timing.metric = tail_timing.peak_metrics[0];
-
-    const size_t period_fit_n = matched;
-    if (period_fit_n >= 2) {
-        detail::LinearFit fit;
-        for (size_t i = 0; i < period_fit_n; ++i)
-            fit.add(static_cast<double>(indices[i]),
-                    static_cast<double>(tail_timing.peak_samples[i]));
-        const double denom = fit.determinant();
-        if (std::abs(denom) > 1e-12) {
-            tail_timing.measured_period = fit.slope(denom);
-            const double intercept_end =
-                fit.intercept(tail_timing.measured_period);
-            tail_timing.preamble_start_sample = std::max<int64_t>(
-                0, static_cast<int64_t>(std::llround(intercept_end)) - lm1);
-        } else {
-            tail_timing.measured_period =
-                static_cast<double>(kQm35SamplesPerSymbol);
-            tail_timing.preamble_start_sample = cfg.tail_start;
-        }
-    } else {
-        tail_timing.measured_period =
-            static_cast<double>(kQm35SamplesPerSymbol);
-        tail_timing.preamble_start_sample = cfg.tail_start;
-    }
-    tail_timing.ok = true;
-    return true;
-}
-
-bool retrack_tail_timing(
-    const std::complex<float>* rx,
-    size_t n,
-    const Qm35825Profile& profile,
-    const std::vector<std::complex<float>>& template_wf,
-    const SfdAnchorConfig& cfg,
-    size_t seed_radius,
-    DemodScratch& scratch,
-    DemodResult& res,
-    TimingResult& tail_timing)
-{
-    Qm35825Profile anchor = cfg.cfo_anchor_profile;
-    anchor.timing_seed_refine_radius = seed_radius;
-    if (anchor.sync_strategy == SyncStrategy::LockedBounded && seed_radius > 0) {
-        anchor.locked_roi_samples = std::min(
-            anchor.locked_roi_samples, std::max<size_t>(64, seed_radius));
-    }
-    const auto sfd_tail_t0 = std::chrono::steady_clock::now();
-
-    bool tail_timing_ok = try_reuse_initial_tail_timing(
-        scratch.initial_timing, profile, anchor, cfg, seed_radius, tail_timing);
-    if (!tail_timing_ok) {
-        tail_timing_ok = stage_timing(
-            rx, n, anchor, template_wf, cfg.tail_start, tail_timing, scratch);
-        if ((!tail_timing_ok ||
-             tail_timing.detected_peaks < 4) &&
-            seed_radius != 0) {
-            // The narrow seed radius is clamped into locked_roi_samples for
-            // LockedBounded, but stage_timing's bounded branch only reads the
-            // ROI -- so a radius-0 retry with the SAME ROI is a provably
-            // identical second run.  Only retry when it actually widens the
-            // search, and restore the unclamped ROI when it does.
-            const bool bounded =
-                anchor.sync_strategy == SyncStrategy::LockedBounded;
-            const bool same_bounded_params =
-                bounded && anchor.locked_roi_samples >= profile.locked_roi_samples;
-            if (!same_bounded_params) {
-                const auto retry_t0 = std::chrono::steady_clock::now();
-                anchor.timing_seed_refine_radius = 0;
-                if (bounded)
-                    anchor.locked_roi_samples = profile.locked_roi_samples;
-                TimingResult retry_timing;
-                const bool retry_ok = stage_timing(
-                    rx, n, anchor, template_wf, cfg.tail_start, retry_timing,
-                    scratch);
-                res.stage_sfd_tail_retrack_fallback_us += static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - retry_t0).count());
-                ++res.stage_tail_retrack_fallbacks;
-                if (retry_ok &&
-                    retry_timing.detected_peaks > tail_timing.detected_peaks) {
-                    // Keep the narrow-attempt diagnostics visible even though
-                    // the wider retry produced the accepted timing.
-                    retry_timing.seed_search_us += tail_timing.seed_search_us;
-                    retry_timing.seed_refine_narrow_attempts +=
-                        tail_timing.seed_refine_narrow_attempts;
-                    retry_timing.seed_refine_narrow_success +=
-                        tail_timing.seed_refine_narrow_success;
-                    retry_timing.seed_refine_fallbacks +=
-                        tail_timing.seed_refine_fallbacks;
-                    tail_timing = std::move(retry_timing);
-                    tail_timing_ok = true;
-                }
-            }
-        }
-    }
-    res.stage_sfd_tail_retrack_us += static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - sfd_tail_t0).count());
-    return tail_timing_ok && tail_timing.detected_peaks >= 4;
-}
-
 void build_sfd_anchored_timing(
     const SfdAnchorConfig& cfg,
     const TimingResult& prev_timing,
     const TimingResult& initial_timing,
-    const TimingResult& tail_timing,
-    bool have_tail_peaks,
     TimingResult& cfo_timing)
 {
-    // Keep the SFD-anchored full-frame grid on the original timing
-    // estimate.  Only the tail peaks have matched-filter measurements;
-    // leading peaks are generated from the SFD-anchored grid.
+    // The SFD anchor gives the exact end of the last SYNC, so the complete
+    // preamble grid is reconstructed from it.  No tail re-tracking runs any
+    // more: the ML CFO estimator samples this grid directly (full preamble).
     const double measured_period = cfg.period_hint;
     const int64_t full_start = cfg.bootstrap_sfd_start -
         static_cast<int64_t>(std::llround(
@@ -419,20 +308,19 @@ void build_sfd_anchored_timing(
     cfo_timing.preamble_start_sample = full_start;
     cfo_timing.preamble_start_uncropped = full_start;
     cfo_timing.measured_period = measured_period;
-    cfo_timing.metric =
-        have_tail_peaks ? tail_timing.metric : prev_timing.metric;
+    cfo_timing.metric = prev_timing.metric;
     cfo_timing.detected_peaks = initial_timing.detected_peaks;
     cfo_timing.sync_peaks_folded = initial_timing.sync_peaks_folded;
     cfo_timing.cir_grid_repetitions = cfg.full_repetitions;
     cfo_timing.expected_peaks = cfg.full_repetitions;
-    cfo_timing.coarse_search_us = tail_timing.coarse_search_us;
-    cfo_timing.fine_track_us = tail_timing.fine_track_us;
-    cfo_timing.seed_search_us = tail_timing.seed_search_us;
+    cfo_timing.coarse_search_us = prev_timing.coarse_search_us;
+    cfo_timing.fine_track_us = prev_timing.fine_track_us;
+    cfo_timing.seed_search_us = prev_timing.seed_search_us;
     cfo_timing.seed_refine_narrow_attempts =
-        tail_timing.seed_refine_narrow_attempts;
+        prev_timing.seed_refine_narrow_attempts;
     cfo_timing.seed_refine_narrow_success =
-        tail_timing.seed_refine_narrow_success;
-    cfo_timing.seed_refine_fallbacks = tail_timing.seed_refine_fallbacks;
+        prev_timing.seed_refine_narrow_success;
+    cfo_timing.seed_refine_fallbacks = prev_timing.seed_refine_fallbacks;
     cfo_timing.peak_samples.resize(cfg.full_repetitions);
     cfo_timing.peak_metrics.assign(cfg.full_repetitions, 0.0f);
     cfo_timing.peak_corr.assign(
@@ -443,75 +331,57 @@ void build_sfd_anchored_timing(
                 static_cast<double>(k) * measured_period)) +
             static_cast<int64_t>(cfg.template_len - 1);
     }
-    if (!have_tail_peaks)
-        return;
-
-    if (tail_timing.peak_samples.size() == cfg.tail_repetitions) {
-        for (size_t k = 0; k < cfg.tail_repetitions; ++k) {
-            const size_t dst = cfg.tail_first + k;
-            cfo_timing.peak_samples[dst] = tail_timing.peak_samples[k];
-            cfo_timing.peak_metrics[dst] = tail_timing.peak_metrics[k];
-            cfo_timing.peak_corr[dst] = tail_timing.peak_corr[k];
-        }
-        return;
-    }
-
-    const int64_t tail_pk0 =
-        cfg.tail_start + static_cast<int64_t>(cfg.template_len - 1);
-    for (size_t i = 0; i < tail_timing.peak_samples.size(); ++i) {
-        const int64_t rel_sym = std::llround(
-            static_cast<double>(tail_timing.peak_samples[i] - tail_pk0) /
-            measured_period);
-        if (rel_sym >= 0 &&
-            static_cast<size_t>(rel_sym) < cfg.tail_repetitions) {
-            const size_t dst = cfg.tail_first + static_cast<size_t>(rel_sym);
-            cfo_timing.peak_samples[dst] = tail_timing.peak_samples[i];
-            cfo_timing.peak_metrics[dst] = tail_timing.peak_metrics[i];
-            cfo_timing.peak_corr[dst] = tail_timing.peak_corr[i];
-        }
-    }
 }
 
 bool refit_tail_cfo_and_rotate_anchored_prefix(
     const std::complex<float>* rx,
     size_t n,
     const Qm35825Profile& profile,
+    const std::vector<std::complex<float>>& template_wf,
     bool integer_grid_ok,
     const SfdAnchorConfig& cfg,
-    const TimingResult& tail_timing,
-    const TimingResult& cfo_timing,
-    bool have_tail_peaks,
     DemodScratch& scratch,
     DemodResult& res,
-    SyncBootstrapState& sync_state)
+    SyncBootstrapState& sync_state,
+    TimingResult& cfo_timing)
 {
     const auto sfd_cfo_t0 = std::chrono::steady_clock::now();
-    // Only the tail has measured correlation phases.  The reconstructed
-    // full-frame grid above contains zero placeholders for earlier SYNCs
-    // and is for downstream timing/CIR, not carrier estimation.  Startup
-    // exclusion belongs to the initial acquisition fit; this SFD-anchored
-    // tail is already the selected stable training interval.
-    if (have_tail_peaks) {
-        // Avoid overwriting a well-sampled full-preamble Stage-2 CFO
-        // estimate (e.g. >=16 peaks spanning 256 symbols) with a high-
-        // variance short-baseline tail refit (<16 noisy peaks at ~-10 dB).
-        const bool refit_well_conditioned =
-            tail_timing.peak_samples.size() >= 16 ||
-            sync_state.stage2_cfo.peaks_used < 16;
-        if (refit_well_conditioned) {
-            Qm35825Profile tail_fit_profile = profile;
-            tail_fit_profile.cfo_skip_initial_repetitions = 0;
-            CfoResult tail_cfo;
-            const bool cfo_fit_ok =
-                fit_cfo(rx, n, tail_fit_profile, tail_timing, tail_cfo, scratch);
-            if (cfo_fit_ok) {
-                res.cfo = tail_cfo;
-                res.cfo.skipped_peaks += cfg.tail_first;
-                res.cfo_refit_hz = tail_cfo.cfo_hz;
-                res.cfo_refit_peaks = static_cast<uint32_t>(tail_cfo.peaks_used);
-                res.cfo_refit_fit_us = tail_cfo.fit_us;
+    // SFD-anchored full-preamble ML refit.  The SFD pins the end of the last
+    // SYNC, so the whole preamble grid (minus the startup exclusion) is a
+    // measured interval: no 40-SYMBOL tail retrack, no zero placeholders, and
+    // a coherent baseline ~sqrt(232/40) longer than the old tail fit.
+    const size_t n_rep = profile.preamble_repetitions;
+    const size_t k_min = std::max<size_t>(8, profile.cfo_min_fit_repetitions);
+    const size_t avail_skip = (n_rep > k_min) ? (n_rep - k_min) : 0;
+    const size_t k_skip = std::min(profile.cfo_skip_initial_repetitions,
+                                   avail_skip);
+    const double p_ref = (cfg.period_hint > 0.0)
+        ? cfg.period_hint
+        : static_cast<double>(kQm35SamplesPerSymbol);
+    const int64_t origin = cfg.bootstrap_sfd_start -
+        static_cast<int64_t>(std::llround(
+            static_cast<double>(n_rep) * p_ref));
+    if (k_skip < n_rep && n_rep - k_skip >= 8) {
+        CfoResult ml_cfo;
+        if (estimate_stage_cfo_ml(
+                rx, n, profile, template_wf, origin, k_skip, n_rep,
+                /*has_cfo_hint=*/sync_state.stage2_cfo.ok,
+                sync_state.stage2_cfo.cfo_hz, cfo_timing, scratch, ml_cfo)) {
+            res.cfo = ml_cfo;
+            res.cfo_refit_hz = ml_cfo.cfo_hz;
+            res.cfo_refit_peaks = static_cast<uint32_t>(ml_cfo.peaks_used);
+            res.cfo_refit_fit_us = ml_cfo.fit_us;
+            res.stage_cfo_fit_us += ml_cfo.fit_us;
+            // Publish the measured correlations on the anchored grid for
+            // downstream diagnostics (the grid is no longer a placeholder
+            // beyond the skipped startup symbols).
+            const size_t used = std::min<size_t>(
+                ml_cfo.peaks_used, scratch.cfo_sym_z.size());
+            for (size_t i = 0; i < used; ++i) {
+                const size_t dst = k_skip + i;
+                if (dst < cfo_timing.peak_corr.size())
+                    cfo_timing.peak_corr[dst] = scratch.cfo_sym_z[i];
             }
-            res.stage_cfo_fit_us += res.cfo.fit_us;
         }
     }
     res.stage_sfd_cfo_refit_us += static_cast<uint64_t>(
@@ -519,6 +389,13 @@ bool refit_tail_cfo_and_rotate_anchored_prefix(
             std::chrono::steady_clock::now() - sfd_cfo_t0).count());
     if (!res.cfo.ok)
         return false;
+    if (res.cfo_refit_hz == 0.0 && res.cfo_refit_peaks == 0) {
+        // ML refit unavailable (extreme window): keep the Stage-2 estimate and
+        // let the refit-mode state machine below decide about the rotation.
+        res.cfo_refit_hz = res.cfo.cfo_hz;
+        res.cfo_refit_peaks = static_cast<uint32_t>(res.cfo.peaks_used);
+        res.cfo_refit_fit_us = res.cfo.fit_us;
+    }
 
     // Second rotation (Task A1): covers final SFD, CIR (54 SYNCs starting
     // from 10th), phase estimation, and initial soft-chips / PHR.
@@ -585,28 +462,14 @@ bool run_tail_retrack_and_cfo_refit(
     DemodScratch& scratch,
     DemodResult& res,
     SyncBootstrapState& sync_state,
-    TimingResult& tail_timing,
     TimingResult& cfo_timing)
 {
-    // A folded Stage 1 already measured >=16 coherent super-anchors, and the
-    // tail is only 40 SYMBOLS: re-tracking it could contribute at most two
-    // 16-symbol groups, which the conditional CFO refit discards anyway.  Skip
-    // the doomed second stage_timing run and keep the Stage-2 CFO.
-    const bool skip_tail_retrack =
-        scratch.initial_timing.sync_peaks_folded &&
-        sync_state.stage2_cfo.peaks_used >= 16;
-    bool have_tail_peaks = false;
-    if (!skip_tail_retrack) {
-        have_tail_peaks = retrack_tail_timing(
-            rx, n, profile, template_wf, cfg, seed_radius, scratch, res,
-            tail_timing);
-    }
-    build_sfd_anchored_timing(
-        cfg, res.timing, scratch.initial_timing, tail_timing,
-        have_tail_peaks, cfo_timing);
+    (void)seed_radius;
+    build_sfd_anchored_timing(cfg, res.timing, scratch.initial_timing,
+                              cfo_timing);
     return refit_tail_cfo_and_rotate_anchored_prefix(
-        rx, n, profile, integer_grid_ok, cfg, tail_timing, cfo_timing,
-        have_tail_peaks, scratch, res, sync_state);
+        rx, n, profile, template_wf, integer_grid_ok, cfg, scratch, res,
+        sync_state, cfo_timing);
 }
 
 bool anchor_and_verify_final_sfd(
@@ -683,13 +546,11 @@ bool anchor_and_verify_final_sfd(
         return ok;
     };
 
-    TimingResult tail_timing;
     TimingResult cfo_timing;
     const size_t first_seed_radius = profile.rx_seed_refine_tail ? 8 : 0;
     if (!run_tail_retrack_and_cfo_refit(
             rx, n, profile, template_wf, integer_grid_ok, cfg,
-            first_seed_radius, scratch, res, sync_state,
-            tail_timing, cfo_timing)) {
+            first_seed_radius, scratch, res, sync_state, cfo_timing)) {
         clock.lap(res.stage_sfd_us, res.stage_total_us);
         res.status = DemodStatus::CfoFailed;
         return false;
@@ -726,11 +587,10 @@ bool anchor_and_verify_final_sfd(
         // per-SYNC threshold.  On a final-SFD/period inconsistency, retry the
         // complete tail -> CFO refit -> final SFD chain with the legacy radius.
         ++res.stage_tail_retrack_fallbacks;
-        TimingResult retry_tail;
         TimingResult retry_cfo;
         if (run_tail_retrack_and_cfo_refit(
                 rx, n, profile, template_wf, integer_grid_ok, cfg, 0,
-                scratch, res, sync_state, retry_tail, retry_cfo)) {
+                scratch, res, sync_state, retry_cfo)) {
             // Preserve the first (narrow) chain's seed diagnostics: the
             // radius-0 retry reports zero attempts of its own.
             retry_cfo.seed_search_us += res.timing.seed_search_us;
@@ -751,6 +611,19 @@ bool anchor_and_verify_final_sfd(
         clock.lap(res.stage_sfd_us, res.stage_total_us);
         res.status = DemodStatus::SfdFailed;
         return false;
+    }
+    // Refresh the SYNC period from the final full-preamble CFO.  With a
+    // coupled crystal SFO = -CFO/fc, so this period is exact to the CFO
+    // accuracy and is far better conditioned than the Stage-1 OLS period
+    // (which the old 40-symbol tail fit could not improve).
+    if (profile.rx_sfo_from_cfo && profile.carrier_freq_hz > 0.0 &&
+        std::isfinite(profile.carrier_freq_hz) && res.cfo.ok &&
+        std::isfinite(res.cfo.cfo_hz)) {
+        const double denom = 1.0 + res.cfo.cfo_hz / profile.carrier_freq_hz;
+        if (denom > 0.0 && std::isfinite(denom)) {
+            res.timing.measured_period =
+                static_cast<double>(kQm35SamplesPerSymbol) / denom;
+        }
     }
     res.timing.preamble_start_sample =
         res.sfd.sfd_start_sample - static_cast<int64_t>(std::llround(

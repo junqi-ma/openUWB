@@ -183,7 +183,7 @@ BOOST_AUTO_TEST_CASE(test_demod_core_task_a1_a2_full_pipeline_range_cfo)
         BOOST_CHECK(res.status == DemodStatus::Success);
         BOOST_CHECK(res.payload.fcs_pass);
         BOOST_CHECK_EQUAL(res.payload.received_fcs, uint16_t(0x584b));
-        BOOST_CHECK_CLOSE(res.cfo.cfo_hz, cfo_hz, 200.0); // within 200 Hz
+        BOOST_CHECK_SMALL(res.cfo.cfo_hz - cfo_hz, 200.0); // within 200 Hz
         BOOST_CHECK_GT(res.stage_cfo_rotate_us, 0u);
         BOOST_CHECK_GT(res.stage_cfo_rotated_samples, 0u);
         BOOST_CHECK_GE(res.stage_cfo_rotation_passes, 2u);
@@ -740,11 +740,13 @@ BOOST_AUTO_TEST_CASE(test_demod_core_tail_reuse_equivalence_and_fallback)
     BOOST_CHECK_SMALL(std::abs(res_fb.cfo.cfo_hz - res_legacy.cfo.cfo_hz), 25.0);
 }
 
-BOOST_AUTO_TEST_CASE(test_demod_core_sfd_tail_cfo_uses_only_measured_peaks)
+BOOST_AUTO_TEST_CASE(test_demod_core_sfd_anchored_cfo_uses_full_preamble)
 {
     // Keep the golden SFD/PHR/payload and vary only the SYNC train length.
-    // The full-frame timing grid deliberately still contains zero placeholders;
-    // those placeholders must never participate in the final CFO phase fit.
+    // The SFD anchor pins the end of the last SYNC, so the final CFO now fits
+    // the whole preamble after the startup exclusion.  Only the excluded
+    // leading SYNCs keep their zero placeholders; every measured grid point of
+    // the fit carries a real matched-filter correlation.
     std::vector<gr_complex> golden;
     BOOST_REQUIRE(load_cf32(golden_dir() + "/window.cfile", golden));
     const auto tmpl = load_reference_template();
@@ -797,8 +799,15 @@ BOOST_AUTO_TEST_CASE(test_demod_core_sfd_tail_cfo_uses_only_measured_peaks)
                     BOOST_REQUIRE(r.status == DemodStatus::Success);
                     BOOST_REQUIRE(r.payload.fcs_pass);
                     BOOST_CHECK_EQUAL(r.payload.received_fcs, uint16_t(0x584b));
-                    const size_t measured = std::min<size_t>(reps, 40);
-                    const size_t first = reps - measured;
+                    // Full-preamble SFD-anchored fit: skip the startup
+                    // transient but keep a 32-SYMBOL floor.
+                    const size_t min_fit =
+                        std::max<size_t>(8, p.cfo_min_fit_repetitions);
+                    const size_t avail_skip =
+                        (reps > min_fit) ? (reps - min_fit) : 0;
+                    const size_t first =
+                        std::min(p.cfo_skip_initial_repetitions, avail_skip);
+                    const size_t measured = reps - first;
                     BOOST_CHECK_EQUAL(r.cfo.peaks_used, measured);
                     BOOST_CHECK_EQUAL(r.cfo.skipped_peaks, first);
                     BOOST_CHECK_EQUAL(r.cfo.fit_first_peak_sample,

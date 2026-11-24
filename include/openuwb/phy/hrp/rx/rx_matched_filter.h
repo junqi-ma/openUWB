@@ -332,6 +332,42 @@ inline std::complex<float> shaped_ternary_dot_single(
     return acc;
 }
 
+// Four CONSECUTIVE lags from ONE 16-lag sparse batch plus four short pulse FIRs.
+// This is the batched companion of shaped_ternary_dot_single(): the 16-lag
+// kernel is called once and the same sparse sums feed all four outputs, so the
+// sparse reduction is not recomputed per lag.
+//
+// Semantics (the fractional CFO grid relies on this):
+//   out[j] == shaped_ternary_dot_single(rx + j, tmpl) for j in [0, 4),
+//   identical up to float accumulation order (~1e-6).
+//
+// Bounds contract, both halves of it:
+//   * Template side: ShapedSparseTemplate::kMaxPulse == 8 and
+//     build_shaped_sparse_template() never stores nt > kMaxPulse, so the FIR
+//     reads at most c[j + k] with j + k <= 3 + 7 = 10 < 16.  The 16-lag output
+//     block is therefore always wide enough and no lag is truncated.
+//   * Caller side: `rx` must have at least max_code_sample_offset + 16 valid
+//     complex samples, because a 16-lag kernel reads lag 15 of every sparse
+//     offset.  That is up to 8 samples more than the 4 x single-lag form needs
+//     (which reads max_code_sample_offset + 8): callers near the end of the
+//     frame must fall back to four shaped_ternary_dot_single() calls instead.
+inline void shaped_ternary_dot_4lag(const std::complex<float>* rx,
+                                    const ShapedSparseTemplate& tmpl,
+                                    std::complex<float> out[4])
+{
+    static_assert(ShapedSparseTemplate::kMaxPulse + 4 <= 16,
+                  "4 lags x pulse FIR must stay inside the 16-lag block");
+    std::complex<float> c[16];
+    sparse_ternary_dot_16lag(rx, tmpl.code, c);
+    const size_t nt = tmpl.nt;
+    for (size_t j = 0; j < 4; ++j) {
+        std::complex<float> acc(0.0f, 0.0f);
+        for (size_t k = 0; k < nt; ++k)
+            acc += tmpl.pulse[k] * c[j + k];
+        out[j] = acc;
+    }
+}
+
 // Contiguous lags: one 32-lag sparse batch plus (nt-1) scalar tail lags, then
 // the FIR. Calling the kernel once per output lag would recompute the same
 // sparse sums 8 times; sharing them across the block is where the speedup is.

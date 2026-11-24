@@ -242,6 +242,7 @@ set(UWB_UNIT_QA_SOURCES
     ${UWB_UNIT_DIR}/support/qa_uwb_defaults.cc
     ${UWB_UNIT_DIR}/phy/qa_uwb_demod_core_timing_cfo_sfd.cc
     ${UWB_UNIT_DIR}/phy/qa_uwb_demod_core_cir_pipeline.cc
+    ${UWB_UNIT_DIR}/phy/qa_uwb_cfo_ml.cc
     ${UWB_UNIT_DIR}/phy/qa_uwb_demod_core_kernel_grid.cc
     ${UWB_UNIT_DIR}/phy/qa_uwb_demod_core_fec_joint_ml.cc
     ${UWB_UNIT_DIR}/phy/qa_uwb_demod_core_heavy_grid.cc
@@ -410,7 +411,8 @@ set(UWB_QA_PCH_SIMD_TARGETS
     uwb_qa_uwb_rational_resampler_core.cc
     uwb_qa_uwb_resampler_burst_opt.cc
     uwb_qa_uwb_resampler_transposed.cc
-    uwb_qa_uwb_rational_resampler_core_65_32.cc)
+    uwb_qa_uwb_rational_resampler_core_65_32.cc
+    uwb_qa_uwb_cfo_ml.cc)
 
 # Stage 1: SIMD-chain rebinding.  The nine QA targets above were first
 # bound to the plain PCH by uwb_register_qa(); they are compiled through
@@ -720,6 +722,7 @@ foreach(_t IN ITEMS
     uwb_qa_uwb_preamble_sic_core_perf.cc_2
     uwb_qa_uwb_demod_core_timing_cfo_sfd.cc
     uwb_qa_uwb_demod_core_cir_pipeline.cc
+    uwb_qa_uwb_cfo_ml.cc
     uwb_qa_uwb_demod_core_kernel_grid.cc
     uwb_qa_uwb_demod_core_fec_joint_ml.cc
     uwb_qa_uwb_hrp_mod_core.cc

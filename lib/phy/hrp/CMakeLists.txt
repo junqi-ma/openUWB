@@ -16,6 +16,8 @@ if(UWB_ENABLE_RX)
         uwb_demod_pipeline.cc
         uwb_demod_timing.cc
         uwb_demod_cfo_sfd.cc
+        uwb_demod_cfo_sampler.cc
+        uwb_demod_cfo_ml.cc
         uwb_demod_softchips_payload.cc
         uwb_demod_fec.cc)
 endif()

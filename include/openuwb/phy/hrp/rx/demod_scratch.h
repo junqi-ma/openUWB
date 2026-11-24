@@ -270,7 +270,7 @@ struct DemodScratch {
         fold_sup_buf.reserve(2048);
         cfo_sym_z.reserve(512);
         cfo_coarse_z.reserve(128);
-        cfo_fft_buf.reserve(1024);
+        cfo_fft_buf.reserve(2048);
         cfo_mag_buf.reserve(512);
         cir_avg_tail.reserve(2048);
         cir_phase_rot.reserve(2048);

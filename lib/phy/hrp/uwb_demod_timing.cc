@@ -201,29 +201,35 @@ bool stage_timing(const std::complex<float>* rx,
     // can reuse the same window.
     int64_t acq_seed = seed_start;
     auto try_fold_acquire = [&](int64_t centre, int64_t radius) -> bool {
-        const auto phase_probe = detail::probe_fold_phase(
-            rx, n, centre, profile.preamble_repetitions);
-        const double coarse_phase = phase_probe.phase();
-        auto acquire_fold = [&](double phase) {
+        auto acquire_fold = [&](size_t max_syms, double phase) {
             return detail::fold_acquire(
                 rx, n, centre, centre - radius, centre + radius,
                 scratch.work.data(), L, Et, scratch.real_sync_template,
-                detail::kFoldMaxSymbols, profile.preamble_repetitions,
+                max_syms, profile.preamble_repetitions,
                 detail::kFoldThreshold, phase,
                 sparse_tmpl, &scratch.fold_buf, shaped_tmpl);
         };
-        // Check energy only when the coarse phase can change the fold choice.
-        // A rejected large phase also rules out the phase-aligned retry.
-        const bool could_alias = std::abs(coarse_phase) >=
-            M_PI / detail::kFoldAnchorGroupSymbols;
-        double fold_phase = could_alias && phase_probe.coherent()
-            ? coarse_phase : 0.0;
-        auto fold = acquire_fold(fold_phase);
-        if (!fold.ok && !could_alias &&
-            std::abs(coarse_phase) >= M_PI / (2 * detail::kFoldMaxSymbols) &&
-            phase_probe.coherent()) {
-            fold_phase = coarse_phase;
-            fold = acquire_fold(fold_phase);
+        // Fast K=4 coherent fold first: immune to typical CFO (< 5 deg over
+        // 4 us) and avoids probe_fold_phase overhead; falls back to K=64
+        // only when K=4 + PAR misses.
+        constexpr size_t kFoldFastSymbols = 4;
+        double fold_phase = 0.0;
+        auto fold = acquire_fold(kFoldFastSymbols, 0.0);
+        if (!fold.ok) {
+            const auto phase_probe = detail::probe_fold_phase(
+                rx, n, centre, profile.preamble_repetitions);
+            const double coarse_phase = phase_probe.phase();
+            const bool could_alias = std::abs(coarse_phase) >=
+                M_PI / detail::kFoldAnchorGroupSymbols;
+            fold_phase = could_alias && phase_probe.coherent()
+                ? coarse_phase : 0.0;
+            fold = acquire_fold(detail::kFoldMaxSymbols, fold_phase);
+            if (!fold.ok && !could_alias &&
+                std::abs(coarse_phase) >= M_PI / (2 * detail::kFoldMaxSymbols) &&
+                phase_probe.coherent()) {
+                fold_phase = coarse_phase;
+                fold = acquire_fold(detail::kFoldMaxSymbols, fold_phase);
+            }
         }
         if (!fold.ok)
             return false;
@@ -292,7 +298,7 @@ bool stage_timing(const std::complex<float>* rx,
         double period_fit = static_cast<double>(kQm35SamplesPerSymbol);
         int64_t origin_fit = fold_start;
         const size_t groups = std::min<size_t>(
-            detail::kFoldAnchorGroupSymbols,
+            64,
             profile.preamble_repetitions / detail::kFoldAnchorGroupSymbols);
         if (groups >= 2) {
             if (!detail::fold_anchor_fit(
@@ -1480,7 +1486,10 @@ FoldAcquireResult fold_acquire(const std::complex<float>* rx,
     // Folding past the end of the preamble only adds noise, never signal.
     k_eff = std::min<int64_t>(k_eff,
                               static_cast<int64_t>(preamble_repetitions));
-    if (k_eff < static_cast<int64_t>(kFoldMinSymbols))
+    const int64_t min_syms = std::min<int64_t>(
+        static_cast<int64_t>(kFoldMinSymbols),
+        static_cast<int64_t>(max_symbols));
+    if (k_eff < min_syms)
         return res;
     w1 = std::min<int64_t>(w1, static_cast<int64_t>(n) - Li - (k_eff - 1) * P);
     if (w1 < w0)
@@ -1527,12 +1536,33 @@ FoldAcquireResult fold_acquire(const std::complex<float>* rx,
     else if (sparse_tmpl && sparse_tmpl->code_energy > 0.0f)
         Et = sparse_tmpl->code_energy;
     const size_t lags = static_cast<size_t>(span + 1);
+    std::vector<float> lag_metrics(lags, 0.0f);
     const auto peak = rxopt::scan_normalized_sync(
-        filter, folded.data(), lags, window_power_8acc(folded.data(), L), Et);
+        filter, folded.data(), lags, window_power_8acc(folded.data(), L), Et,
+        lag_metrics.data());
 
     res.symbols_folded = static_cast<size_t>(k_eff);
     res.window_lags = lags;
-    if (!(peak.metric >= threshold))
+    bool accepted = (peak.metric >= threshold);
+    if (!accepted && peak.metric >= 0.015f) {
+        constexpr int64_t kFoldParGuard = 40;
+        constexpr double kFoldParMin = 17.7827941; // 12.5 dB
+        double bg_sum = 0.0;
+        size_t bg_cnt = 0;
+        const int64_t pk_i = static_cast<int64_t>(peak.lag);
+        for (size_t i = 0; i < lags; ++i) {
+            if (std::abs(static_cast<int64_t>(i) - pk_i) > kFoldParGuard) {
+                bg_sum += static_cast<double>(lag_metrics[i]);
+                ++bg_cnt;
+            }
+        }
+        if (bg_cnt >= 64) {
+            const double bg_mean =
+                std::max(bg_sum / static_cast<double>(bg_cnt), 1e-12);
+            accepted = (static_cast<double>(peak.metric) / bg_mean) >= kFoldParMin;
+        }
+    }
+    if (!accepted)
         return res;
     res.ok = true;
     res.start = w0 + static_cast<int64_t>(peak.lag);
@@ -1676,9 +1706,6 @@ bool fold_anchor_fit(const std::complex<float>* rx,
             static_cast<int64_t>(kFoldAnchorGroupSymbols));
         const double y = static_cast<double>(pos + Li - 1);
         fit.add(x, y);
-        peak_samples.push_back(pos + Li - 1);
-        peak_metrics.push_back(peak.metric);
-        peak_corr.push_back(peak.corr);
         ++used;
     }
     if (used < 2)
@@ -1695,6 +1722,53 @@ bool fold_anchor_fit(const std::complex<float>* rx,
     if (std::abs(p - static_cast<double>(P)) > 0.005 * static_cast<double>(P))
         return false;
     const double intercept_end = fit.intercept(p);
+
+    // Sample complex correlation on the fitted linear timing grid rather than
+    // at each block's independent argmax lag, so multipath tap hopping within
+    // +-refine does not inject phase jumps into fit_cfo().  When the fitted
+    // drift across the preamble is < 1.5 samples, snap to the exact integer
+    // period P around the midpoint so llround() cannot step 1 sample across
+    // multipath taps mid-preamble.
+    const double span_syms = static_cast<double>(
+        (groups - 1) * kFoldAnchorGroupSymbols);
+    const double mid_x = 0.5 * span_syms;
+    const bool lock_integer_grid =
+        std::abs(p - static_cast<double>(P)) * span_syms < 1.5;
+    const int64_t grid_origin_end = std::llround(
+        intercept_end + (p - static_cast<double>(P)) * mid_x);
+    for (size_t g = 0; g < groups; ++g) {
+        const int64_t sym_idx = static_cast<int64_t>(g) *
+                                static_cast<int64_t>(kFoldAnchorGroupSymbols);
+        const double x = static_cast<double>(sym_idx);
+        const int64_t fitted_end = lock_integer_grid
+            ? (grid_origin_end + sym_idx * P)
+            : std::llround(intercept_end + p * x);
+        const int64_t fitted_start = fitted_end - (Li - 1);
+        if (fitted_start < 0)
+            continue;
+        if (fitted_start + Li +
+                static_cast<int64_t>(kFoldAnchorGroupSymbols - 1) * P >
+            static_cast<int64_t>(n))
+            continue;
+        std::fill(sup.begin(), sup.begin() + static_cast<ptrdiff_t>(L),
+                  std::complex<float>(0.0f, 0.0f));
+        for (int64_t j = 0; j < static_cast<int64_t>(kFoldAnchorGroupSymbols);
+             ++j)
+            fold_accumulate(sup.data(), rx + fitted_start + j * P, L,
+                            -j * phase_per_symbol);
+        const std::complex<float> corr = filter.dot(sup.data());
+        float rx_energy = 0.0f;
+        for (size_t k = 0; k < L; ++k)
+            rx_energy += std::norm(sup[k]);
+        const float denom_e = std::sqrt(std::max(1e-12f, rx_energy * Et));
+        const float metric =
+            denom_e > 0.0f ? std::abs(corr) / denom_e : 0.0f;
+        peak_samples.push_back(fitted_end);
+        peak_metrics.push_back(metric);
+        peak_corr.push_back(corr);
+    }
+    if (peak_samples.size() < 2)
+        return false;
     *period_out = p;
     *preamble_start_out = std::max<int64_t>(
         0, static_cast<int64_t>(std::llround(intercept_end)) - (Li - 1));

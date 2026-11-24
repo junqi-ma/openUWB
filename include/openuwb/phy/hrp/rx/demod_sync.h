@@ -118,7 +118,7 @@ normalized_mf(const std::complex<float>* rx,
 inline constexpr size_t kFoldMaxSymbols = 64;
 inline constexpr size_t kFoldMinSymbols = 16;
 inline constexpr float kFoldThreshold = 0.05f;
-inline constexpr size_t kFoldAnchorGroupSymbols = 16;
+inline constexpr size_t kFoldAnchorGroupSymbols = 4;
 inline constexpr int64_t kFoldAnchorRefine = 8;
 
 struct FoldAcquireResult {

@@ -275,7 +275,9 @@ BOOST_AUTO_TEST_CASE(test_sfd_low_floor_hits_center_window_without_offset_scan)
     const SfdFixture fix("4z2", 64);
     const Qm35825Profile prof = make_profile(fix, "4z2");
     const auto sfd_seq = fix.sfd_seq;
-    const auto frame = fix.make_frame(-14.0, 4242u);
+    // -14 dB with this seed puts the locked centre-window metric at ~0.0159,
+    // i.e. near the middle of the new [0.008, 0.02) band.
+    const auto frame = fix.make_frame(-14.0, 2026u);
 
     core::DemodScratch scratch;
     scratch.reserve(frame.size());
@@ -285,8 +287,12 @@ BOOST_AUTO_TEST_CASE(test_sfd_low_floor_hits_center_window_without_offset_scan)
                                   fix.sync, sr, scratch));
     BOOST_CHECK_LE(std::llabs(sr.sfd_start_sample - fix.true_sfd), 2);
     BOOST_CHECK_EQUAL(sr.search_windows, 1u);
-    // Not a >= 0.3 direct pass: this is the low-floor + polarity branch.
-    BOOST_CHECK_LT(sr.metric, 0.3f);
+    // Must sit strictly inside the NEW low-floor band [0.008, 0.02): a value
+    // >= 0.02 would also have passed the old floor and would not prove the
+    // S2 change; a value < 0.008 could not have passed at all.
+    BOOST_TEST_MESSAGE("lowfloor metric=" << sr.metric);
+    BOOST_CHECK_GE(sr.metric, core::kSfdGridPeakFloor);
+    BOOST_CHECK_LT(sr.metric, 0.02f);
 }
 
 // ---------------------------------------------------------------------------

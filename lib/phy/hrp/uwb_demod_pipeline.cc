@@ -105,6 +105,12 @@ uint64_t ensure_derotated_range(
     DemodScratch& scratch,
     DemodResult& res)
 {
+    // `span.range` is the contract "every sample in this interval is already
+    // derotated with `cfo_hz`/origin".  It must therefore stay a single,
+    // CONTIGUOUS interval: growing it across an unrotated gap would let a
+    // later caller read stale samples.  The incremental merge below is only
+    // valid when `req` overlaps or adjoins the span; a disjoint request is
+    // handled as a fresh span instead of a union.
     const SampleRange req =
         align_rotation_range(clamp_sample_range(req_lo, req_hi, n), n);
     if (req.empty())
@@ -112,8 +118,13 @@ uint64_t ensure_derotated_range(
     DerotatedSpan& span = sync_state.derotated_span;
     const bool compatible =
         span.valid && span.cfo_hz == cfo_hz && span.phase_origin_sample == 0;
+    const bool disjoint =
+        !compatible || req.hi < span.range.lo || req.lo > span.range.hi;
     uint64_t total_us = 0;
-    if (!compatible) {
+    if (disjoint) {
+        // Rotate the request on its own and replace the span.  Re-anchoring
+        // (rather than bridging the gap) keeps the invariant exact and avoids
+        // rotating samples no stage is going to read.
         const RotationStepResult step = rotate_window_range(
             rx, n, profile, cfo_hz, req, 2u, scratch, res);
         total_us += step.rotate_us;

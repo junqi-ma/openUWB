@@ -458,6 +458,42 @@ bool fold_anchor_fit(const std::complex<float>* rx,
     // information.  The public peak_samples/peak_corr stay sparse (<= 16) for
     // the detected_peaks contract.  This pass does one refold + one dot per
     // group (no +/-refine search), so it is a fraction of the period-fit cost.
+    //
+    // Refold one group on the fitted timing grid and correlate it.  Shared by
+    // the dense-grid and sparse-only loops so both walk the identical fill /
+    // fold_accumulate / dot sequence (bit-identical outputs).
+    auto refold_and_dot = [&](size_t g, int64_t& fitted_end,
+                              std::complex<float>& corr) -> bool {
+        const int64_t sym_idx = static_cast<int64_t>(g) *
+                                static_cast<int64_t>(
+                                    kFoldAnchorGroupSymbols);
+        const double x = static_cast<double>(sym_idx);
+        fitted_end = lock_integer_grid
+            ? (grid_origin_end + sym_idx * P)
+            : std::llround(intercept_end + p * x);
+        const int64_t fitted_start = fitted_end - (Li - 1);
+        if (fitted_start < 0)
+            return false;
+        if (fitted_start + Li +
+                static_cast<int64_t>(kFoldAnchorGroupSymbols - 1) * P >
+            static_cast<int64_t>(n))
+            return false;
+        std::fill(sup.begin(), sup.begin() + static_cast<ptrdiff_t>(L),
+                  std::complex<float>(0.0f, 0.0f));
+        for (int64_t j = 0;
+             j < static_cast<int64_t>(kFoldAnchorGroupSymbols); ++j)
+            fold_accumulate(sup.data(), rx + fitted_start + j * P, L,
+                            -j * phase_per_symbol);
+        corr = filter.dot(sup.data());
+        return true;
+    };
+    auto corr_metric = [&](const std::complex<float>& corr) -> float {
+        // 8-accumulator windowed power (same primitive the rest of the fold
+        // engine uses) instead of a scalar std::norm loop.
+        const float rx_energy = window_power_8acc(sup.data(), L);
+        const float denom_e = std::sqrt(std::max(1e-12f, rx_energy * Et));
+        return denom_e > 0.0f ? std::abs(corr) / denom_e : 0.0f;
+    };
     if (cfo_peak_samples && cfo_peak_corr) {
         size_t sel_idx = 0;
         for (size_t g = 0; g < groups; ++g) {
@@ -470,73 +506,26 @@ bool fold_anchor_fit(const std::complex<float>* rx,
                 selected = true;
                 ++sel_idx;
             }
-            const int64_t sym_idx = static_cast<int64_t>(g) *
-                                    static_cast<int64_t>(
-                                        kFoldAnchorGroupSymbols);
-            const double x = static_cast<double>(sym_idx);
-            const int64_t fitted_end = lock_integer_grid
-                ? (grid_origin_end + sym_idx * P)
-                : std::llround(intercept_end + p * x);
-            const int64_t fitted_start = fitted_end - (Li - 1);
-            if (fitted_start < 0)
+            int64_t fitted_end = 0;
+            std::complex<float> corr;
+            if (!refold_and_dot(g, fitted_end, corr))
                 continue;
-            if (fitted_start + Li +
-                    static_cast<int64_t>(kFoldAnchorGroupSymbols - 1) * P >
-                static_cast<int64_t>(n))
-                continue;
-            std::fill(sup.begin(), sup.begin() + static_cast<ptrdiff_t>(L),
-                      std::complex<float>(0.0f, 0.0f));
-            for (int64_t j = 0;
-                 j < static_cast<int64_t>(kFoldAnchorGroupSymbols); ++j)
-                fold_accumulate(sup.data(), rx + fitted_start + j * P, L,
-                                -j * phase_per_symbol);
-            const std::complex<float> corr = filter.dot(sup.data());
             cfo_peak_samples->push_back(fitted_end);
             cfo_peak_corr->push_back(corr);
             if (selected) {
-                // 8-accumulator windowed power (same primitive the rest of
-                // the fold engine uses) instead of a scalar std::norm loop.
-                const float rx_energy = window_power_8acc(sup.data(), L);
-                const float denom_e =
-                    std::sqrt(std::max(1e-12f, rx_energy * Et));
-                const float metric =
-                    denom_e > 0.0f ? std::abs(corr) / denom_e : 0.0f;
                 peak_samples.push_back(fitted_end);
-                peak_metrics.push_back(metric);
+                peak_metrics.push_back(corr_metric(corr));
                 peak_corr.push_back(corr);
             }
         }
     } else {
         for (size_t i = 0; i < n_sel; ++i) {
-            const int64_t sym_idx = static_cast<int64_t>(g_sel[i]) *
-                                    static_cast<int64_t>(
-                                        kFoldAnchorGroupSymbols);
-            const double x = static_cast<double>(sym_idx);
-            const int64_t fitted_end = lock_integer_grid
-                ? (grid_origin_end + sym_idx * P)
-                : std::llround(intercept_end + p * x);
-            const int64_t fitted_start = fitted_end - (Li - 1);
-            if (fitted_start < 0)
+            int64_t fitted_end = 0;
+            std::complex<float> corr;
+            if (!refold_and_dot(g_sel[i], fitted_end, corr))
                 continue;
-            if (fitted_start + Li +
-                    static_cast<int64_t>(kFoldAnchorGroupSymbols - 1) * P >
-                static_cast<int64_t>(n))
-                continue;
-            std::fill(sup.begin(), sup.begin() + static_cast<ptrdiff_t>(L),
-                      std::complex<float>(0.0f, 0.0f));
-            for (int64_t j = 0;
-                 j < static_cast<int64_t>(kFoldAnchorGroupSymbols); ++j)
-                fold_accumulate(sup.data(), rx + fitted_start + j * P, L,
-                                -j * phase_per_symbol);
-            const std::complex<float> corr = filter.dot(sup.data());
-            // 8-accumulator windowed power (same primitive the rest of the
-            // fold engine uses) instead of a scalar std::norm loop.
-            const float rx_energy = window_power_8acc(sup.data(), L);
-            const float denom_e = std::sqrt(std::max(1e-12f, rx_energy * Et));
-            const float metric =
-                denom_e > 0.0f ? std::abs(corr) / denom_e : 0.0f;
             peak_samples.push_back(fitted_end);
-            peak_metrics.push_back(metric);
+            peak_metrics.push_back(corr_metric(corr));
             peak_corr.push_back(corr);
         }
     }

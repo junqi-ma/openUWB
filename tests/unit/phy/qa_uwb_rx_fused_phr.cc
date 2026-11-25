@@ -1118,7 +1118,9 @@ BOOST_AUTO_TEST_CASE(fused_payload_bad_packet_skips_four_candidate_replay)
     profile.rx_bpm_known_hop = true;
     profile.rx_bpm_joint_ml = true;
     profile.rx_bpm_terminated_viterbi = true;
-    profile.rx_fused_sfo_track = true;
+    // Keep SFO tracking off so this regression test directly exercises the
+    // retired `if (known_hop && !sfo_track)` four-candidate replay gate.
+    profile.rx_fused_sfo_track = false;
 
     demod::core::DemodScratch scratch;
     scratch.reserve(packet.iq.size());
@@ -1155,6 +1157,6 @@ BOOST_AUTO_TEST_CASE(fused_payload_bad_packet_skips_four_candidate_replay)
                        << " metric_passes=" << sub.fused_metric_passes);
     BOOST_CHECK(!ok);
     BOOST_CHECK(!out.fcs_pass);
-    // Exactly the primary four-candidate correlation; no replay pass.
+    // Exactly the primary known-hop correlation; no four-candidate replay pass.
     BOOST_CHECK_EQUAL(sub.fused_metric_passes, 1u);
 }

@@ -383,8 +383,8 @@ struct DemodResult {
     uint32_t diag_fir_phr_chips = 0;
     uint32_t diag_fir_payload_chips = 0;
     uint32_t diag_fir_extra_chips = 0;
-    uint32_t stage_tail_retrack_fallbacks = 0; // legacy-radius tail retries
-    uint64_t stage_sfd_tail_retrack_fallback_us = 0; // included in tail timer
+    uint32_t stage_tail_retrack_fallbacks = 0; // retired: always 0
+    uint64_t stage_sfd_tail_retrack_fallback_us = 0; // retired: always 0
     // `stage_sfd` runs once for bootstrap CFO anchoring and once after the
     // MATLAB-aligned CFO refit.  Preserve both actual search counts.
     uint64_t sfd_bootstrap_windows = 0;
@@ -397,7 +397,7 @@ struct DemodResult {
     // stage — already measured end-to-end by the single `lap(stage_sfd_us)`
     // on the success path — into its internal sub-blocks:
     //   bootstrap stage_sfd()  -> stage_sfd_bootstrap_us
-    //   tail stage_timing()    -> stage_sfd_tail_retrack_us
+    //   tail stage_timing()    -> stage_sfd_tail_retrack_us (retired: always 0)
     //   second stage_cfo()     -> stage_sfd_cfo_refit_us
     //   final stage_sfd()      -> stage_sfd_final_us
     //   remainder of the stage -> stage_sfd_anchor_other_us (checks, grid

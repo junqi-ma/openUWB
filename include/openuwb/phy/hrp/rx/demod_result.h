@@ -266,6 +266,12 @@ struct PayloadSubTimers {
     uint64_t other_derotate_us = 0;
     uint32_t fused_calls = 0;  // stage_payload_fused_cmf invocations
     uint32_t legacy_calls = 0; // stage_payload_fcs invocations
+    // Failure-path attempt counters.  Diagnostics only: they let the payload
+    // QA lock the set of redundant retries that were retired (one fused
+    // complex-correlation pass per call, and one soft round per polarity in
+    // the legacy stage after the L±1/±2 neighborhood was removed).
+    uint32_t fused_metric_passes = 0;
+    uint32_t legacy_soft_rounds = 0;
 };
 
 // ---------------------------------------------------------------------------

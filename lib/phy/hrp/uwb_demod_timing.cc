@@ -244,7 +244,7 @@ constexpr float kFoldFastAnchorMedianFloor = 0.08f;
 // probes the CFO phase or escalates to K=64, and it additionally requires a
 // confirmed leading edge plus >= 4 anchor groups with a plausible anchor
 // median.  A fast-only rejection clears everything it wrote and leaves the
-// caller to fall through to the ORIGINAL wide/TM-1/coarse/grid/full-fold path
+// caller to fall through to the ORIGINAL wide/coarse/full-fold path
 // unchanged.  `fast_only == false` is the original, gate-free behaviour.
 bool try_fold_acquire(TimingEnv& env,
                       AcquisitionState& st,
@@ -517,17 +517,16 @@ bool acquire_locked_bounded(TimingEnv& env,
         std::max<size_t>(1, profile.locked_tail_probe_step);
     const size_t need_confirm =
         std::max<size_t>(1, profile.locked_tail_probe_confirm);
-    // Two probe widths.  The locked residual is a few samples, so the
-    // narrow (+/-32) sweep finds a clean tail cheaply.  The wide sweep
-    // (+/-roi) only matters when the residual is larger than the narrow
-    // window -- and it costs 32 x 513 = 16,416 single-SYMBOL correlations,
-    // so it is NOT run before the fold: the fold covers the identical
-    // window with a 64-SYMBOL coherent gain (~18 dB more sensitive) and is
-    // the correct rescue in that regime.  The wide sweep is therefore the
-    // last resort, reached only when the fold itself could not rescue the
-    // packet.  Measured at -12 dB in-band (200 packets): the narrow sweep
-    // never produced a confirmable hit and the fold rescued every packet,
-    // so this ordering removes ~1.2 ms/packet of doomed work without
+    // Narrow (+/-32) sweep only.  The locked residual is a few samples, so
+    // this finds a clean tail cheaply (at most 32 probes over 256 SYNCs).
+    // A wider (+/-roi) sweep would cost 32 x 513 = 16,416 single-SYMBOL
+    // correlations and is redundant: the K=4/K=64 fold below covers the
+    // identical window with far more coherent gain.  The failure path is
+    // therefore narrow sweep -> fold -> hard tracking failure; it never
+    // escalates to a second, wider single-SYMBOL scan.  Measured at -12 dB
+    // in-band (200 packets): the narrow sweep never produced a confirmable
+    // hit and the fold rescued every packet, so dropping the wide sweep
+    // removes ~1.2 ms/packet of doomed work from noise/lost windows without
     // changing any outcome.
     auto tail_sweep = [&](int64_t trad) {
         for (size_t m = inner + 1; m < reps; m += step) {
@@ -609,13 +608,6 @@ bool acquire_locked_bounded(TimingEnv& env,
             profile.locked_tail_probe &&
             try_fold_acquire(env, st, static_cast<int64_t>(seed_start), roi,
                              /*fast_only=*/false);
-        if (!fold_ok && profile.locked_tail_probe) {
-            // Last resort (see the note above): the fold could not rescue
-            // this packet either, so the wide single-SYMBOL sweep is the
-            // only remaining option.  Paying its cost here cannot slow down
-            // any packet the fold already handles.
-            tail_sweep(roi);
-        }
         if (!fold_ok && !found) {
             ++out.bounded_failures;
             return false;
@@ -693,9 +685,8 @@ bool acquire_unbounded_seed(TimingEnv& env,
             // every SYNC peak above 0.08 with PAR 232..253, but only
             // 11-24 of 256 clear the 0.25 absolute threshold, so the
             // absolute gate alone loses the packet.  The wide stride scan
-            // and the whole-SYNC grid probes stay absolute-only: at
-            // thousands of lags a pure-noise false alarm would clear any
-            // PAR gate.
+            // stays absolute-only: at thousands of lags a pure-noise false
+            // alarm would clear any PAR gate.
             const bool narrow_ok =
                 local_best(env, st, seed, narrow, thr, &pos, &met, &corr,
                            /*allow_par_fallback=*/true);
@@ -735,9 +726,9 @@ bool acquire_unbounded_seed(TimingEnv& env,
     // frontend seed is still good to a few SYMBOLS.  A local K=4 coherent fold
     // over seed +/- min(margin, 8192) buys +6 dB and costs one 1016-lag
     // correlation (~15-20 us); when it is confirmed by the leading-edge
-    // disambiguation and the sparse anchor fit, the entire TM-1 / +/-131072
-    // coarse scan / whole-SYNC grid / K=64 fold tail is skipped for this
-    // packet.  Any rejection falls through to that original path untouched.
+    // disambiguation and the sparse anchor fit, the entire +/-131072 coarse
+    // scan / K=64 fold tail is skipped for this packet.  Any rejection falls
+    // through to that original path untouched.
     // No seed (blind search) or the wide interval probe (SIC fast-fail) keep
     // their existing behaviour and never enter here.
     if (!seed_acquired &&
@@ -759,11 +750,11 @@ bool acquire_unbounded_seed(TimingEnv& env,
     // (its peak lag resolves back to a true symbol boundary), so the
     // normal backtrack / SYNC-train / SFD path recovers the origin.
     //
-    // On an all-miss, the historical stride-14 coarse scan, whole-SYNC
-    // grid and fold rescue are skipped so an SIC candidate that contains
-    // no target preamble fails fast to L0_Bypass instead of paying the
-    // full wide acquisition.  rx_wide_probe_fallback restores the old
-    // behaviour for callers that prefer recall over latency.
+    // On an all-miss, the historical stride-14 coarse scan and fold rescue
+    // are skipped so an SIC candidate that contains no target preamble fails
+    // fast to L0_Bypass instead of paying the full wide acquisition.
+    // rx_wide_probe_fallback restores the old behaviour for callers that
+    // prefer recall over latency.
     if (!seed_acquired && profile.rx_wide_interval_probe) {
         const int64_t P = static_cast<int64_t>(kQm35SamplesPerSymbol);
         if (P > 0 && j_hi - j_lo >= 16 * P) {
@@ -823,83 +814,6 @@ bool acquire_unbounded_seed(TimingEnv& env,
                     return false;
                 }
             }
-        }
-    }
-
-    // ---- Phase probe + symbol-grid acquisition (TM-1) ------------------
-    // The preamble is N verbatim copies of one P=1016-sample SYNC symbol.
-    // A window of P consecutive lags therefore contains one code-phase
-    // match, so the exact sample phase can be recovered from a handful of
-    // probe windows instead of correlating all 2*margin lags.  A strict
-    // threshold keeps this zero-risk: if the probe does not see a solid
-    // SYNC (low SNR, packet outside the probes), everything below falls
-    // through to the original coarse scan unchanged.
-    //
-    // Cheap pre-gate: the frontend seed is accurate to a few SYMBOLS, so
-    // the code phase at the seed is preserved and one single-lag dot tells
-    // us whether this window is deep noise.  The 0.2 floor is close to the
-    // tracking threshold on purpose: at -12/-14 dB the single-SYNC metric
-    // is ~0.04-0.1, so the three P-length probes (which would all fail)
-    // are skipped and the fold path is not slowed down by them.
-    float probe_gate = -1.0f;
-    {
-        const int64_t gp = std::min(std::max(seed, j_lo), j_hi);
-        if (gp >= 0 && gp + static_cast<int64_t>(L) <=
-                           static_cast<int64_t>(env.n)) {
-            const auto acc = pf.filter.dot(env.rx + gp);
-            probe_gate = detail::normalized_correlation_power(
-                acc, window_power_8acc(env.rx + gp, L), Et);
-        }
-    }
-    if (probe_gate >= 0.2f && !seed_acquired && j_hi > j_lo &&
-        j_hi - j_lo >= 2 * static_cast<int64_t>(kQm35SamplesPerSymbol)) {
-        const int64_t P = static_cast<int64_t>(kQm35SamplesPerSymbol);
-        int64_t probes[3];
-        size_t nprobe = 0;
-        auto push_probe = [&](int64_t p) {
-            if (p < j_lo || p > j_hi)
-                return;
-            if (p + static_cast<int64_t>(L) + 64 > static_cast<int64_t>(env.n))
-                return;
-            if (nprobe < 3)
-                probes[nprobe++] = p;
-        };
-        push_probe(std::min(std::max(seed, j_lo), j_hi));
-        if (margin >= 32 * P) {
-            push_probe(seed - 32 * P);
-            push_probe(seed + 32 * P);
-        }
-        float best_probe = -1.0f;
-        int64_t anchor = -1;
-        for (size_t i = 0; i < nprobe; ++i) {
-            const int64_t p = probes[i];
-            const int64_t avail =
-                static_cast<int64_t>(env.n) - static_cast<int64_t>(L) - p + 1;
-            const size_t lags = static_cast<size_t>(
-                std::min<int64_t>(P, std::max<int64_t>(0, avail)));
-            if (lags < 64)
-                continue;
-            const auto pk = rxopt::scan_normalized_sync(
-                pf.filter, env.rx + p, lags,
-                window_power_8acc(env.rx + p, L), Et);
-            if (pk.metric > best_probe) {
-                best_probe = pk.metric;
-                anchor = p + static_cast<int64_t>(pk.lag);
-            }
-        }
-        if (anchor >= 0 && best_probe >= thr) {
-            // Same phase modulo P for every SYNC, so only the symbol grid
-            // remains: ~2*margin/P grid points at +/-2 samples each.
-            const int64_t rem = ((anchor - j_lo) % P + P) % P;
-            for (int64_t want = j_lo + rem; want <= j_hi; want += P) {
-                int64_t pos = -1;
-                float met = 0.0f;
-                std::complex<float> corr(0.0f, 0.0f);
-                if (local_best(env, st, want, 2, thr, &pos, &met, &corr))
-                    consider(pos, met, corr);
-            }
-            if (st.first_start >= 0)
-                seed_acquired = true;
         }
     }
 
@@ -999,26 +913,11 @@ bool acquire_unbounded_seed(TimingEnv& env,
             consider(best_coarse_j, best_coarse_m, best_coarse_c);
     }
 
-    // (c) Whole-SYNC grid probes (fallback only; covers a seed that lands
-    // mid-preamble and a sub-symbol confirmation that must not replace an
-    // SFD-refined anchor with a stronger neighbouring SYNC).
-    if (!seed_acquired) {
-        int64_t pos = -1;
-        float met = 0.0f;
-        std::complex<float> corr(0.0f, 0.0f);
-        const int64_t grid_half = margin / kQm35SamplesPerSymbol;
-        for (int64_t n_sym = -grid_half; n_sym <= grid_half; ++n_sym) {
-            if (local_best(env, st, seed + n_sym * static_cast<int64_t>(
-                                           kQm35SamplesPerSymbol),
-                           8, thr, &pos, &met, &corr))
-                consider(pos, met, corr);
-        }
-    }
     if (st.first_start < 0) {
-        // Low-SNR fallback: narrow seed refine, legacy seed refine, stride
-        // coarse scan and whole-SYNC grid probes all missed.  Fold over a
-        // capped acquisition window (never the full 40k margin: the fold
-        // cost grows with the window and the seed is already close).
+        // Low-SNR fallback: narrow seed refine, legacy seed refine and the
+        // stride coarse scan all missed.  Fold over a capped acquisition
+        // window (never the full 40k margin: the fold cost grows with the
+        // window and the seed is already close).
         if (!try_fold_acquire(env, st, seed, std::min<int64_t>(margin, 8192),
                               /*fast_only=*/false))
             return false;

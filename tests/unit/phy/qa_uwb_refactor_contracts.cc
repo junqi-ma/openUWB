@@ -309,21 +309,8 @@ BOOST_AUTO_TEST_CASE(demod_window_range_geometry_and_derotated_span)
         n, profile, /*integer_grid_ok=*/true, anchored_timing, final_sfd);
     BOOST_CHECK(anchored_sfd_only == final_sfd);
 
-    // Payload and on-demand extension rotation ranges clamp to n and skip covered prefixes.
+    // On-demand extension rotation range clamps to n and skips covered prefixes.
     profile.rx_stop_after_sfd = false;
-    demod::NsSfdResult ns_sfd;
-    ns_sfd.sfd_end_chip = 264 * 508 - 1;
-    demod::PhrResult phr;
-    phr.psdu_length = 127;
-    const SampleRange pay_range = compute_fused_payload_rotation_range(
-        n, profile, anchored_timing, 38, ns_sfd, phr, anchored_int.hi);
-    BOOST_CHECK(!pay_range.empty());
-    BOOST_CHECK(pay_range.hi < n);
-    const SampleRange pay_clamped = compute_fused_payload_rotation_range(
-        450000, profile, anchored_timing, 38, ns_sfd, phr, anchored_int.hi);
-    BOOST_CHECK_EQUAL(pay_clamped.hi, 450000u);
-    BOOST_CHECK(compute_fused_payload_rotation_range(
-                    200000, profile, anchored_timing, 38, ns_sfd, phr, 200000).empty());
     const SampleRange ext_range = compute_ondemand_extension_rotation_range(
         n, profile, anchored_timing, 38, 180000, anchored_int.hi);
     BOOST_CHECK(!ext_range.empty());

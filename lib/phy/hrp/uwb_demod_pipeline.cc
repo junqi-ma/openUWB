@@ -43,13 +43,9 @@ struct SyncBootstrapState {
 
 struct SfdAnchorConfig {
     size_t full_repetitions = 0;
-    size_t tail_repetitions = 0;
-    size_t tail_first = 0;
     int64_t bootstrap_sfd_start = 0;
     double period_hint = 0.0;
-    int64_t tail_start = 0;
     size_t template_len = 0;
-    Qm35825Profile cfo_anchor_profile;
 };
 
 // The derotation kernels (the vector block form and the legacy recurrence)
@@ -561,27 +557,6 @@ bool refit_tail_cfo_and_rotate_anchored_prefix(
     return true;
 }
 
-bool run_tail_retrack_and_cfo_refit(
-    const std::complex<float>* rx,
-    size_t n,
-    const Qm35825Profile& profile,
-    const std::vector<std::complex<float>>& template_wf,
-    bool integer_grid_ok,
-    const SfdAnchorConfig& cfg,
-    size_t seed_radius,
-    DemodScratch& scratch,
-    DemodResult& res,
-    SyncBootstrapState& sync_state,
-    TimingResult& cfo_timing)
-{
-    (void)seed_radius;
-    build_sfd_anchored_timing(cfg, res.timing, scratch.initial_timing,
-                              cfo_timing);
-    return refit_tail_cfo_and_rotate_anchored_prefix(
-        rx, n, profile, template_wf, integer_grid_ok, cfg, scratch, res,
-        sync_state, cfo_timing);
-}
-
 bool anchor_and_verify_final_sfd(
     const std::complex<float>* rx,
     size_t n,
@@ -594,14 +569,11 @@ bool anchor_and_verify_final_sfd(
     DemodResult& res)
 {
     // Use the SFD as the frame anchor.  The first SYNCs can be weak or can be
-    // missed by acquisition, so do not re-track the whole preamble from its
-    // reconstructed first repetition.  Track only the stable tail used by
-    // CIR/CFO, then rebuild the complete SYNC grid from the SFD coordinate.
+    // missed by acquisition, so reconstruct the complete SYNC grid from the
+    // SFD coordinate instead of re-tracking the preamble from its first
+    // repetition.  The ML CFO estimator samples that full-preamble grid.
     const size_t full_repetitions = profile.preamble_repetitions;
-    const size_t tail_repetitions = std::min(
-        full_repetitions,
-        std::max<size_t>(profile.cfo_min_fit_repetitions, 40));
-    if (tail_repetitions < 2 || res.timing.measured_period <= 0.0) {
+    if (full_repetitions < 2 || res.timing.measured_period <= 0.0) {
         clock.lap(res.stage_sfd_us, res.stage_total_us);
         res.status = DemodStatus::CfoFailed;
         return false;
@@ -609,40 +581,9 @@ bool anchor_and_verify_final_sfd(
 
     SfdAnchorConfig cfg;
     cfg.full_repetitions = full_repetitions;
-    cfg.tail_repetitions = tail_repetitions;
-    cfg.tail_first = (full_repetitions >= tail_repetitions)
-        ? (full_repetitions - tail_repetitions)
-        : 0;
     cfg.bootstrap_sfd_start = res.sfd.sfd_start_sample;
     cfg.period_hint = res.timing.measured_period;
-    cfg.tail_start = cfg.bootstrap_sfd_start -
-        static_cast<int64_t>(std::llround(
-            static_cast<double>(tail_repetitions) * cfg.period_hint));
     cfg.template_len = template_wf.size();
-    cfg.cfo_anchor_profile = profile;
-    cfg.cfo_anchor_profile.preamble_repetitions = tail_repetitions;
-    // The SFD anchor supplies the absolute tail origin.  Use a local ±8 sample
-    // refinement at each tail SYNC, but do not allow acquisition to jump to a
-    // different symbol or walk backwards toward weak leading repetitions.
-    cfg.cfo_anchor_profile.timing_search_margin = 0;
-    cfg.cfo_anchor_profile.timing_coarse_stride = 1;
-    cfg.cfo_anchor_profile.timing_max_backtrack_symbols = 0;
-    cfg.cfo_anchor_profile.timing_track_radius = 8;
-    // Opt-in: the SFD anchor predicts this tail origin to within a few samples;
-    // try ±8 first and fall back to the legacy ±max(256,stride) search below.
-    cfg.cfo_anchor_profile.timing_seed_refine_radius =
-        profile.rx_seed_refine_tail ? 8 : 0;
-    // Tail tracking floor.  MATLAB's 0.20 of the candidate energy is an
-    // ABSOLUTE gate: at -3.5..-4 dB in-band SNR the tail SYNC peaks sit at
-    // 0.18..0.23, so a hard 0.20 rejects half of them and the refit dies with
-    // `detected_peaks < 4` (measured: 23/100 CFO_FAILED at -3.5 dB).  The tail
-    // origin is already pinned by bootstrap_sfd to +-8 samples, so the
-    // false-alarm risk that the absolute gate was protecting against does not
-    // apply here; use the same 0.08 floor LockedBounded uses for its bounded
-    // tail probe.  `stage_timing`'s narrow seed searches additionally enable
-    // the PAR gate (PAR >= 20, floor 0.06).
-    cfg.cfo_anchor_profile.radar_verification_threshold =
-        std::min(profile.radar_verification_threshold, 0.08f);
 
     const std::vector<int8_t>& sfd_seq = scratch.cached_seq.sfd_seq;
     auto run_final_sfd = [&]() -> bool {
@@ -657,10 +598,11 @@ bool anchor_and_verify_final_sfd(
     };
 
     TimingResult cfo_timing;
-    const size_t first_seed_radius = profile.rx_seed_refine_tail ? 8 : 0;
-    if (!run_tail_retrack_and_cfo_refit(
-            rx, n, profile, template_wf, integer_grid_ok, cfg,
-            first_seed_radius, scratch, res, sync_state, cfo_timing)) {
+    build_sfd_anchored_timing(cfg, res.timing, scratch.initial_timing,
+                              cfo_timing);
+    if (!refit_tail_cfo_and_rotate_anchored_prefix(
+            rx, n, profile, template_wf, integer_grid_ok, cfg, scratch, res,
+            sync_state, cfo_timing)) {
         clock.lap(res.stage_sfd_us, res.stage_total_us);
         res.status = DemodStatus::CfoFailed;
         return false;
@@ -693,10 +635,9 @@ bool anchor_and_verify_final_sfd(
         final_sfd_ok = run_final_sfd();
     }
     // No legacy-radius retry on a failed final SFD.  The old retry re-ran the
-    // identical CFO refit on the same raw frame (`run_tail_retrack_and_cfo_refit`
-    // ignores its `seed_radius` argument, see its `(void)seed_radius;`) and then
-    // the identical final SFD on identically derotated data, so it could never
-    // change `final_sfd_ok`.
+    // identical CFO refit on the same raw frame and then the identical final
+    // SFD on identically derotated data, so it could never change
+    // `final_sfd_ok`.  The retry path (and its `seed_radius` plumbing) is gone.
     res.sfd_final_windows = res.sfd.search_windows;
     res.sfd_final_coarse_correlations = res.sfd.coarse_correlations;
     res.sfd_final_fine_correlations = res.sfd.fine_correlations;

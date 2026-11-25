@@ -295,39 +295,6 @@ SampleRange compute_anchored_prefix_range(
     return SampleRange{0, n};
 }
 
-SampleRange compute_fused_payload_rotation_range(
-    size_t n,
-    const Qm35825Profile& profile,
-    const TimingResult& timing,
-    size_t cir_tap_count,
-    const NsSfdResult& ns_sfd,
-    const PhrResult& phr,
-    size_t already_rotated_hi)
-{
-    const size_t psdu_bits = static_cast<size_t>(phr.psdu_length) * 8;
-    const size_t num_blocks = (psdu_bits + 329) / 330;
-    const size_t nsym = psdu_bits + 48 * num_blocks;
-    const int64_t phr_start = ns_sfd.sfd_end_chip + 1;
-    const int64_t payload_start = phr_start + 21 * 512;
-    const int64_t chip_start = timing.preamble_start_sample +
-        static_cast<int64_t>(cir_tap_count) -
-        static_cast<int64_t>(profile.cir_pre_samples) - 1;
-    const int64_t base0 = chip_start + payload_start * 2 -
-        static_cast<int64_t>(cir_tap_count) + 1;
-    const int64_t last_chip = static_cast<int64_t>(nsym - 1) * 64 + 40;
-    const size_t len = cir_tap_count + 2 * (8 - 1);
-    const int64_t last_sample =
-        base0 + last_chip * 2 + static_cast<int64_t>(len);
-    const size_t pay_lo = std::min(
-        already_rotated_hi,
-        static_cast<size_t>(std::max<int64_t>(0, base0)));
-    const size_t pay_hi = static_cast<size_t>(
-        std::min<int64_t>(static_cast<int64_t>(n), last_sample + 64));
-    if (pay_hi <= pay_lo)
-        return SampleRange{};
-    return SampleRange{pay_lo, pay_hi};
-}
-
 SampleRange compute_ondemand_extension_rotation_range(
     size_t n,
     const Qm35825Profile& profile,
@@ -1703,7 +1670,8 @@ bool stage_payload_fcs(const std::vector<float>& soft_chips,
     if (sub)
         ++sub->legacy_calls;
     out = PayloadResult{};
-    if (soft_chips.empty() || !phr.ok || !ns_sfd.ok || phr.psdu_length == 0)
+    if (soft_chips.empty() || !phr.ok || !ns_sfd.ok || phr.psdu_length == 0 ||
+        phr.psdu_length > profile.max_psdu_bytes)
         return false;
     const int64_t phr_start = ns_sfd.sfd_end_chip + 1;
     if (phr_start < 0)
@@ -1742,117 +1710,103 @@ bool stage_payload_fcs(const std::vector<float>& soft_chips,
         }
     }
 
-    // Candidate PSDU lengths: reported PHR length, then a small neighborhood
-    // (±2) that covers common SECDED single-bit length slips on real RF.
-    uint32_t lens[5];
-    size_t n_lens = 0;
-    auto add_len = [&](uint32_t L) {
-        if (L == 0 || L > profile.max_psdu_bytes)
-            return;
-        for (size_t i = 0; i < n_lens; ++i)
-            if (lens[i] == L)
-                return;
-        if (n_lens < 5)
-            lens[n_lens++] = L;
-    };
-    add_len(phr.psdu_length);
-    if (phr.psdu_length > 2)
-        add_len(phr.psdu_length - 1);
-    add_len(phr.psdu_length + 1);
-    if (phr.psdu_length > 3)
-        add_len(phr.psdu_length - 2);
-    add_len(phr.psdu_length + 2);
+    // Only the reported PHR length is retried.  PHR has already passed SECDED,
+    // and the retired ±2 neighborhood multiplied both the CRC-16 false-positive
+    // risk and the bad-packet tail latency (up to 10 full soft-decode rounds)
+    // without a measured recall gain.
+    const uint32_t L = phr.psdu_length;
+    const size_t psdu_bits = static_cast<size_t>(L) * 8;
+    const size_t num_blocks = (psdu_bits + 329) / 330;
+    const size_t nsym = psdu_bits + 48 * num_blocks;
+    const size_t total = 21 + nsym;
 
     // Try reported SFD polarity first, then the opposite.  On real RF the
     // NS-SFD sign can flip relative to the payload field even when the
     // magnitude metric is high; one polarity yields RS+FCS, the other fails.
     const int8_t pol0 = (ns_sfd.polarity < 0) ? -1 : 1;
     const int8_t pols[2] = { pol0, static_cast<int8_t>(-pol0) };
-    for (size_t li = 0; li < n_lens; ++li) {
-        const uint32_t L = lens[li];
-        const size_t psdu_bits = static_cast<size_t>(L) * 8;
-        const size_t num_blocks = (psdu_bits + 329) / 330;
-        const size_t nsym = psdu_bits + 48 * num_blocks;
-        for (int8_t pol : pols) {
-            std::vector<int8_t> g0p, g1p, g0, g1;
-            std::vector<float> llr0p, llr1p, llr0, llr1;
-            const auto t_soft = std::chrono::steady_clock::now();
-            const bool soft_ok =
-                detail::bprf_demod_soft(soft_chips, phr_start,
-                                        profile.code_index, 21, 64, 512, 0,
-                                        pol, g0p, g1p, llr0p, llr1p) &&
-                detail::bprf_demod_soft(soft_chips, payload_start,
-                                        profile.code_index, nsym, 8, 64,
-                                        1344, pol, g0, g1, llr0, llr1);
-            if (sub)
-                sub->soft_us += detail::payload_elapsed_us(t_soft);
-            if (!soft_ok)
-                continue;
+    // Buffers live outside the polarity loop: a failed packet is exactly the
+    // path that must not pay for repeated heap growth.
+    std::vector<int8_t> g0p, g1p, g0, g1;
+    std::vector<float> llr0p, llr1p, llr0, llr1;
+    std::vector<float> llr0j(total), llr1j(total);
+    std::vector<int8_t> decoded;
+    std::vector<int8_t> rs_cw;
+    std::vector<int8_t> psdu_bits_out;
+    for (int8_t pol : pols) {
+        if (sub)
+            ++sub->legacy_soft_rounds;
+        const auto t_soft = std::chrono::steady_clock::now();
+        const bool soft_ok =
+            detail::bprf_demod_soft(soft_chips, phr_start,
+                                    profile.code_index, 21, 64, 512, 0,
+                                    pol, g0p, g1p, llr0p, llr1p) &&
+            detail::bprf_demod_soft(soft_chips, payload_start,
+                                    profile.code_index, nsym, 8, 64,
+                                    1344, pol, g0, g1, llr0, llr1);
+        if (sub)
+            sub->soft_us += detail::payload_elapsed_us(t_soft);
+        if (!soft_ok)
+            continue;
 
-            const size_t total = 21 + nsym;
-            std::vector<float> llr0j(total), llr1j(total);
-            for (size_t s = 0; s < 21; ++s) {
-                llr0j[s] = llr0p[s];
-                llr1j[s] = llr1p[s];
-            }
-            for (size_t s = 0; s < nsym; ++s) {
-                llr0j[s + 21] = llr0[s];
-                llr1j[s + 21] = llr1[s];
-            }
-            std::vector<int8_t> decoded;
-            const auto t_vit = std::chrono::steady_clock::now();
-            detail::vitdec_cl3_soft(llr0j.data(), llr1j.data(), total, decoded);
-            if (sub)
-                sub->viterbi_us += detail::payload_elapsed_us(t_vit);
-            if (decoded.size() < total)
-                continue;
-
-            std::vector<int8_t> rs_cw(decoded.begin() + 19,
-                                      decoded.begin() + (total - 2));
-            if (rs_cw.size() != nsym)
-                continue;
-
-            std::vector<int8_t> psdu_bits_out;
-            const auto t_rs = std::chrono::steady_clock::now();
-            const bool rs_ok =
-                detail::rs_decode_stream(rs_cw, psdu_bits, psdu_bits_out);
-            if (sub)
-                sub->rs_us += detail::payload_elapsed_us(t_rs);
-            if (!rs_ok)
-                continue;
-
-            // PSDU assembly + FCS: bit packing, CRC-16 and the comparison.
-            const auto t_crc = std::chrono::steady_clock::now();
-            const size_t nbytes = psdu_bits_out.size() / 8;
-            PayloadResult cand;
-            cand.bytes.resize(nbytes);
-            for (size_t i = 0; i < nbytes; ++i) {
-                uint8_t b = 0;
-                for (int bit = 0; bit < 8; ++bit)
-                    b |= static_cast<uint8_t>(psdu_bits_out[8 * i + bit])
-                         << bit;
-                cand.bytes[i] = b;
-            }
-            cand.bits.assign(psdu_bits_out.begin(), psdu_bits_out.end());
-            if (nbytes >= 2) {
-                cand.calculated_fcs =
-                    detail::crc16_802154(cand.bytes.data(), nbytes - 2);
-                cand.received_fcs =
-                    static_cast<uint16_t>(cand.bytes[nbytes - 2]) |
-                    (static_cast<uint16_t>(cand.bytes[nbytes - 1]) << 8);
-                cand.fcs_pass =
-                    (cand.received_fcs == cand.calculated_fcs);
-            }
-            cand.ok = true;
-            if (sub)
-                sub->crc_us += detail::payload_elapsed_us(t_crc);
-            if (!any_ok || cand.fcs_pass) {
-                out = cand;
-                any_ok = true;
-            }
-            if (out.fcs_pass)
-                return true;
+        for (size_t s = 0; s < 21; ++s) {
+            llr0j[s] = llr0p[s];
+            llr1j[s] = llr1p[s];
         }
+        for (size_t s = 0; s < nsym; ++s) {
+            llr0j[s + 21] = llr0[s];
+            llr1j[s + 21] = llr1[s];
+        }
+        const auto t_vit = std::chrono::steady_clock::now();
+        detail::vitdec_cl3_soft(llr0j.data(), llr1j.data(), total, decoded);
+        if (sub)
+            sub->viterbi_us += detail::payload_elapsed_us(t_vit);
+        if (decoded.size() < total)
+            continue;
+
+        rs_cw.assign(decoded.begin() + 19, decoded.begin() + (total - 2));
+        if (rs_cw.size() != nsym)
+            continue;
+
+        const auto t_rs = std::chrono::steady_clock::now();
+        const bool rs_ok =
+            detail::rs_decode_stream(rs_cw, psdu_bits, psdu_bits_out);
+        if (sub)
+            sub->rs_us += detail::payload_elapsed_us(t_rs);
+        if (!rs_ok)
+            continue;
+
+        // PSDU assembly + FCS: bit packing, CRC-16 and the comparison.
+        const auto t_crc = std::chrono::steady_clock::now();
+        const size_t nbytes = psdu_bits_out.size() / 8;
+        PayloadResult cand;
+        cand.bytes.resize(nbytes);
+        for (size_t i = 0; i < nbytes; ++i) {
+            uint8_t b = 0;
+            for (int bit = 0; bit < 8; ++bit)
+                b |= static_cast<uint8_t>(psdu_bits_out[8 * i + bit])
+                     << bit;
+            cand.bytes[i] = b;
+        }
+        cand.bits.assign(psdu_bits_out.begin(), psdu_bits_out.end());
+        if (nbytes >= 2) {
+            cand.calculated_fcs =
+                detail::crc16_802154(cand.bytes.data(), nbytes - 2);
+            cand.received_fcs =
+                static_cast<uint16_t>(cand.bytes[nbytes - 2]) |
+                (static_cast<uint16_t>(cand.bytes[nbytes - 1]) << 8);
+            cand.fcs_pass =
+                (cand.received_fcs == cand.calculated_fcs);
+        }
+        cand.ok = true;
+        if (sub)
+            sub->crc_us += detail::payload_elapsed_us(t_crc);
+        if (!any_ok || cand.fcs_pass) {
+            out = cand;
+            any_ok = true;
+        }
+        if (out.fcs_pass)
+            return true;
     }
     return any_ok;
 }
@@ -2040,6 +1994,8 @@ bool stage_payload_fused_cmf(const std::complex<float>* rx,
                                                                   t_plan0)
                 .count());
 
+        if (sub)
+            ++sub->fused_metric_passes;
         if (known_hop) {
             const std::complex<float>* bank = nullptr;
             size_t bins = 0;
@@ -2147,11 +2103,13 @@ bool stage_payload_fused_cmf(const std::complex<float>* rx,
 
     // Attempt 2 (M2) — joint bi-orthogonal ML Viterbi on the same metrics.
     // The PHR metrics come from the fused PHR stage (already in the same
-    // rotation frame when the pilot refinement ran).  If the ML attempt fails
-    // its FCS the legacy split-LLR soft attempt below still runs, so the
-    // switch can never lose a packet the old path could decode.
-    if (joint_ml && scratch.fused_phr.metrics2_valid &&
-        scratch.fused_phr.metrics2.m0.size() == 21) {
+    // rotation frame when the pilot refinement ran).  `joint_ml_ran` records
+    // that attempts 2/2b actually executed: when they did, the split-LLR
+    // attempt 3 below is mathematically dominated by this decoder and is
+    // skipped.
+    const bool joint_ml_ran = joint_ml && scratch.fused_phr.metrics2_valid &&
+                              scratch.fused_phr.metrics2.m0.size() == 21;
+    if (joint_ml_ran) {
         const float* bm0 = nullptr;
         const float* bm1 = nullptr;
         if (known_hop) {
@@ -2192,10 +2150,9 @@ bool stage_payload_fused_cmf(const std::complex<float>* rx,
     // redone, no PHR is re-demodulated, and the only added work is one Viterbi
     // pass (~10 us).  This is visible ONLY after Attempts 1 and 2 both failed;
     // a high-SNR packet that passes on Attempt 1 never reaches it.  Failure
-    // here falls through to the unchanged Attempt 3 / safety net, so the switch
-    // cannot lose a packet the old path could decode.
-    if (joint_ml && scratch.fused_phr.metrics2_valid &&
-        scratch.fused_phr.metrics2.m0.size() == 21) {
+    // here returns false: because the ML decoder ran, Attempt 3 is skipped and
+    // the caller may still enter the full-stream fallback.
+    if (joint_ml_ran) {
         auto& v0 = scratch.fused.biorth_m0;
         auto& v1 = scratch.fused.biorth_m1;
         v0.resize(symbols);
@@ -2242,86 +2199,65 @@ bool stage_payload_fused_cmf(const std::complex<float>* rx,
     // the fused PHR cache when it is valid, otherwise from one bprf_demod_soft()
     // pass over the legacy prefix.  This is what keeps a marginal packet out of
     // the ~15 ms full-stream stage_softchip_fallbacks retry.
-    std::vector<int8_t>& soft_g0 = scratch.fused.soft_g0;
-    std::vector<int8_t>& soft_g1 = scratch.fused.soft_g1;
-    std::vector<float>& llr0 = scratch.fused.llr0;
-    std::vector<float>& llr1 = scratch.fused.llr1;
-    std::vector<int8_t> local_soft_g0p, local_soft_g1p;
-    std::vector<float> local_llr0p, local_llr1p;
-    const std::vector<float>* llr0p = phr_llr0;
-    const std::vector<float>* llr1p = phr_llr1;
-    {
-        detail::PayloadSubBucket soft_bucket(sub, &PayloadSubTimers::soft_us);
-        if (known_hop) {
-            const auto& a = scratch.fused.metrics2.m0;
-            const auto& b = scratch.fused.metrics2.m1;
-            llr0.resize(symbols);
-            llr1.resize(symbols);
-            for (size_t s = 0; s < symbols; ++s) {
-                llr0[s] = std::abs(a[s]) - std::abs(b[s]);
-                llr1[s] = std::max(a[s], b[s]) - std::max(-a[s], -b[s]);
+    //
+    // This path is retained only when Attempts 2/2b did not run: on M0/M1 (or a
+    // non-fused PHR) it is the only soft-decision decoder.  When the joint ML
+    // decoder ran, its Viterbi on the same observations dominates the split
+    // LLRs, so a further pass would only add failure-path latency.
+    if (!joint_ml_ran) {
+        std::vector<int8_t>& soft_g0 = scratch.fused.soft_g0;
+        std::vector<int8_t>& soft_g1 = scratch.fused.soft_g1;
+        std::vector<float>& llr0 = scratch.fused.llr0;
+        std::vector<float>& llr1 = scratch.fused.llr1;
+        std::vector<int8_t> local_soft_g0p, local_soft_g1p;
+        std::vector<float> local_llr0p, local_llr1p;
+        const std::vector<float>* llr0p = phr_llr0;
+        const std::vector<float>* llr1p = phr_llr1;
+        {
+            detail::PayloadSubBucket soft_bucket(sub,
+                                                &PayloadSubTimers::soft_us);
+            if (known_hop) {
+                const auto& a = scratch.fused.metrics2.m0;
+                const auto& b = scratch.fused.metrics2.m1;
+                llr0.resize(symbols);
+                llr1.resize(symbols);
+                for (size_t s = 0; s < symbols; ++s) {
+                    llr0[s] = std::abs(a[s]) - std::abs(b[s]);
+                    llr1[s] = std::max(a[s], b[s]) - std::max(-a[s], -b[s]);
+                }
+            } else {
+                rxfusion::decide_bpm_soft(scratch.fused.metrics, soft_g0,
+                                          soft_g1, llr0, llr1);
             }
-        } else {
-            rxfusion::decide_bpm_soft(scratch.fused.metrics, soft_g0, soft_g1,
-                                      llr0, llr1);
-        }
-        if (!llr0p || !llr1p || llr0p->size() != 21 || llr1p->size() != 21) {
-            llr0p = nullptr;
-            llr1p = nullptr;
-            if (detail::bprf_demod_soft(prefix_soft_chips, phr_start,
-                                        profile.code_index, 21, 64, 512, 0,
-                                        pol, local_soft_g0p, local_soft_g1p,
-                                        local_llr0p, local_llr1p)) {
-                llr0p = &local_llr0p;
-                llr1p = &local_llr1p;
+            if (!llr0p || !llr1p || llr0p->size() != 21 ||
+                llr1p->size() != 21) {
+                llr0p = nullptr;
+                llr1p = nullptr;
+                if (detail::bprf_demod_soft(prefix_soft_chips, phr_start,
+                                            profile.code_index, 21, 64, 512, 0,
+                                            pol, local_soft_g0p,
+                                            local_soft_g1p, local_llr0p,
+                                            local_llr1p)) {
+                    llr0p = &local_llr0p;
+                    llr1p = &local_llr1p;
+                }
             }
         }
-    }
-    if (llr0p && llr1p) {
-        const bool soft_decoded = detail::decode_payload_soft(
-            *llr0p, *llr1p, llr0, llr1, psdu_bits, out, sub,
-            &scratch.fused.decode);
-        if (soft_decoded && out.fcs_pass) {
-            stamp_decode();
-            return true;
+        if (llr0p && llr1p) {
+            const bool soft_decoded = detail::decode_payload_soft(
+                *llr0p, *llr1p, llr0, llr1, psdu_bits, out, sub,
+                &scratch.fused.decode);
+            if (soft_decoded && out.fcs_pass) {
+                stamp_decode();
+                return true;
+            }
         }
     }
 
-    // Safety net: the known-hop / joint-ML path failed.  Before paying for the
-    // ~10 ms full-stream retry, replay the previous-round four-candidate fused
-    // decode on the same raw IQ (integer grid only).  This is exactly the M0
-    // fused path, so an edge case in the new metric/decoder combination can
-    // never cost a packet the old fused path could decode.
-    if (known_hop && !sfo_track) {
-        detail::PayloadSubBucket soft_bucket(sub, &PayloadSubTimers::soft_us);
-        rxfusion::Timings t4;
-        if (rxfusion::correlate_payload_fused_cfo(
-                rx, n, cir.cir_filter_taps.data(), tap_count, chip_start,
-                rxfusion::kSamplesPerChip, payload_start,
-                scratch.fused.pn.data(), symbols, pol, rot, cfo_eff,
-                scratch.fused.metrics, scratch.fused.kernel, &t4,
-                /*write_complex=*/false)) {
-            std::vector<int8_t> g0_4, g1_4;
-            rxfusion::decide_bpm(scratch.fused.metrics, g0_4, g1_4);
-            if (detail::decode_payload_hard(*g0p, *g1p, g0_4, g1_4, psdu_bits,
-                                            out, sub, &scratch.fused.decode) &&
-                out.fcs_pass) {
-                stamp_decode();
-                return true;
-            }
-            std::vector<int8_t> sg0, sg1;
-            std::vector<float> l0, l1;
-            rxfusion::decide_bpm_soft(scratch.fused.metrics, sg0, sg1, l0, l1);
-            if (llr0p && llr1p &&
-                detail::decode_payload_soft(*llr0p, *llr1p, l0, l1, psdu_bits,
-                                            out, sub,
-                                            &scratch.fused.decode) &&
-                out.fcs_pass) {
-                stamp_decode();
-                return true;
-            }
-        }
-    }
+    // Every in-place attempt failed.  Returning false lets the caller's
+    // run_on_demand_with_full_stream_fallback() contract decide whether to pay
+    // for the full-stream retry (stage_fused_fallbacks); the retired M0
+    // four-candidate replay must not run here.
     stamp_decode();
     return false;
 }

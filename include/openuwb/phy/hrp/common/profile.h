@@ -200,7 +200,10 @@ struct Qm35825Profile {
     // old and new paths to be timed from the same binary.
     bool rx_fast_sfd = false;            // cached SFD template + VOLK dot
     bool rx_fast_cfo_rotation = false;   // block-anchored vector derotation
-    bool rx_seed_refine_tail = false;    // narrow first tail-SYNC search
+    // Retired: the SFD-anchored refit tolerates no tail re-tracking, so this
+    // flag no longer changes the demodulator.  Kept for public ABI / caller
+    // compatibility.
+    bool rx_seed_refine_tail = false;
     bool rx_softchip_on_demand = false;  // prefix chips + PHR-length extend
     // Experimental fused payload CMF + PN despread.  Requires the on-demand
     // prefix (SYNC/SFD/PHR) and the full integer-grid CMF; unsupported grids

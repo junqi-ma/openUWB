@@ -1093,3 +1093,68 @@ BOOST_AUTO_TEST_CASE(fused_payload_neg_polarity_retry_recovers)
     BOOST_CHECK(!control.ok);
     BOOST_CHECK(!control.out.fcs_pass);
 }
+
+// ---------------------------------------------------------------------------
+// 13. A bad packet must not replay the retired M0 four-candidate safety net.
+//
+// The clean packet is demodulated once to obtain timing/CIR/fused-PHR metrics,
+// then the payload field of the same IQ is destroyed (beyond RS correction).
+// With `rx_bpm_joint_ml` on, the in-place attempts 1/2/2b all fail and attempt
+// 3 is skipped, so stage_payload_fused_cmf() must return false after exactly
+// one complex-correlation pass.  A second pass would be the removed
+// known_hop four-candidate replay.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(fused_payload_bad_packet_skips_four_candidate_replay)
+{
+    Packet packet(127, 9);
+
+    auto profile = demod::Qm35825Profile::Default();
+    profile.code_index = 9;
+    profile.timing_search_margin = 256;
+    profile.timing_coarse_stride = 1;
+    profile.rx_softchip_on_demand = true;
+    profile.rx_fused_payload_cmf = true;
+    profile.rx_fused_phr_cmf = true;
+    profile.rx_bpm_known_hop = true;
+    profile.rx_bpm_joint_ml = true;
+    profile.rx_bpm_terminated_viterbi = true;
+    profile.rx_fused_sfo_track = true;
+
+    demod::core::DemodScratch scratch;
+    scratch.reserve(packet.iq.size());
+    const auto res = demod::core::demodulate_one(
+        packet.iq.data(), packet.iq.size(), profile, 93, Packet::seed, 0,
+        packet.sync, scratch);
+    BOOST_REQUIRE_EQUAL(int(res.status), int(demod::DemodStatus::Success));
+    BOOST_REQUIRE(res.payload.fcs_pass);
+    BOOST_REQUIRE(scratch.fused_phr.metrics2_valid);
+    BOOST_REQUIRE_EQUAL(scratch.fused_phr.metrics2.m0.size(), size_t(21));
+
+    // Destroy the payload field but keep SFD/PHR untouched (same slice as
+    // qa_uwb_rx_fused_cmf.cc's corrupt-payload case).
+    std::vector<cf> bad = packet.iq;
+    const size_t payload_start =
+        Packet::seed + (64 + 8) * 1016 + 21 * 1024;
+    const size_t corrupt_lo = std::min(bad.size(), payload_start + 100);
+    const size_t corrupt_hi = std::min(bad.size(), corrupt_lo + 8192);
+    for (size_t i = corrupt_lo; i < corrupt_hi; ++i)
+        bad[i] = cf(0.0f, 0.0f);
+
+    demod::PayloadResult out;
+    demod::PayloadSubTimers sub;
+    uint64_t template_us = 0, correlate_us = 0, decode_us = 0, decode_ns = 0;
+    size_t symbols_out = 0;
+    const bool ok = demod::core::stage_payload_fused_cmf(
+        bad.data(), bad.size(), profile, res.timing, res.cir,
+        scratch.soft_chips, res.ns_sfd, res.phr, out, scratch, template_us,
+        correlate_us, decode_us, decode_ns, symbols_out,
+        &scratch.fused_phr.g0, &scratch.fused_phr.g1, &sub, nullptr, nullptr,
+        0.0);
+    BOOST_TEST_MESSAGE("bad packet replay: ok=" << ok
+                       << " fcs=" << out.fcs_pass
+                       << " metric_passes=" << sub.fused_metric_passes);
+    BOOST_CHECK(!ok);
+    BOOST_CHECK(!out.fcs_pass);
+    // Exactly the primary four-candidate correlation; no replay pass.
+    BOOST_CHECK_EQUAL(sub.fused_metric_passes, 1u);
+}

@@ -298,6 +298,40 @@ BOOST_AUTO_TEST_CASE(test_demod_core_r4_bad_input_fails_cleanly)
 }
 
 // ---------------------------------------------------------------------------
+// P2-C: the legacy payload retry must only decode the reported PHR length.
+// A packet that cannot pass FCS must run exactly one soft round per SFD
+// polarity (2 total); the retired L±1/L±2 neighborhood would have been up to
+// 10 rounds.  `legacy_soft_rounds` makes that contract observable.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(test_demod_core_r4_payload_soft_retry_only_reported_length)
+{
+    std::vector<float> soft(18000);
+    uint32_t state = 0x12345678u;
+    for (auto& v : soft) {
+        state = state * 1664525u + 1013904223u;
+        const int32_t r = static_cast<int32_t>(state >> 8) % 2001 - 1000;
+        v = static_cast<float>(r) * 0.001f;
+    }
+    auto prof = Qm35825Profile::Default();
+    PhrResult phr;
+    phr.ok = true;
+    phr.psdu_length = 8;
+    NsSfdResult ns;
+    ns.ok = true;
+    ns.sfd_end_chip = 0;
+    core::DemodScratch scratch;
+    scratch.reserve(soft.size());
+    PayloadResult pay;
+    PayloadSubTimers sub;
+    const bool ok = core::stage_payload_fcs(
+        soft, prof, phr, ns, kQm35ChipsPerSymbol, pay, scratch, &sub);
+    BOOST_TEST_MESSAGE("legacy bad payload: ok=" << ok
+                       << " soft_rounds=" << sub.legacy_soft_rounds);
+    BOOST_CHECK(!ok);
+    BOOST_CHECK_EQUAL(sub.legacy_soft_rounds, 2u);
+}
+
+// ---------------------------------------------------------------------------
 // P0: CFO sweep — estimate + full demod across 0/±1/±5/±10/±25/±50 kHz.
 // The full chain (timing → cfo → sfd(derotated) → cir → ns_sfd → phr →
 // payload) must still decode the golden payload at every CFO.

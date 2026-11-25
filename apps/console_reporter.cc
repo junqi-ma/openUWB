@@ -59,7 +59,7 @@ void print_live_help()
                 "--tone-when-locked full|window (default full; window skips the\n"
                 "  locked silent regions and only cancels target-window samples;\n"
                 "  requires --autocorr-when-locked suspend and continuous mode)\n"
-                "--fused on|off (fused payload+PHR CMF, default on)\n"
+                "--fused on|off (fused payload+PHR CMF, default on; 'off' is deprecated)\n"
                 "--sfo-from-cfo on|off (derive SFO/period from Stage-2 CFO and --freq, default on)\n"
                 "--fused-gate-ppm 6.468 (integer chip-grid admission; ceiling = 1 sample of drift)\n"
                 "--ondemand auto|on|off (on-demand soft-chip prefix, default auto = follow --fused)\n"

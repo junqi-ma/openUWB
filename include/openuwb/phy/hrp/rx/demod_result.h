@@ -75,9 +75,9 @@ struct TimingResult {
     uint32_t seed_refine_narrow_attempts = 0;
     uint32_t seed_refine_narrow_success = 0;
     uint32_t seed_refine_fallbacks = 0;
-    // LockedBounded strategy diagnostics.  `bounded_legacy_scans` counts any
+    // Locked strategy diagnostics.  `bounded_legacy_scans` counts any
     // escalation to the stride coarse scan / whole-SYNC grid probe / long
-    // backtrack; it MUST stay 0 under SyncStrategy::LockedBounded, and a
+    // backtrack; it MUST stay 0 under SyncStrategy::Locked, and a
     // nonzero value is a contract violation, not a tuning result.
     uint32_t bounded_attempts = 0;
     uint32_t bounded_success = 0;
@@ -86,7 +86,7 @@ struct TimingResult {
     uint32_t bounded_inner_used = 0; // recovered from an inner SYNC, not SYNC #0
     size_t bounded_roi_samples = 0;
     uint32_t backtrack_symbols = 0;
-    // LockedBounded grid tracking (sparse anchors + single-point correlation).
+    // Locked grid tracking (sparse anchors + single-point correlation).
     // `grid_anchor_hits` counts anchors that produced a real +/-radius peak;
     // `grid_single_valid` counts SYNCs whose single-point metric cleared the
     // tracking threshold (this is what feeds detected_peaks).  `grid_fallbacks`
@@ -289,7 +289,7 @@ struct DemodResult {
     int64_t window_start_sample = -1;
     size_t input_sample_count = 0;
     // Synchronization strategy actually used for this packet.
-    SyncStrategy sync_strategy = SyncStrategy::AcquireLegacy;
+    SyncStrategy sync_strategy = SyncStrategy::Acquire;
 
     // per-stage outputs
     TimingResult timing;

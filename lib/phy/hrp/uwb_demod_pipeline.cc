@@ -807,65 +807,8 @@ void run_primary_full_stream_decode(
     }
 }
 
-void run_full_stream_fallback(
-    const std::complex<float>* rx,
-    size_t n,
-    const Qm35825Profile& profile,
-    DerotatedSpan& derotated_span,
-    StageClock& clock,
-    DemodScratch& scratch,
-    DemodResult& res)
-{
-    // Single full-stream retry on the legacy path.  Measure it as a
-    // separate diagnostic bucket so the first-pass stage timings are
-    // not silently replaced or double-counted.
-    ++res.stage_softchip_fallbacks;
-    // Fallback: compensate full window on legacy retry (Task A1).
-    // Record fallback_t0 before rotation so entire fallback cost is
-    // captured in stage_softchip_fallback_us and stage_total_us.
-    const auto fallback_t0 = std::chrono::steady_clock::now();
-    uint64_t rot_fb_us = 0;
-    uint32_t rk_fb = 0;
-    derotate_cfo_range(rx, n, profile, res.cfo.cfo_hz, 0, n, scratch,
-                       rot_fb_us, rk_fb);
-    res.stage_cfo_rotate_us += rot_fb_us;
-    res.stage_cfo_rotated_samples += n;
-    ++res.stage_cfo_rotation_passes;
-    derotated_span = DerotatedSpan{
-        SampleRange{0, n}, res.cfo.cfo_hz, 0, n > 0};
-
-    CirResult full_cir;
-    NsSfdResult full_ns;
-    PhrResult full_phr;
-    PayloadResult full_payload;
-    DemodStatus fallback_status = DemodStatus::PayloadFailed;
-    FullSoftchipDecodeOutputs out{full_cir, full_ns, full_phr, full_payload};
-    const bool all_stages_ok = run_full_softchip_decode_stages(
-        n, profile, profile, res.timing,
-        scratch.cached_seq.pcode, scratch.cached_seq.sfd_seq,
-        /*clock=*/nullptr, /*payload_sub=*/nullptr,
-        scratch, out, res, fallback_status);
-
-    res.stage_softchip_fallback_us = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - fallback_t0).count());
-    res.stage_total_us += res.stage_softchip_fallback_us;
-    clock.t_prev = std::chrono::steady_clock::now();
-
-    // Publish the fallback attempt even when it fails: the status
-    // below is decided by this legacy run, so the reported CIR /
-    // NS-SFD / PHR / payload must describe the same run.  Otherwise a
-    // short prefix result is paired with a full-stream failure status.
-    res.cir = std::move(full_cir);
-    res.cir.on_demand_fallbacks = 1;
-    res.ns_sfd = std::move(full_ns);
-    res.phr = std::move(full_phr);
-    res.payload = std::move(full_payload);
-    res.status = fallback_status;
-    if (all_stages_ok) {
-        maybe_diagnose_fir(profile, n, scratch, res);
-    }
-}
+// `run_full_stream_fallback` retired: fused / on-demand decode fails directly
+// without re-rotating the entire stream or re-running full-stream softchips.
 
 uint64_t rotate_uncovered_tail_range(
     const std::complex<float>* rx,
@@ -1173,8 +1116,16 @@ void run_on_demand_with_full_stream_fallback(
         }
     }
     if (!ok) {
-        run_full_stream_fallback(
-            rx, n, profile, derotated_span, clock, scratch, res);
+        if (!res.cir.ok)
+            res.status = DemodStatus::CirFailed;
+        else if (!res.ns_sfd.ok)
+            res.status = DemodStatus::SfdFailed;
+        else if (!res.phr.ok)
+            res.status = DemodStatus::PhrFailed;
+        else if (!res.payload.ok)
+            res.status = DemodStatus::PayloadFailed;
+        else
+            res.status = DemodStatus::FcsFailed;
     }
 }
 
@@ -1255,7 +1206,7 @@ DemodResult demodulate_one(const std::complex<float>* rx,
         ++res.stage_grid_rejects;
 
     if (!anchor_and_verify_final_sfd(
-            rx, n, profile, template_wf, integer_grid_ok,
+            rx, n, eff, template_wf, integer_grid_ok,
             sync_state, clock, scratch, res)) {
         rebase();
         return res;
@@ -1291,9 +1242,9 @@ DemodResult demodulate_one(const std::complex<float>* rx,
 
     // Stage 4: soft-chip CMF + PHR + payload/FCS on the CFO-compensated frame.
     const bool on_demand_path = integer_grid_ok &&
-                                (profile.rx_softchip_on_demand ||
-                                 profile.rx_fused_payload_cmf ||
-                                 profile.rx_fused_phr_cmf);
+                                (eff.rx_softchip_on_demand ||
+                                 eff.rx_fused_payload_cmf ||
+                                 eff.rx_fused_phr_cmf);
     if (on_demand_path) {
         run_on_demand_with_full_stream_fallback(
             rx, n, profile, eff, integer_grid_ok,

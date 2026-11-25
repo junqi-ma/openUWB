@@ -249,13 +249,11 @@ BOOST_AUTO_TEST_CASE(test_demod_core_softchip_fallback_timing_accounting)
     scratch.reserve(rx.size());
     auto res = core::demodulate_one(
         rx.data(), rx.size(), prof, 1, 9984, 0, load_reference_template(), scratch);
-    // Fallback must have been triggered
-    BOOST_CHECK_EQUAL(res.stage_softchip_fallbacks, 1u);
-    BOOST_CHECK_GT(res.stage_softchip_fallback_us, 0u);
-    // stage_total_us must be at least stage_softchip_fallback_us
-    BOOST_CHECK_GE(res.stage_total_us, res.stage_softchip_fallback_us);
-    // Full window was rotated in fallback
-    BOOST_CHECK_GE(res.stage_cfo_rotated_samples, rx.size());
+    // Fused failure returns directly without full-stream softchip fallback.
+    BOOST_CHECK(res.status != DemodStatus::Success);
+    BOOST_CHECK(!res.payload.fcs_pass);
+    BOOST_CHECK_EQUAL(res.stage_softchip_fallbacks, 0u);
+    BOOST_CHECK_EQUAL(res.stage_softchip_fallback_us, 0u);
 }
 
 BOOST_AUTO_TEST_CASE(test_demod_core_payload_substage_timers_partition_parent)
@@ -736,7 +734,8 @@ BOOST_AUTO_TEST_CASE(test_demod_core_tail_reuse_equivalence_and_fallback)
     auto res_fb =
         core::demodulate_one(iq.data(), iq.size(), prof_fb, 1, 9984, 0, tmpl, scratch_fb);
     BOOST_CHECK(res_fb.status == DemodStatus::Success);
-    BOOST_CHECK_EQUAL(res_fb.timing.detected_peaks, size_t(64));
+    BOOST_CHECK_EQUAL(res_fb.timing.cir_grid_repetitions, size_t(64));
+    BOOST_CHECK_GE(res_fb.timing.detected_peaks, size_t(8));
     BOOST_CHECK_SMALL(std::abs(res_fb.cfo.cfo_hz - res_legacy.cfo.cfo_hz), 25.0);
 }
 

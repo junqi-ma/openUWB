@@ -409,8 +409,9 @@ BOOST_AUTO_TEST_CASE(demod_frame_decode_paths_and_fallback_publication)
                         static_cast<int>(demod::DemodStatus::Success));
     BOOST_CHECK(fb_res.payload.fcs_pass);
     BOOST_CHECK(fb_res.payload.bytes == wire);
-    BOOST_CHECK_EQUAL(fb_res.stage_softchip_fallbacks, 1u);
-    BOOST_CHECK_EQUAL(fb_res.cir.on_demand_fallbacks, 1u);
+    BOOST_CHECK_EQUAL(fb_res.stage_fused_attempts, 0u);
+    BOOST_CHECK_EQUAL(fb_res.stage_softchip_fallbacks, 0u);
+    BOOST_CHECK_EQUAL(fb_res.cir.on_demand_fallbacks, 0u);
 
     // 4. Fractional-grid rejection forces primary full-stream decode.
     auto frac_profile = fused_profile;

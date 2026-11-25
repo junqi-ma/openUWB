@@ -217,7 +217,7 @@ build/native-avx2/apps/openuwb_rx \
 
 | 参数 | C++ live 默认 / 行为 |
 | --- | --- |
-| `--fused` / `--cir` | `on` / `full`；Full 是融合 CMF 的前提 |
+| `--fused` / `--cir` | `on` / `full`；Full 是融合 CMF 的前提（`--fused off` 已废弃，仅作内部回退与对照保留） |
 | `--fused-gate-ppm` | 默认为物理漂移上限，约 6.468 ppm；必须正值且不超上限 |
 | `--sfo-from-cfo` | `on`；默认由 Stage-2 CFO 与 `--freq`（`carrier_freq_hz`）推导 `measured_period`（`-cfo_hz / carrier_freq_hz`），避免整数峰位量化离群；`off` 回退到 Stage-1 SYNC 峰位 OLS 拟合 |
 | `--ondemand` | `auto`，跟随 `--fused` |

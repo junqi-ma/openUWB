@@ -131,22 +131,22 @@ bool estimate_cfo_from_symbols_ml(const std::complex<float>* z,
     }
 
     // ---- Step 1: Huber / median soft clipping ---------------------------
-    // Magnitudes go into the scratch buffer purely to compute the median; the
-    // per-element clip scale is re-derived from z[k] while filling the FFT
-    // buffer so the nth_element permutation cannot corrupt index association.
+    // Squared magnitudes go into the scratch buffer purely to compute the
+    // median (saving `count` sqrt calls); the per-element clip scale is
+    // re-derived from |z[k]|^2 below so only clipped outliers take sqrt().
     auto& mags = scratch.cfo_mag_buf;
     mags.resize(count); // reserved to 512; grows only for >512 symbols
     for (size_t k = 0; k < count; ++k)
-        mags[k] = std::abs(z[k]);
+        mags[k] = std::norm(z[k]);
 
     const size_t mid = count / 2;
     std::nth_element(mags.begin(), mags.begin() + mid, mags.end());
-    double med = static_cast<double>(mags[mid]);
+    double med = std::sqrt(static_cast<double>(mags[mid]));
     if (!(med > 1e-12)) {
         // Degenerate median (mostly-zero sequence): fall back to the mean.
         double sum = 0.0;
         for (size_t k = 0; k < count; ++k)
-            sum += static_cast<double>(mags[k]);
+            sum += std::sqrt(static_cast<double>(mags[k]));
         med = sum / static_cast<double>(count);
         if (!(med > 0.0))
             return false; // all-zero / all-non-positive magnitude input
@@ -154,21 +154,25 @@ bool estimate_cfo_from_symbols_ml(const std::complex<float>* z,
 
     const bool do_clip = (huber_median_scale > 0.0) && std::isfinite(huber_median_scale);
     const double clip = do_clip ? huber_median_scale * med : 0.0;
+    const double clip_sq = clip * clip;
 
     // `nth_element` permuted the magnitude buffer, so the per-element clip
     // scale is rebuilt once here and cached in the same buffer: every later
     // pass (FFT fill, Newton refill) reuses it instead of recomputing |z[k]|.
     double sum_mag = 0.0;
     for (size_t k = 0; k < count; ++k) {
-        const double m = static_cast<double>(std::abs(z[k]));
+        const double n2 = static_cast<double>(std::norm(z[k]));
         double scale = 1.0;
-        if (do_clip && m > 0.0) {
-            const double lim = clip / m;
-            if (lim < 1.0)
-                scale = lim;
+        if (do_clip && n2 > clip_sq) {
+            const double m = std::sqrt(n2);
+            if (m > 0.0) {
+                scale = clip / m;
+                sum_mag += clip;
+            }
+        } else if (n2 > 0.0) {
+            sum_mag += std::sqrt(n2);
         }
         mags[k] = static_cast<float>(scale);
-        sum_mag += m * scale;
     }
     if (!(sum_mag > 0.0))
         return false;

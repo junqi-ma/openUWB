@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -287,6 +288,11 @@ void validate_live_rx_config(LiveRxConfig& o)
         o.fused_gate_ppm > demod::core::kIntegerGridCeilingPpm)
         throw std::runtime_error("--fused-gate-ppm must be in (0, 6.468] "
                                  "(1 sample of drift over the 127 B payload)");
+    if (!o.fused) {
+        std::cerr << "Warning: --fused off is deprecated; --fused on is the "
+                     "supported path (internal full-stream fallback remains "
+                     "active).\n";
+    }
     o.ondemand_resolved =
         (o.ondemand == "auto") ? o.fused : (o.ondemand == "on");
     if (!(o.period_ms>0.0) || !std::isfinite(o.period_ms))

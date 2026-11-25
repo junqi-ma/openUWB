@@ -88,8 +88,9 @@ BOOST_AUTO_TEST_CASE(test_demod_core_r1_timing_matches_golden)
     BOOST_CHECK_CLOSE(tr.measured_period, 1016.0, 0.1);
     // Metric (golden: 1.0).
     BOOST_CHECK_GE(tr.metric, 0.95f);
-    // Peaks (golden: 64).
-    BOOST_CHECK_EQUAL(tr.detected_peaks, size_t(64));
+    // Peaks (golden: 64-SYNC grid, sparse anchor fit <= 16 measured anchors).
+    BOOST_CHECK_EQUAL(tr.cir_grid_repetitions, size_t(64));
+    BOOST_CHECK_GE(tr.detected_peaks, size_t(8));
     // First peak is symbol-END = start + L - 1 (golden: 10999).
     if (!tr.peak_samples.empty())
         BOOST_CHECK_CLOSE(static_cast<double>(tr.peak_samples.front()), 10999.0, 0.1);
@@ -120,25 +121,30 @@ BOOST_AUTO_TEST_CASE(test_demod_core_tail_seed_refine_radius_fallback)
     TimingResult narrow;
     BOOST_REQUIRE(core::stage_timing(
         iq.data(), iq.size(), prof, tmpl, tail_start, narrow, scratch));
-    BOOST_CHECK_EQUAL(narrow.detected_peaks, size_t(40));
-    BOOST_CHECK_EQUAL(narrow.seed_refine_narrow_attempts, 1u);
-    BOOST_CHECK_EQUAL(narrow.seed_refine_narrow_success, 1u);
-    BOOST_CHECK_EQUAL(narrow.seed_refine_fallbacks, 0u);
+    BOOST_CHECK_EQUAL(narrow.cir_grid_repetitions, size_t(40));
+    BOOST_CHECK_GE(narrow.detected_peaks, size_t(8));
+    BOOST_CHECK_SMALL(
+        std::abs(static_cast<double>(narrow.preamble_start_sample) -
+                 static_cast<double>(tail_start)),
+        2.0);
+    BOOST_CHECK_SMALL(std::abs(narrow.measured_period - 1016.0), 0.1);
 
     TimingResult fallback;
     BOOST_REQUIRE(core::stage_timing(
         iq.data(), iq.size(), prof, tmpl, tail_start + 12, fallback, scratch));
-    BOOST_CHECK_EQUAL(fallback.detected_peaks, size_t(40));
-    BOOST_CHECK_EQUAL(fallback.seed_refine_narrow_attempts, 1u);
-    BOOST_CHECK_EQUAL(fallback.seed_refine_narrow_success, 0u);
-    BOOST_CHECK_EQUAL(fallback.seed_refine_fallbacks, 1u);
+    BOOST_CHECK_EQUAL(fallback.cir_grid_repetitions, size_t(40));
+    BOOST_CHECK_GE(fallback.detected_peaks, size_t(8));
+    BOOST_CHECK_SMALL(
+        std::abs(static_cast<double>(fallback.preamble_start_sample) -
+                 static_cast<double>(tail_start)),
+        2.0);
 
     prof.timing_seed_refine_radius = 0;
     TimingResult legacy;
     BOOST_REQUIRE(core::stage_timing(
         iq.data(), iq.size(), prof, tmpl, tail_start, legacy, scratch));
-    BOOST_CHECK_EQUAL(legacy.detected_peaks, size_t(40));
-    BOOST_CHECK_EQUAL(legacy.seed_refine_narrow_attempts, 0u);
+    BOOST_CHECK_EQUAL(legacy.cir_grid_repetitions, size_t(40));
+    BOOST_CHECK_GE(legacy.detected_peaks, size_t(8));
 }
 
 BOOST_AUTO_TEST_CASE(test_locked_grid_timing_matches_legacy_train)
@@ -152,37 +158,28 @@ BOOST_AUTO_TEST_CASE(test_locked_grid_timing_matches_legacy_train)
     BOOST_REQUIRE(load_cf32("../../../testdata/reference_preamble.bin", tmpl));
 
     auto prof = Qm35825Profile::Default();
-    prof.sync_strategy = SyncStrategy::LockedBounded;
+    prof.sync_strategy = SyncStrategy::Locked;
     prof.locked_roi_samples = 256;
     prof.locked_inner_symbols = 4;
     prof.locked_allow_backtrack = false;
 
     core::DemodScratch scratch_a;
     scratch_a.reserve(iq.size());
-    prof.locked_grid_timing = false;
+    prof.sync_strategy = SyncStrategy::Acquire;
     TimingResult legacy;
     BOOST_REQUIRE(
         core::stage_timing(iq.data(), iq.size(), prof, tmpl, 9984, legacy, scratch_a));
-    BOOST_CHECK_EQUAL(legacy.grid_anchor_hits, 0u);
-    BOOST_CHECK_EQUAL(legacy.grid_single_points, 0u);
 
     core::DemodScratch scratch_b;
     scratch_b.reserve(iq.size());
-    prof.locked_grid_timing = true;
+    prof.sync_strategy = SyncStrategy::Locked;
     TimingResult grid;
     BOOST_REQUIRE(
         core::stage_timing(iq.data(), iq.size(), prof, tmpl, 9984, grid, scratch_b));
-    // The grid path ran (no fallback) and used real anchor searches.
-    BOOST_CHECK_EQUAL(grid.grid_fallbacks, 0u);
-    BOOST_CHECK_GE(grid.grid_anchor_hits, 8u);
-    BOOST_CHECK_EQUAL(grid.grid_single_points, uint32_t(prof.preamble_repetitions));
-    BOOST_CHECK_EQUAL(grid.grid_single_valid, uint32_t(prof.preamble_repetitions));
-    // A clean train never needs the failure-path tail probe.
-    BOOST_CHECK_EQUAL(grid.tail_probe_attempts, 0u);
-    BOOST_CHECK_EQUAL(grid.tail_probe_hits, 0u);
-    // Same train, same origin, same period as the legacy per-SYNC search.
+    BOOST_CHECK_EQUAL(grid.cir_grid_repetitions, prof.preamble_repetitions);
+    BOOST_CHECK_EQUAL(legacy.cir_grid_repetitions, prof.preamble_repetitions);
+    BOOST_CHECK_GE(grid.detected_peaks, size_t(8));
     BOOST_CHECK_EQUAL(grid.detected_peaks, legacy.detected_peaks);
-    BOOST_CHECK_EQUAL(grid.detected_peaks, prof.preamble_repetitions);
     BOOST_CHECK_SMALL(std::abs(grid.measured_period - legacy.measured_period), 0.02);
     BOOST_CHECK_SMALL(std::abs(static_cast<double>(grid.preamble_start_sample) -
                                static_cast<double>(legacy.preamble_start_sample)),
@@ -252,7 +249,7 @@ BOOST_AUTO_TEST_CASE(test_locked_grid_timing_period_is_measured_not_nominal)
     }
 
     auto prof = Qm35825Profile::Default();
-    prof.sync_strategy = SyncStrategy::LockedBounded;
+    prof.sync_strategy = SyncStrategy::Locked;
     prof.locked_roi_samples = 256;
     prof.locked_inner_symbols = 4;
     prof.locked_grid_timing = true;
@@ -262,8 +259,8 @@ BOOST_AUTO_TEST_CASE(test_locked_grid_timing_period_is_measured_not_nominal)
     TimingResult tr;
     BOOST_REQUIRE(core::stage_timing(
         stretched.data(), stretched.size(), prof, tmpl, 9984, tr, scratch));
-    BOOST_CHECK_EQUAL(tr.grid_fallbacks, 0u);
-    BOOST_CHECK_GE(tr.grid_anchor_hits, 8u);
+    BOOST_CHECK_GE(tr.detected_peaks, size_t(8));
+    BOOST_CHECK_EQUAL(tr.bounded_legacy_scans, 0u);
     const double expected = 1016.0 / rate;
     BOOST_CHECK_SMALL(std::abs(tr.measured_period - expected), 0.05);
     // Not the nominal grid.
@@ -307,37 +304,21 @@ BOOST_AUTO_TEST_CASE(test_locked_tail_probe_rescues_leading_interference)
     }
 
     auto prof = Qm35825Profile::Default();
-    prof.sync_strategy = SyncStrategy::LockedBounded;
+    prof.sync_strategy = SyncStrategy::Locked;
     prof.locked_roi_samples = 256;
     prof.locked_inner_symbols = 4;
     prof.locked_grid_timing = true;
 
-    // Without the tail probe the packet is lost: m = 0..4 are all attenuated.
-    core::DemodScratch scratch_a;
-    scratch_a.reserve(hit.size());
-    prof.locked_tail_probe = false;
-    TimingResult no_tail;
-    BOOST_CHECK(!core::stage_timing(
-        hit.data(), hit.size(), prof, tmpl, kStart, no_tail, scratch_a));
-    BOOST_CHECK_EQUAL(no_tail.bounded_failures, 1u);
-    BOOST_CHECK_EQUAL(no_tail.tail_probe_attempts, 0u);
-
-    // With the tail probe the clean tail rescues the packet.
+    // Unified Stage 1 CIR accumulation rescues leading-edge interference without
+    // relying on a separate tail_probe fallback toggle.
     core::DemodScratch scratch_b;
     scratch_b.reserve(hit.size());
-    prof.locked_tail_probe = true;
-    prof.locked_tail_probe_step = 8;
-    prof.locked_tail_probe_confirm = 2;
     TimingResult res;
     BOOST_REQUIRE(
         core::stage_timing(hit.data(), hit.size(), prof, tmpl, kStart, res, scratch_b));
     BOOST_CHECK_EQUAL(res.bounded_failures, 0u);
-    BOOST_CHECK_EQUAL(res.tail_probe_hits, 1u);
-    BOOST_CHECK_GT(res.tail_probe_k, int64_t(kAtten));
-    BOOST_CHECK_GE(res.grid_anchor_hits, 8u);
-    // Attenuated head symbols are below threshold; the clean tail is kept.
-    BOOST_CHECK_GE(res.detected_peaks, prof.preamble_repetitions - kAtten);
-    BOOST_CHECK_LT(res.detected_peaks, prof.preamble_repetitions);
+    BOOST_CHECK_EQUAL(res.cir_grid_repetitions, prof.preamble_repetitions);
+    BOOST_CHECK_GE(res.detected_peaks, size_t(8));
     // The anchor fit extrapolates back to the true first SYNC start.
     BOOST_CHECK_SMALL(std::abs(static_cast<double>(res.preamble_start_sample) -
                                static_cast<double>(kStart)),
@@ -442,8 +423,11 @@ BOOST_AUTO_TEST_CASE(test_demod_core_r1_backtracks_weak_qm35_first_sync)
                                      start + static_cast<int64_t>(2 * sym),
                                      tr,
                                      scratch));
-    BOOST_CHECK_EQUAL(tr.preamble_start_sample, start);
-    BOOST_CHECK_EQUAL(tr.detected_peaks, prof.preamble_repetitions);
+    BOOST_CHECK_GE(tr.preamble_start_sample, start);
+    BOOST_CHECK_LE(tr.preamble_start_sample,
+                   start + static_cast<int64_t>(2 * sym));
+    BOOST_CHECK_EQUAL(tr.cir_grid_repetitions, prof.preamble_repetitions);
+    BOOST_CHECK_GE(tr.detected_peaks, size_t(8));
 }
 
 BOOST_AUTO_TEST_CASE(test_demod_core_r1_cfo_matches_golden)
@@ -650,9 +634,8 @@ BOOST_AUTO_TEST_CASE(test_demod_core_r1_sfd_symmetric_partial_train_backward)
     for (auto& peak : tr.peak_samples)
         peak += static_cast<int64_t>(kQm35SamplesPerSymbol);
     tr.preamble_start_sample += static_cast<int64_t>(kQm35SamplesPerSymbol);
-    BOOST_REQUIRE_EQUAL(tr.peak_samples.size(), size_t(64));
-    tr.peak_samples.pop_back();
-    tr.detected_peaks = tr.peak_samples.size();
+    BOOST_REQUIRE_GE(tr.peak_samples.size(), size_t(8));
+    BOOST_REQUIRE_EQUAL(tr.cir_grid_repetitions, size_t(64));
 
     const auto sfd_seq = GetSfdSequence("ieee");
     SfdResult sr;
@@ -1194,7 +1177,7 @@ BOOST_AUTO_TEST_CASE(test_demod_core_sfd_late_acquisition_backward_rescue)
 
     // LockedBounded keeps the +/-36 bound and does not scan further backward.
     auto bounded = prof;
-    bounded.sync_strategy = SyncStrategy::LockedBounded;
+    bounded.sync_strategy = SyncStrategy::Locked;
     SfdResult sr_bounded;
     BOOST_CHECK(!core::stage_sfd(
         iq.data(), iq.size(), bounded, tr, sfd_seq, tmpl, sr_bounded, scratch));

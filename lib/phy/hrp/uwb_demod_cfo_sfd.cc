@@ -57,7 +57,7 @@ bool fit_cfo(const std::complex<float>* rx,
             have_corr ? std::arg(pc[idx])
                       : std::arg(rx[ps[idx]]);
     }
-    // Unwrap: adjacent SYNC phases must stay within ±π.  When LockedBounded
+    // Unwrap: adjacent SYNC phases must stay within ±π.  When Locked
     // bridges a multi-symbol interference gap, estimate the per-sample phase
     // slope from adjacent 1-symbol pairs so multi-symbol gaps unwrap cleanly.
     double unwrap_slope_rad_per_sample = 0.0;
@@ -302,18 +302,47 @@ void derotate_block_anchored(std::complex<float>* dst,
     // Complex multiply, interleaved [re, im, re, im, ...] lanes:
     //   permute(x, 0xB1) swaps re/im, addsub(a, b) = (a_even - b_even,
     //   a_odd + b_odd), which yields re = xr*yr - xi*yi, im = xi*yr + xr*yi.
+    //   Unrolled 2x (8 complex/iter); uses addsub+mul (not FMA) to stay
+    //   bit-identical with the -ffp-contract=off scalar tail.
     const __m256 are = _mm256_set1_ps(ar);
     const __m256 aim = _mm256_set1_ps(ai);
+    for (; k + 8 <= len; k += 8) {
+        const __m256 t0 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(table + k));
+        const __m256 t1 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(table + k + 4));
+        const __m256 a0 = _mm256_addsub_ps(
+            _mm256_mul_ps(t0, are),
+            _mm256_mul_ps(_mm256_permute_ps(t0, 0xB1), aim));
+        const __m256 a1 = _mm256_addsub_ps(
+            _mm256_mul_ps(t1, are),
+            _mm256_mul_ps(_mm256_permute_ps(t1, 0xB1), aim));
+        const __m256 s0 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(src + k));
+        const __m256 s1 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(src + k + 4));
+        const __m256 r0 = _mm256_addsub_ps(
+            _mm256_mul_ps(s0, _mm256_moveldup_ps(a0)),
+            _mm256_mul_ps(_mm256_permute_ps(s0, 0xB1),
+                          _mm256_movehdup_ps(a0)));
+        const __m256 r1 = _mm256_addsub_ps(
+            _mm256_mul_ps(s1, _mm256_moveldup_ps(a1)),
+            _mm256_mul_ps(_mm256_permute_ps(s1, 0xB1),
+                          _mm256_movehdup_ps(a1)));
+        _mm256_storeu_ps(reinterpret_cast<float*>(dst + k), r0);
+        _mm256_storeu_ps(reinterpret_cast<float*>(dst + k + 4), r1);
+    }
     for (; k + 4 <= len; k += 4) {
-        const __m256 t = _mm256_loadu_ps(reinterpret_cast<const float*>(table + k));
-        const __m256 ts = _mm256_permute_ps(t, 0xB1);
-        const __m256 a =
-            _mm256_addsub_ps(_mm256_mul_ps(t, are), _mm256_mul_ps(ts, aim));
-        const __m256 s = _mm256_loadu_ps(reinterpret_cast<const float*>(src + k));
-        const __m256 ss = _mm256_permute_ps(s, 0xB1);
-        const __m256 r =
-            _mm256_addsub_ps(_mm256_mul_ps(s, _mm256_moveldup_ps(a)),
-                             _mm256_mul_ps(ss, _mm256_movehdup_ps(a)));
+        const __m256 t =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(table + k));
+        const __m256 a = _mm256_addsub_ps(
+            _mm256_mul_ps(t, are),
+            _mm256_mul_ps(_mm256_permute_ps(t, 0xB1), aim));
+        const __m256 s =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(src + k));
+        const __m256 r = _mm256_addsub_ps(
+            _mm256_mul_ps(s, _mm256_moveldup_ps(a)),
+            _mm256_mul_ps(_mm256_permute_ps(s, 0xB1), _mm256_movehdup_ps(a)));
         _mm256_storeu_ps(reinterpret_cast<float*>(dst + k), r);
     }
 #endif

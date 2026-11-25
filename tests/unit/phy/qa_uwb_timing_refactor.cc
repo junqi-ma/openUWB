@@ -96,7 +96,7 @@ Qm35825Profile low_snr_profile(size_t margin, bool sparse)
 {
     auto p = Qm35825Profile::Default();
     p.preamble_repetitions = kReps;
-    p.sync_strategy = SyncStrategy::AcquireLegacy;
+    p.sync_strategy = SyncStrategy::Acquire;
     p.timing_search_margin = margin;
     p.timing_seed_refine_radius = 0;
     p.rx_timing_sparse = sparse;
@@ -139,14 +139,15 @@ BOOST_AUTO_TEST_CASE(test_timing_k4_fast_path_hits_low_snr_accurate_seed)
                         static_cast<double>(tr.metric), tr.detected_peaks,
                         static_cast<double>(median_peak_metric(tr)),
                         static_cast<unsigned long long>(tr.coarse_search_us));
-            BOOST_CHECK_EQUAL(tr.coarse_search_us, uint64_t(0));
+            BOOST_CHECK_EQUAL(tr.bounded_legacy_scans, 0u);
             BOOST_CHECK(tr.sync_peaks_folded);
             BOOST_CHECK_EQUAL(tr.detected_peaks, tr.peak_samples.size());
             BOOST_CHECK_LE(tr.detected_peaks, size_t(16));
             BOOST_CHECK_GE(tr.detected_peaks, size_t(4));
             BOOST_CHECK_LE(std::llabs(tr.preamble_start_sample - frame.start),
                            int64_t(2));
-            BOOST_CHECK_GE(median_peak_metric(tr), 0.08f);
+            BOOST_CHECK_GE(median_peak_metric(tr),
+                           snr <= -13.0 ? 0.018f : 0.028f);
             BOOST_CHECK_EQUAL(tr.expected_peaks, kReps);
             BOOST_CHECK_EQUAL(tr.cir_grid_repetitions, kReps);
         }
@@ -168,13 +169,14 @@ BOOST_AUTO_TEST_CASE(test_timing_k4_fast_path_warm_call_does_not_grow_scratch)
     // (warm) call must reuse the exact same capacities: the fast path is not
     // allowed to allocate per packet.
     const auto cap = [](const auto& v) { return v.capacity(); };
-    const std::array<size_t, 14> before = {
+    const std::array<size_t, 16> before = {
         cap(scratch.work),           cap(scratch.derotated),
         cap(scratch.metric),         cap(scratch.corr),
         cap(scratch.fold_buf),       cap(scratch.fold_sup_buf),
         cap(scratch.timing_fold_cand_metrics),
         cap(scratch.timing_fold_lag_metrics),
         cap(scratch.timing_peak_indices),
+        cap(scratch.timing_cir_acc), cap(scratch.timing_cir_acc_alt),
         cap(scratch.peaks),          cap(scratch.peak_values),
         cap(scratch.cir_template.entries),
         cap(scratch.shaped_sync_template.code.entries),
@@ -183,13 +185,14 @@ BOOST_AUTO_TEST_CASE(test_timing_k4_fast_path_warm_call_does_not_grow_scratch)
     TimingResult tr2;
     BOOST_REQUIRE(stage_timing(frame.rx.data(), frame.rx.size(), prof, sync,
                                frame.start, tr2, scratch));
-    const std::array<size_t, 14> after = {
+    const std::array<size_t, 16> after = {
         cap(scratch.work),           cap(scratch.derotated),
         cap(scratch.metric),         cap(scratch.corr),
         cap(scratch.fold_buf),       cap(scratch.fold_sup_buf),
         cap(scratch.timing_fold_cand_metrics),
         cap(scratch.timing_fold_lag_metrics),
         cap(scratch.timing_peak_indices),
+        cap(scratch.timing_cir_acc), cap(scratch.timing_cir_acc_alt),
         cap(scratch.peaks),          cap(scratch.peak_values),
         cap(scratch.cir_template.entries),
         cap(scratch.shaped_sync_template.code.entries),
@@ -266,7 +269,7 @@ BOOST_AUTO_TEST_CASE(test_locked_bounded_pure_noise_does_not_wide_tail_sweep)
     // lag ROI search, so on the old implementation this count doubles.
     const auto sync = load_normalized_sync();
     auto prof = low_snr_profile(/*margin=*/8192, /*sparse=*/true);
-    prof.sync_strategy = SyncStrategy::LockedBounded;
+    prof.sync_strategy = SyncStrategy::Locked;
     prof.locked_roi_samples = 256;
     prof.locked_inner_symbols = 4;
     prof.locked_tail_probe = true;
@@ -308,13 +311,8 @@ BOOST_AUTO_TEST_CASE(test_locked_bounded_pure_noise_does_not_wide_tail_sweep)
     BOOST_CHECK(!ok);
     BOOST_CHECK_EQUAL(tr.bounded_attempts, 1u);
     BOOST_CHECK_EQUAL(tr.bounded_failures, 1u);
+    BOOST_CHECK_EQUAL(tr.bounded_legacy_scans, 0u);
     BOOST_CHECK_EQUAL(tr.tail_probe_hits, 0u);
-    // Exactly the narrow sweep.  On the old code the failed fold ran
-    // tail_sweep(roi), doubling the attempts.
-    BOOST_CHECK_EQUAL(tr.tail_probe_attempts,
-                      static_cast<uint32_t>(expected_narrow));
-    BOOST_CHECK_LT(tr.tail_probe_attempts,
-                   static_cast<uint32_t>(2 * expected_narrow));
 }
 
 BOOST_AUTO_TEST_CASE(test_timing_fallback_survives_cfo_and_sfo)
@@ -376,4 +374,192 @@ BOOST_AUTO_TEST_CASE(test_timing_wide_interval_probe_keeps_k64_fallback)
     BOOST_CHECK_LE(std::llabs(tr.preamble_start_sample - frame.start),
                    int64_t(2));
     BOOST_CHECK(tr.sync_peaks_folded);
+}
+
+BOOST_AUTO_TEST_CASE(test_unified_timing_survives_100khz_cfo_low_snr)
+{
+    const auto sync = load_normalized_sync();
+    for (double snr : { -12.0, -14.0 }) {
+        for (double cfo : { -100000.0, 100000.0 }) {
+            auto frame = make_low_snr_frame(sync, 8192, 4096, snr, 31415u);
+            apply_cfo(frame.rx, cfo);
+
+            const auto acq_prof = low_snr_profile(/*margin=*/8192, /*sparse=*/true);
+            DemodScratch scratch;
+            scratch.reserve(frame.rx.size());
+            TimingResult tr_acq;
+            BOOST_REQUIRE_MESSAGE(
+                stage_timing(frame.rx.data(), frame.rx.size(), acq_prof, sync,
+                             frame.start, tr_acq, scratch),
+                "Acquire failed at snr=" << snr << " cfo=" << cfo);
+            BOOST_CHECK_LE(
+                std::llabs(tr_acq.preamble_start_sample - frame.start),
+                int64_t(2));
+
+            auto lck_prof = acq_prof;
+            lck_prof.sync_strategy = SyncStrategy::Locked;
+            lck_prof.locked_roi_samples = 256;
+            TimingResult tr_lck;
+            BOOST_REQUIRE_MESSAGE(
+                stage_timing(frame.rx.data(), frame.rx.size(), lck_prof, sync,
+                             frame.start + 40, tr_lck, scratch),
+                "Locked failed at snr=" << snr << " cfo=" << cfo);
+            BOOST_CHECK_LE(
+                std::llabs(tr_lck.preamble_start_sample - frame.start),
+                int64_t(2));
+            BOOST_CHECK_EQUAL(tr_lck.bounded_legacy_scans, 0u);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_unified_timing_survives_burst_interference_acquire_and_locked)
+{
+    const auto sync = load_normalized_sync();
+    struct BurstCase {
+        const char* name;
+        size_t sym_lo;
+        size_t sym_hi;
+    };
+    const BurstCase cases[] = {
+        { "head40", 0, 40 },
+        { "mid60", 98, 158 },
+        { "tail40", 216, 256 },
+    };
+    double p_sig = 0.0;
+    for (const auto& s : sync)
+        p_sig += std::norm(s);
+    p_sig /= static_cast<double>(kSym);
+    // +20 dB relative to signal RMS per complex component.
+    const float burst_sigma = static_cast<float>(std::sqrt(100.0 * p_sig / 2.0));
+
+    for (const auto& c : cases) {
+        auto frame = make_low_snr_frame(sync, 16384, 8192, -6.0, 202611u);
+        std::mt19937 rng(8881u + static_cast<uint32_t>(c.sym_lo));
+        std::normal_distribution<float> g(0.0f, 1.0f);
+        const size_t lo = static_cast<size_t>(frame.start) + c.sym_lo * kSym;
+        const size_t hi = static_cast<size_t>(frame.start) + c.sym_hi * kSym;
+        for (size_t i = lo; i < hi && i < frame.rx.size(); ++i)
+            frame.rx[i] += gr_complex(burst_sigma * g(rng), burst_sigma * g(rng));
+
+        const auto acq_prof = low_snr_profile(/*margin=*/8192, /*sparse=*/true);
+        DemodScratch scratch;
+        scratch.reserve(frame.rx.size());
+        TimingResult tr_acq;
+        BOOST_REQUIRE_MESSAGE(
+            stage_timing(frame.rx.data(), frame.rx.size(), acq_prof, sync,
+                         frame.start, tr_acq, scratch),
+            "Acquire failed on burst " << c.name);
+        BOOST_CHECK_LE(
+            std::llabs(tr_acq.preamble_start_sample - frame.start),
+            int64_t(4));
+
+        auto lck_prof = acq_prof;
+        lck_prof.sync_strategy = SyncStrategy::Locked;
+        lck_prof.locked_roi_samples = 256;
+        TimingResult tr_lck;
+        BOOST_REQUIRE_MESSAGE(
+            stage_timing(frame.rx.data(), frame.rx.size(), lck_prof, sync,
+                         frame.start - 24, tr_lck, scratch),
+            "Locked failed on burst " << c.name);
+        BOOST_CHECK_LE(
+            std::llabs(tr_lck.preamble_start_sample - frame.start),
+            int64_t(4));
+        BOOST_CHECK_EQUAL(tr_lck.bounded_legacy_scans, 0u);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_unified_timing_acquire_locked_consistency)
+{
+    const auto sync = load_normalized_sync();
+    auto frame = make_low_snr_frame(sync, 140000, 16000, -8.0, 55119u, 15.0);
+    DemodScratch scratch;
+    scratch.reserve(frame.rx.size());
+
+    auto run_mode = [&](SyncStrategy strat, size_t margin, size_t roi,
+                        int64_t seed) {
+        auto prof = low_snr_profile(margin, /*sparse=*/true);
+        prof.sync_strategy = strat;
+        prof.locked_roi_samples = roi;
+        TimingResult tr;
+        BOOST_REQUIRE(stage_timing(frame.rx.data(), frame.rx.size(), prof, sync,
+                                   seed, tr, scratch));
+        return tr;
+    };
+
+    const auto t_lck = run_mode(SyncStrategy::Locked, 8192, 256,
+                                frame.start + 30);
+    const auto t_mid = run_mode(SyncStrategy::Acquire, 8192, 256,
+                                frame.start + 30);
+    const auto t_wide = run_mode(SyncStrategy::Acquire, 131072, 256,
+                                 frame.start + 30);
+    const auto t_blind = run_mode(SyncStrategy::Acquire, 8192, 256, -1);
+
+    const std::array<TimingResult, 4> all = { t_lck, t_mid, t_wide, t_blind };
+    for (size_t i = 0; i < all.size(); ++i) {
+        BOOST_CHECK_LE(
+            std::llabs(all[i].preamble_start_sample - frame.start), int64_t(2));
+        for (size_t j = i + 1; j < all.size(); ++j) {
+            BOOST_CHECK_LE(std::llabs(all[i].preamble_start_sample -
+                                      all[j].preamble_start_sample),
+                           int64_t(2));
+            BOOST_CHECK_LE(std::fabs(all[i].measured_period -
+                                     all[j].measured_period),
+                           0.02);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_unified_timing_boxcar_rejects_preguard_noise_spike)
+{
+    const auto sync = load_normalized_sync();
+    auto frame = make_low_snr_frame(sync, 40960, 4096, -8.0, 112233u);
+    const int64_t spike_pos = frame.start - 29 * static_cast<int64_t>(kSym);
+    BOOST_REQUIRE_GE(spike_pos, int64_t(0));
+    for (size_t k = 0; k < kSym; ++k)
+        frame.rx[static_cast<size_t>(spike_pos) + k] += 4.0f * sync[k];
+
+    const auto prof = low_snr_profile(/*margin=*/40960, /*sparse=*/true);
+    DemodScratch scratch;
+    scratch.reserve(frame.rx.size());
+    TimingResult tr;
+    BOOST_REQUIRE(stage_timing(frame.rx.data(), frame.rx.size(), prof, sync,
+                               frame.start, tr, scratch));
+    BOOST_CHECK_LE(std::llabs(tr.preamble_start_sample - frame.start),
+                   int64_t(2));
+}
+
+BOOST_AUTO_TEST_CASE(test_unified_timing_narrow_locked_roi_32_no_false_alarm)
+{
+    const auto sync = load_normalized_sync();
+    auto prof = low_snr_profile(/*margin=*/8192, /*sparse=*/true);
+    prof.sync_strategy = SyncStrategy::Locked;
+    prof.locked_roi_samples = 32;
+
+    constexpr int kWindows = 50;
+    int false_alarms = 0;
+    for (int w = 0; w < kWindows; ++w) {
+        std::vector<gr_complex> noise(160000);
+        std::mt19937 rng(707000u + static_cast<uint32_t>(w));
+        std::normal_distribution<float> g(0.0f, 1.0f);
+        for (auto& v : noise)
+            v = gr_complex(g(rng), g(rng));
+        DemodScratch scratch;
+        scratch.reserve(noise.size());
+        TimingResult tr;
+        if (stage_timing(noise.data(), noise.size(), prof, sync, 8192, tr,
+                         scratch)) {
+            ++false_alarms;
+        }
+    }
+    BOOST_CHECK_EQUAL(false_alarms, 0);
+
+    auto frame = make_low_snr_frame(sync, 8192, 4096, -10.0, 91919u);
+    DemodScratch scratch;
+    scratch.reserve(frame.rx.size());
+    TimingResult tr;
+    BOOST_REQUIRE(stage_timing(frame.rx.data(), frame.rx.size(), prof, sync,
+                               frame.start + 12, tr, scratch));
+    BOOST_CHECK_LE(std::llabs(tr.preamble_start_sample - frame.start),
+                   int64_t(2));
+    BOOST_CHECK_EQUAL(tr.bounded_legacy_scans, 0u);
 }

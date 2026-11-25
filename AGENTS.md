@@ -19,8 +19,8 @@ Ninja + PCH + 重型头文件声明/实现分离重构（[构建加速验收报�
 - 历史 GNU Radio 实现在 `archive/gnuradio-adapter`（`d5dfd30`）。过渡兼容层
   `include/gnuradio/uwb/`、`gr::uwb` 别名、`uwb::` 包与 `uwb_*` 应用软链全部
   标注 `TODO(openuwb-compat-removal)`，清除顺序见重构验收报告 §4.5。
-- 保留分数网格、融合失败回退；timed 无 replay 必须 fail-closed。
-- `openuwb_rx` 默认 `--fused on --cir full --taps eq16 --sic off`。
+- timed 无 replay 必须 fail-closed。
+- `openuwb_rx` 默认 `--fused on --cir full --taps eq16 --sic off`（`--fused off` 已废弃）。
   `--sic off` 保持零分配与既有 `stdout` 协议，开启后 L0/失败路径保持 fail-open。
   Python wrapper 为兼容入口，默认 `--cir auto`；其他 C++ 参数使用 `--` 透传。
 - 不把 SFD-only 进锁、前端种子数写成完整帧 FCS 成功率；区分仿真、回放和上板证据。
@@ -48,20 +48,24 @@ Ninja + PCH + 重型头文件声明/实现分离重构（[构建加速验收报�
     env -u LD_LIBRARY_PATH cmake --build --preset dev-avx2 -j
     env -u LD_LIBRARY_PATH ctest --test-dir build/dev-avx2 -L rx_sic --output-on-failure -j
     ```
-    （TWR/Sensing/DSP 修改可按需换用 `-L twr` / `-L sensing` / `-L dsp_extra`；
-    重型低 SNR 网格扫描用 `-L heavy` 显式运行。）
+    （仅跑受影响域：改 RX/SIC 只跑 `-L rx_sic`，TWR/Sensing/DSP 修改按需换用
+    `-L twr` / `-L sensing` / `-L dsp_extra`；日常不连带跑 `legacy_diag`、
+    `heavy` 或无关域，无真机/沙箱环境跳过 `uwb_qa_uwb_uhd_backend_device.cc`。
+    重型低 SNR 网格扫描仅在改相关算法时用 `-L heavy` 显式运行。）
   - 单功能域开发可用 `UWB_DEV_SCOPE=rx|tx|twr|radar` 对应预设
     `dev-rx` / `dev-tx` / `dev-twr` / `dev-radar`（独立 `build/dev-*` 目录，
     均默认开启 `UWB_DEV_SHARED_LIBS=ON`，改库实现只重链 `.so` 而不重链全部 QA 可执行文件）；
     非 `all` 作用域不生成安装规则，也不注册 install_consumer。
     `dev-avx2` 如需共享库可追加 `-DUWB_DEV_SHARED_LIBS=ON`。
     `UWB_LINKER=AUTO|lld|mold|gold|ld` 选择链接器（先探活再启用）。
-  - 交付验收与跨预设门禁：运行 `native-avx2`、`no-uhd` 全量构建与全量 `ctest`，
-    `native-avx512` 全量编译（无 AVX-512 机器仅编译并核验强符号），以及 `scalar-debug`；
-    改动公共头、安装规则或 CMake 包导出时，须以临时前缀（`-DUWB_NATIVE_INSTALL_PREFIX=...`
-    或 `tests/integration/install_consumer/run_native_install_consumer.sh`）实跑
-    `uwb_qa_native_install_consumer`。
-- 性能测试串行、同环境对照；有调度反馈的 locked 回放采用 ABBA 配对。
+  - 交付验收与跨预设门禁（**仅在最终合入/交付或用户要求时运行，日常修改不重复跑**）：
+    运行 `native-avx2`、`no-uhd` 全量构建与全量 `ctest`（无硬件/沙箱可排除
+    `uwb_qa_uwb_uhd_backend_device.cc`），`native-avx512` 全量编译（无 AVX-512 机器仅编译并核验强符号），
+    以及 `scalar-debug`；改动公共头、安装规则或 CMake 包导出时，须以临时前缀
+    （`-DUWB_NATIVE_INSTALL_PREFIX=...` 或 `tests/integration/install_consumer/run_native_install_consumer.sh`）
+    实跑 `uwb_qa_native_install_consumer`。
+- 仅在有明确性能对比需求或用户要求时再做串行 ABBA 回归（避免每次小改都跑全场景大矩阵）。
+  性能测试串行、同环境对照；有调度反馈的 locked 回放采用 ABBA 配对。
   记录提交、CPU、ISA、构建参数、worker/queue、夹具种子/哈希和统计口径。
 - 测试信号通常在 `testdata/`；实验摘要在 `docs/performance/data_*`。
   新复现工具放入 `tools/`，生成数据放 build 或临时目录并记录来源。

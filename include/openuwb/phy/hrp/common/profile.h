@@ -41,19 +41,18 @@ enum class CirSoftChipMode : uint8_t {
 // First-SYNC search strategy (see Qm35825Profile::sync_strategy).
 // ---------------------------------------------------------------------------
 enum class SyncStrategy : int {
-    AcquireLegacy = 0, // narrow seed refine -> stride coarse scan -> grid
-                       // probes -> per-symbol backtrack (blind acquisition)
-    LockedBounded = 1  // bounded ROI around the predicted origin only; an ROI
-                       // miss is a tracking failure, never a wide scan
+    Acquire = 0, // wide/blind acquisition (full-period CIR accumulation + Boxcar leading-edge)
+    Locked = 1   // bounded ROI around the predicted origin only; an ROI
+                 // miss is a tracking failure, never a wide scan
 };
 
 inline const char* sync_strategy_name(SyncStrategy s)
 {
     switch (s) {
-    case SyncStrategy::AcquireLegacy:
-        return "acquire_legacy";
-    case SyncStrategy::LockedBounded:
-        return "locked_bounded";
+    case SyncStrategy::Acquire:
+        return "acquire";
+    case SyncStrategy::Locked:
+        return "locked";
     }
     return "unknown";
 }
@@ -149,7 +148,7 @@ struct Qm35825Profile {
     // peaks.
     //
     // The default stays AcquireLegacy so every existing caller is unchanged.
-    SyncStrategy sync_strategy = SyncStrategy::AcquireLegacy;
+    SyncStrategy sync_strategy = SyncStrategy::Acquire;
     // ± half-width (samples) of the locked ROI around the predicted origin.
     // 256 is the conservative first value; 64/128 are only valid after the
     // residual distribution has been measured on real captures.
@@ -208,10 +207,11 @@ struct Qm35825Profile {
     // Experimental fused payload CMF + PN despread.  Requires the on-demand
     // prefix (SYNC/SFD/PHR) and the full integer-grid CMF; unsupported grids
     // keep the legacy path.  Default off.
+    // Fused payload/PHR CMF switches.  Production RX (`openuwb_rx`) runs with
+    // both enabled (`--fused on`); running with `--fused off` as a primary mode
+    // is deprecated, though the underlying full-stream soft-chip path remains
+    // retained as the internal fallback/ablation path.
     bool rx_fused_payload_cmf = false;
-    // Experimental fused PHR CMF + PN despread.  Requires the payload fusion
-    // and the on-demand prefix; it shortens the prefix to the SYNC/SFD/PHR
-    // range.  Default off.
     bool rx_fused_phr_cmf = false;
     // ---- BPM-BPSK algorithm switches (ablation levels M1..M4) ------------
     // All default off so existing callers and the M0 baseline are unchanged.

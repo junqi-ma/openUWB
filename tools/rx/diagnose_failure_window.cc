@@ -57,9 +57,9 @@ int main(int argc,char**argv) try {
     p.rx_fast_sfd=true;p.rx_fast_cfo_rotation=true;p.rx_seed_refine_tail=true;
     p.rx_softchip_on_demand=true;p.rx_fused_payload_cmf=true;p.rx_fused_phr_cmf=true;
     p.fused_gate_ppm=demod::core::kIntegerGridCeilingPpm;
-    p.sync_strategy=demod::SyncStrategy::LockedBounded;p.locked_roi_samples=256;
+    p.sync_strategy=demod::SyncStrategy::Locked;p.locked_roi_samples=256;
     p.locked_allow_backtrack=false;p.timing_search_margin=0;p.timing_max_backtrack_symbols=0;
-    if(mode=="acquire") {p.sync_strategy=demod::SyncStrategy::AcquireLegacy;p.timing_search_margin=131072;p.timing_max_backtrack_symbols=128;}
+    if(mode=="acquire") {p.sync_strategy=demod::SyncStrategy::Acquire;p.timing_search_margin=131072;p.timing_max_backtrack_symbols=128;}
     if(mode=="timing020") p.radar_verification_threshold=.20f;
     if(mode=="sfd025") p.sfd_detection_threshold=.25f;
     if(mode=="both") {p.radar_verification_threshold=.20f;p.sfd_detection_threshold=.25f;}
@@ -80,7 +80,7 @@ int main(int argc,char**argv) try {
     // Independent full-preamble inspection: probe every known symbol, including
     // after the production tracker's first miss. Zero threshold is DIAGNOSTIC
     // ONLY and is not used to declare packet success.
-    auto probe=p;probe.sync_strategy=demod::SyncStrategy::LockedBounded;
+    auto probe=p;probe.sync_strategy=demod::SyncStrategy::Locked;
     probe.locked_inner_symbols=0;probe.locked_roi_samples=8;
     probe.radar_verification_threshold=0;probe.timing_track_radius=8;
     demod::TimingResult timing;demod::core::DemodScratch ps;

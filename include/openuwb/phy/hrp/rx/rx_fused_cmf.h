@@ -792,6 +792,65 @@ inline void dot2_shared_fixed52(const std::complex<float>* x0,
 #endif
 }
 
+// Generic-length shared-template 2-window complex dot (used by fused PHR where
+// `len` varies with CIR tap count).  Loads each 4-complex template group once
+// and feeds both candidate windows.
+inline void dot2_shared_generic(const std::complex<float>* x0,
+                                const std::complex<float>* x1,
+                                const std::complex<float>* tpl,
+                                size_t len,
+                                std::complex<float> out[2])
+{
+    if (len == kFusedFastLen) {
+        dot2_shared_fixed52(x0, x1, tpl, out);
+        return;
+    }
+#if UWB_CIR_FIR_HAVE_AVX2
+    const float* hp = reinterpret_cast<const float*>(tpl);
+    const float* xp0 = reinterpret_cast<const float*>(x0);
+    const float* xp1 = reinterpret_cast<const float*>(x1);
+    const size_t groups = len / 4;
+    const __m256 zero = _mm256_setzero_ps();
+    __m256 a0 = zero, a1 = zero;
+    __m256 b0 = zero, b1 = zero;
+    size_t g = 0;
+    for (; g + 2 <= groups; g += 2) {
+        const int o0 = static_cast<int>(8 * g);
+        const int o1 = o0 + 8;
+        const __m256 ht0 = _mm256_loadu_ps(hp + o0);
+        const __m256 hs0 = _mm256_permute_ps(ht0, 0xB1);
+        fused_mac_group(xp0, o0, ht0, hs0, a0);
+        fused_mac_group(xp1, o0, ht0, hs0, a1);
+        const __m256 ht1 = _mm256_loadu_ps(hp + o1);
+        const __m256 hs1 = _mm256_permute_ps(ht1, 0xB1);
+        fused_mac_group(xp0, o1, ht1, hs1, b0);
+        fused_mac_group(xp1, o1, ht1, hs1, b1);
+    }
+    for (; g < groups; ++g) {
+        const int o = static_cast<int>(8 * g);
+        const __m256 ht = _mm256_loadu_ps(hp + o);
+        const __m256 hs = _mm256_permute_ps(ht, 0xB1);
+        fused_mac_group(xp0, o, ht, hs, a0);
+        fused_mac_group(xp1, o, ht, hs, a1);
+    }
+    std::complex<float> r0 = fused_hsum4(_mm256_add_ps(a0, b0));
+    std::complex<float> r1 = fused_hsum4(_mm256_add_ps(a1, b1));
+    for (size_t i = 4 * groups; i < len; ++i) {
+        const float hr = tpl[i].real();
+        const float hi = tpl[i].imag();
+        r0 += std::complex<float>(x0[i].real() * hr - x0[i].imag() * hi,
+                                  x0[i].real() * hi + x0[i].imag() * hr);
+        r1 += std::complex<float>(x1[i].real() * hr - x1[i].imag() * hi,
+                                  x1[i].real() * hi + x1[i].imag() * hr);
+    }
+    out[0] = r0;
+    out[1] = r1;
+#else
+    out[0] = cir_fir::dot_multi_acc8(x0, tpl, len);
+    out[1] = cir_fir::dot_multi_acc8(x1, tpl, len);
+#endif
+}
+
 // Window-origin and length validation shared by the payload kernels.  Mirrors
 // correlate_field()'s uint64 bounds logic exactly: symbol 0 starts at `base0`,
 // the furthest candidate window must end at or before sample n-1.

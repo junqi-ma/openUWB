@@ -98,6 +98,130 @@ build_sfd_template(const std::vector<std::complex<float>>& template_wf,
 namespace {
 
 #if UWB_RXOPT_HAVE_AVX2
+// Local AVX2 three-operand add.  Sixteen complex samples per iteration
+// (4 x 256-bit) plus one 256-bit register and a scalar tail.  Both sources are
+// loaded before dst is stored, so dst == a or dst == b stays safe.
+__attribute__((target("avx2")))
+void vector_add3_complex_avx2(std::complex<float>* dst,
+                              const std::complex<float>* a,
+                              const std::complex<float>* b, size_t count)
+{
+    float* d = reinterpret_cast<float*>(dst);
+    const float* pa = reinterpret_cast<const float*>(a);
+    const float* pb = reinterpret_cast<const float*>(b);
+    size_t i = 0;
+    const size_t limit16 = count & ~size_t(15);
+    for (; i < limit16; i += 16) {
+        const __m256 a0 = _mm256_loadu_ps(pa + 2 * i);
+        const __m256 a1 = _mm256_loadu_ps(pa + 2 * i + 8);
+        const __m256 a2 = _mm256_loadu_ps(pa + 2 * i + 16);
+        const __m256 a3 = _mm256_loadu_ps(pa + 2 * i + 24);
+        const __m256 b0 = _mm256_loadu_ps(pb + 2 * i);
+        const __m256 b1 = _mm256_loadu_ps(pb + 2 * i + 8);
+        const __m256 b2 = _mm256_loadu_ps(pb + 2 * i + 16);
+        const __m256 b3 = _mm256_loadu_ps(pb + 2 * i + 24);
+        _mm256_storeu_ps(d + 2 * i, _mm256_add_ps(a0, b0));
+        _mm256_storeu_ps(d + 2 * i + 8, _mm256_add_ps(a1, b1));
+        _mm256_storeu_ps(d + 2 * i + 16, _mm256_add_ps(a2, b2));
+        _mm256_storeu_ps(d + 2 * i + 24, _mm256_add_ps(a3, b3));
+    }
+    for (; i + 4 <= count; i += 4) {
+        const __m256 va = _mm256_loadu_ps(pa + 2 * i);
+        const __m256 vb = _mm256_loadu_ps(pb + 2 * i);
+        _mm256_storeu_ps(d + 2 * i, _mm256_add_ps(va, vb));
+    }
+    for (; i < count; ++i)
+        dst[i] = a[i] + b[i];
+}
+
+__attribute__((target("avx2")))
+void vector_accumulate_complex_dual_avx2(std::complex<float>* dst0,
+                                         std::complex<float>* dst1,
+                                         const std::complex<float>* src,
+                                         size_t count)
+{
+    float* d0 = reinterpret_cast<float*>(dst0);
+    float* d1 = reinterpret_cast<float*>(dst1);
+    const float* s = reinterpret_cast<const float*>(src);
+    const size_t num_floats = 2 * count;
+    size_t i = 0;
+    const size_t limit = num_floats & ~size_t(7);
+    for (; i < limit; i += 8) {
+        const __m256 vs = _mm256_loadu_ps(s + i);
+        const __m256 vd0 = _mm256_loadu_ps(d0 + i);
+        const __m256 vd1 = _mm256_loadu_ps(d1 + i);
+        _mm256_storeu_ps(d0 + i, _mm256_add_ps(vd0, vs));
+        _mm256_storeu_ps(d1 + i, _mm256_add_ps(vd1, vs));
+    }
+    for (; i < num_floats; ++i) {
+        const float sv = s[i];
+        d0[i] += sv;
+        d1[i] += sv;
+    }
+}
+
+__attribute__((target("avx2")))
+void vector_accumulate_scaled_complex_dual_avx2(std::complex<float>* dst0,
+                                                std::complex<float>* dst1,
+                                                const std::complex<float>* src,
+                                                float c, float s, size_t count)
+{
+    const __m256 vc = _mm256_set1_ps(c);
+    const __m256 vs = _mm256_set1_ps(s);
+    size_t j = 0;
+    const size_t limit8 = count & ~size_t(7);
+    for (; j < limit8; j += 8) {
+        const __m256 v0 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(src + j));
+        const __m256 v1 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(src + j + 4));
+        const __m256 rot0 = _mm256_addsub_ps(
+            _mm256_mul_ps(v0, vc),
+            _mm256_mul_ps(_mm256_permute_ps(v0, 0xB1), vs));
+        const __m256 rot1 = _mm256_addsub_ps(
+            _mm256_mul_ps(v1, vc),
+            _mm256_mul_ps(_mm256_permute_ps(v1, 0xB1), vs));
+        const __m256 d00 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(dst0 + j));
+        const __m256 d01 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(dst0 + j + 4));
+        const __m256 d10 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(dst1 + j));
+        const __m256 d11 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(dst1 + j + 4));
+        _mm256_storeu_ps(reinterpret_cast<float*>(dst0 + j),
+                         _mm256_add_ps(d00, rot0));
+        _mm256_storeu_ps(reinterpret_cast<float*>(dst0 + j + 4),
+                         _mm256_add_ps(d01, rot1));
+        _mm256_storeu_ps(reinterpret_cast<float*>(dst1 + j),
+                         _mm256_add_ps(d10, rot0));
+        _mm256_storeu_ps(reinterpret_cast<float*>(dst1 + j + 4),
+                         _mm256_add_ps(d11, rot1));
+    }
+    for (; j + 4 <= count; j += 4) {
+        const __m256 v =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(src + j));
+        const __m256 rot = _mm256_addsub_ps(
+            _mm256_mul_ps(v, vc),
+            _mm256_mul_ps(_mm256_permute_ps(v, 0xB1), vs));
+        const __m256 d0 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(dst0 + j));
+        const __m256 d1 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(dst1 + j));
+        _mm256_storeu_ps(reinterpret_cast<float*>(dst0 + j),
+                         _mm256_add_ps(d0, rot));
+        _mm256_storeu_ps(reinterpret_cast<float*>(dst1 + j),
+                         _mm256_add_ps(d1, rot));
+    }
+    for (; j < count; ++j) {
+        const auto v = src[j];
+        const std::complex<float> rot(c * v.real() - s * v.imag(),
+                                      s * v.real() + c * v.imag());
+        dst0[j] += rot;
+        dst1[j] += rot;
+    }
+}
+
 // Local AVX2 three-operand subtract.  Sixteen complex samples per iteration
 // (4 x 256-bit) plus one 256-bit register and a scalar tail.  Both sources are
 // loaded before dst is stored, so dst == a stays safe.
@@ -246,6 +370,42 @@ void vector_accumulate_complex(std::complex<float>* dst,
         dst[m] += src[m];
 }
 
+void vector_accumulate_complex_dual(std::complex<float>* dst0,
+                                    std::complex<float>* dst1,
+                                    const std::complex<float>* src,
+                                    size_t count)
+{
+    if (count == 0)
+        return;
+#if UWB_RXOPT_HAVE_AVX2
+    if (has_avx2_fma()) {
+        vector_accumulate_complex_dual_avx2(dst0, dst1, src, count);
+        return;
+    }
+#endif
+    for (size_t m = 0; m < count; ++m) {
+        const std::complex<float> sv = src[m];
+        dst0[m] += sv;
+        dst1[m] += sv;
+    }
+}
+
+void vector_add3_complex(std::complex<float>* dst,
+                         const std::complex<float>* a,
+                         const std::complex<float>* b, size_t count)
+{
+    if (count == 0)
+        return;
+#if UWB_RXOPT_HAVE_AVX2
+    if (has_avx2_fma()) {
+        vector_add3_complex_avx2(dst, a, b, count);
+        return;
+    }
+#endif
+    for (size_t m = 0; m < count; ++m)
+        dst[m] = a[m] + b[m];
+}
+
 void vector_sub_complex(std::complex<float>* dst,
                         const std::complex<float>* src,
                         size_t count)
@@ -349,6 +509,28 @@ void vector_accumulate_scaled_complex(std::complex<float>* dst,
 #endif
     for (size_t j = 0; j < count; ++j)
         dst[j] += alpha * src[j];
+}
+
+void vector_accumulate_scaled_complex_dual(std::complex<float>* dst0,
+                                           std::complex<float>* dst1,
+                                           const std::complex<float>* src,
+                                           std::complex<float> alpha,
+                                           size_t count)
+{
+    if (count == 0)
+        return;
+#if UWB_RXOPT_HAVE_AVX2
+    if (has_avx2_fma()) {
+        vector_accumulate_scaled_complex_dual_avx2(
+            dst0, dst1, src, alpha.real(), alpha.imag(), count);
+        return;
+    }
+#endif
+    for (size_t j = 0; j < count; ++j) {
+        const std::complex<float> rot = alpha * src[j];
+        dst0[j] += rot;
+        dst1[j] += rot;
+    }
 }
 
 void vector_mul_complex(std::complex<float>* dst,
@@ -614,16 +796,43 @@ MatchedFilterPeak scan_normalized_sync(const SyncMatchedFilter& filter,
                                        float* metrics)
 {
     MatchedFilterPeak peak;
-    filter.for_each_lag(rx, lag_count, [&](size_t lag, std::complex<float> corr, bool) {
-        const float metric =
-            openuwb::core::normalized_correlation_power(corr, power, template_energy);
-        if (metrics)
-            metrics[lag] = metric;
-        if (metric > peak.metric)
-            peak = { lag, metric, corr };
-        if (lag + 1 < lag_count)
-            power += std::norm(rx[lag + filter.length()]) - std::norm(rx[lag]);
-    });
+    if (lag_count == 0)
+        return peak;
+    const size_t L = filter.length();
+    constexpr size_t kChunk = 256; // multiple of 32; 2 KB stack, zero heap alloc
+    float off_pwr[kChunk];
+    float on_pwr[kChunk];
+    for (size_t base = 0; base < lag_count; base += kChunk) {
+        const size_t chunk_len = std::min<size_t>(kChunk, lag_count - base);
+        const size_t n_diff =
+            (base + chunk_len < lag_count) ? chunk_len : (chunk_len - 1);
+        if (n_diff > 0) {
+            const float* f_off = reinterpret_cast<const float*>(rx + base);
+            const float* f_on = reinterpret_cast<const float*>(rx + base + L);
+            for (size_t i = 0; i < n_diff; ++i) {
+                const float r0 = f_off[2 * i];
+                const float i0 = f_off[2 * i + 1];
+                const float r1 = f_on[2 * i];
+                const float i1 = f_on[2 * i + 1];
+                off_pwr[i] = r0 * r0 + i0 * i0;
+                on_pwr[i] = r1 * r1 + i1 * i1;
+            }
+        }
+        filter.for_each_lag(
+            rx + base, chunk_len,
+            [&](size_t local_lag, std::complex<float> corr, bool) {
+                const size_t lag = base + local_lag;
+                const float metric =
+                    openuwb::core::normalized_correlation_power(
+                        corr, power, template_energy);
+                if (metrics)
+                    metrics[lag] = metric;
+                if (metric > peak.metric)
+                    peak = { lag, metric, corr };
+                if (local_lag < n_diff)
+                    power += on_pwr[local_lag] - off_pwr[local_lag];
+            });
+    }
     return peak;
 }
 

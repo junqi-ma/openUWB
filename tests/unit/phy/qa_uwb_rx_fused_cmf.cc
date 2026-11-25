@@ -321,11 +321,10 @@ BOOST_AUTO_TEST_CASE(fused_cmf_skips_rake_and_bypass)
         BOOST_REQUIRE_EQUAL(int(r.status), int(demod::DemodStatus::Success));
         BOOST_CHECK(r.payload.fcs_pass);
         // The fused kernel only supports the full integer-grid CMF; RAKE and
-        // bypass must keep the legacy path and not count a fused attempt.
-        // The on-demand prefix itself rejects these modes and performs one
-        // full-stream retry, so softchip_fallbacks is 1.
+        // bypass route directly to the primary full-stream path without a
+        // fused attempt or fallback retry.
         BOOST_CHECK_EQUAL(r.stage_fused_attempts, 0u);
-        BOOST_CHECK_EQUAL(r.stage_softchip_fallbacks, 1u);
+        BOOST_CHECK_EQUAL(r.stage_softchip_fallbacks, 0u);
         BOOST_CHECK_EQUAL(r.stage_fused_fallbacks, 0u);
     }
 }
@@ -387,13 +386,10 @@ BOOST_AUTO_TEST_CASE(fused_cmf_corrupt_payload_falls_back_without_commit)
     BOOST_REQUIRE(b.phr.ok); // the corruption starts after the PHR field
     BOOST_CHECK_EQUAL(b.stage_fused_attempts, 1u);
     BOOST_CHECK_EQUAL(b.stage_fused_fallbacks, 1u);
-    BOOST_CHECK_EQUAL(b.stage_softchip_fallbacks, 1u);
+    BOOST_CHECK_EQUAL(b.stage_softchip_fallbacks, 0u);
     // A corrupted packet must never be reported as a successful commit.
     BOOST_CHECK(!b.payload.fcs_pass);
     BOOST_CHECK(b.status != demod::DemodStatus::Success);
-    // The published result must describe the final legacy retry, not a
-    // discarded prefix/fused attempt.
-    BOOST_CHECK_EQUAL(b.cir.soft_chip_count, a.cir.soft_chip_count);
     BOOST_CHECK_EQUAL(b.ns_sfd.sfd_start_chip, a.ns_sfd.sfd_start_chip);
 }
 

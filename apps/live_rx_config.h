@@ -124,7 +124,7 @@ struct LiveRxConfig {
     bool tone = true;        // fixed-tone cancellation (continuous mode only)
     double tone_period_ms = 20.0;   // model update cadence (diagnostic sweep)
     double tone_training_ms = 0.5;  // training window at each period start
-    bool fused = true;       // fused payload + PHR CMF/despread
+    bool fused = true;       // fused payload + PHR CMF/despread (`off` is deprecated)
     bool sfo_from_cfo = true; // derive chip/symbol period from Stage-2 CFO (-cfo/freq)
     // Integer chip-grid admission tolerance in ppm.  Defaults to the physical
     // ceiling (1 sample of drift over the 127 B payload); see

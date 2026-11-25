@@ -74,12 +74,12 @@ inline std::complex<float> sparse_ternary_dot_single(
     return acc;
 }
 
-inline void sparse_ternary_dot_8lag(
-    const std::complex<float>* rx,
-    const SparseCirTemplate& tmpl,
-    std::complex<float> out[8])
+#if UWB_RXOPT_HAVE_AVX2
+__attribute__((target("avx2,fma")))
+inline void sparse_ternary_dot_8lag_avx2(const std::complex<float>* rx,
+                                         const SparseCirTemplate& tmpl,
+                                         std::complex<float> out[8])
 {
-#if defined(__AVX2__) && defined(__FMA__)
     const float* rx_f = reinterpret_cast<const float*>(rx);
     __m256 p0 = _mm256_setzero_ps();
     __m256 p1 = _mm256_setzero_ps();
@@ -97,7 +97,20 @@ inline void sparse_ternary_dot_8lag(
     }
     _mm256_storeu_ps(reinterpret_cast<float*>(out), _mm256_sub_ps(p0, n0));
     _mm256_storeu_ps(reinterpret_cast<float*>(out + 4), _mm256_sub_ps(p1, n1));
-#else
+}
+#endif
+
+inline void sparse_ternary_dot_8lag(
+    const std::complex<float>* rx,
+    const SparseCirTemplate& tmpl,
+    std::complex<float> out[8])
+{
+#if UWB_RXOPT_HAVE_AVX2
+    if (has_avx2_fma()) {
+        sparse_ternary_dot_8lag_avx2(rx, tmpl, out);
+        return;
+    }
+#endif
     for (int m = 0; m < 8; ++m)
         out[m] = std::complex<float>(0.0f, 0.0f);
     for (const auto& e : tmpl.entries) {
@@ -110,7 +123,6 @@ inline void sparse_ternary_dot_8lag(
                 out[m] -= rx[p + m];
         }
     }
-#endif
 }
 
 #if UWB_RXOPT_HAVE_AVX2

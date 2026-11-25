@@ -348,7 +348,7 @@ BOOST_AUTO_TEST_CASE(locked_bounded_never_uses_a_wide_scan)
     p.code_index = 10;
     p.preamble_repetitions = reps;
     p.sfd_mode = "4z2";
-    p.sync_strategy = openuwb::demod::SyncStrategy::LockedBounded;
+    p.sync_strategy = openuwb::demod::SyncStrategy::Locked;
     p.locked_roi_samples = 256;
     p.locked_allow_backtrack = false;
 
@@ -382,7 +382,7 @@ BOOST_AUTO_TEST_CASE(locked_bounded_never_uses_a_wide_scan)
     // which proves the bounded path is genuinely more restrictive rather than
     // broken.
     auto legacy = p;
-    legacy.sync_strategy = openuwb::demod::SyncStrategy::AcquireLegacy;
+    legacy.sync_strategy = openuwb::demod::SyncStrategy::Acquire;
     legacy.timing_search_margin = 40960;
     legacy.timing_max_backtrack_symbols = 40;
     openuwb::demod::TimingResult acq;

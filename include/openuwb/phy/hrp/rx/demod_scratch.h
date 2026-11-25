@@ -75,6 +75,9 @@ struct DemodScratch {
     std::vector<float> timing_fold_cand_metrics;
     std::vector<float> timing_fold_lag_metrics;
     std::vector<size_t> timing_peak_indices;
+    // Unified Stage-1 CIR accumulation buffers (1024 floats each = 4 KB, L1-resident).
+    std::vector<float> timing_cir_acc;
+    std::vector<float> timing_cir_acc_alt;
 
     // Coherent SYNC average tail (last 32 SYNCs) produced while estimating the
     // CIR from the raw, unrotated rx.  `stage_softchips_from_cir`'s
@@ -295,9 +298,11 @@ struct DemodScratch {
         peak_values.reserve(256);
         fold_buf.reserve(16384);
         fold_sup_buf.reserve(2048);
-        timing_fold_cand_metrics.reserve(64);
+        timing_fold_cand_metrics.reserve(1024);
         timing_fold_lag_metrics.reserve(2048);
         timing_peak_indices.reserve(512);
+        timing_cir_acc.reserve(1024);
+        timing_cir_acc_alt.reserve(1024);
         cfo_sym_z.reserve(512);
         cfo_coarse_z.reserve(128);
         cfo_fft_buf.reserve(2048);

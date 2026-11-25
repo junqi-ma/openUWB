@@ -462,6 +462,16 @@ void vector_accumulate_complex(std::complex<float>* dst,
                                const std::complex<float>* src,
                                size_t count);
 
+void vector_accumulate_complex_dual(std::complex<float>* dst0,
+                                    std::complex<float>* dst1,
+                                    const std::complex<float>* src,
+                                    size_t count);
+
+void vector_add3_complex(std::complex<float>* dst,
+                         const std::complex<float>* a,
+                         const std::complex<float>* b,
+                         size_t count);
+
 void vector_sub_complex(std::complex<float>* dst,
                         const std::complex<float>* src,
                         size_t count);
@@ -575,8 +585,28 @@ inline void vector_accumulate_scaled_complex_avx2(std::complex<float>* dst,
     const __m256 vc = _mm256_set1_ps(c);
     const __m256 vs = _mm256_set1_ps(s);
     size_t j = 0;
-    const size_t limit = count & ~size_t(3);
-    for (; j < limit; j += 4) {
+    const size_t limit8 = count & ~size_t(7);
+    for (; j < limit8; j += 8) {
+        const __m256 v0 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(src + j));
+        const __m256 v1 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(src + j + 4));
+        const __m256 sw0 = _mm256_permute_ps(v0, 0xB1);
+        const __m256 sw1 = _mm256_permute_ps(v1, 0xB1);
+        const __m256 rot0 = _mm256_addsub_ps(_mm256_mul_ps(v0, vc),
+                                             _mm256_mul_ps(sw0, vs));
+        const __m256 rot1 = _mm256_addsub_ps(_mm256_mul_ps(v1, vc),
+                                             _mm256_mul_ps(sw1, vs));
+        const __m256 d0 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(dst + j));
+        const __m256 d1 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(dst + j + 4));
+        _mm256_storeu_ps(reinterpret_cast<float*>(dst + j),
+                         _mm256_add_ps(d0, rot0));
+        _mm256_storeu_ps(reinterpret_cast<float*>(dst + j + 4),
+                         _mm256_add_ps(d1, rot1));
+    }
+    for (; j + 4 <= count; j += 4) {
         const __m256 v =
             _mm256_loadu_ps(reinterpret_cast<const float*>(src + j));
         const __m256 sw = _mm256_permute_ps(v, 0xB1);
@@ -600,8 +630,30 @@ inline void vector_mul_complex_avx2(std::complex<float>* dst,
                                     size_t count)
 {
     size_t j = 0;
-    const size_t limit = count & ~size_t(3);
-    for (; j < limit; j += 4) {
+    const size_t limit8 = count & ~size_t(7);
+    for (; j < limit8; j += 8) {
+        const __m256 v0 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(dst + j));
+        const __m256 v1 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(dst + j + 4));
+        const __m256 b0 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(mul + j));
+        const __m256 b1 =
+            _mm256_loadu_ps(reinterpret_cast<const float*>(mul + j + 4));
+        const __m256 br0 = _mm256_moveldup_ps(b0);
+        const __m256 bi0 = _mm256_movehdup_ps(b0);
+        const __m256 br1 = _mm256_moveldup_ps(b1);
+        const __m256 bi1 = _mm256_movehdup_ps(b1);
+        const __m256 prod0 = _mm256_addsub_ps(
+            _mm256_mul_ps(v0, br0),
+            _mm256_mul_ps(_mm256_permute_ps(v0, 0xB1), bi0));
+        const __m256 prod1 = _mm256_addsub_ps(
+            _mm256_mul_ps(v1, br1),
+            _mm256_mul_ps(_mm256_permute_ps(v1, 0xB1), bi1));
+        _mm256_storeu_ps(reinterpret_cast<float*>(dst + j), prod0);
+        _mm256_storeu_ps(reinterpret_cast<float*>(dst + j + 4), prod1);
+    }
+    for (; j + 4 <= count; j += 4) {
         const __m256 v =
             _mm256_loadu_ps(reinterpret_cast<const float*>(dst + j));
         const __m256 b =
@@ -621,6 +673,12 @@ void vector_accumulate_scaled_complex(std::complex<float>* dst,
                                       const std::complex<float>* src,
                                       std::complex<float> alpha,
                                       size_t count);
+
+void vector_accumulate_scaled_complex_dual(std::complex<float>* dst0,
+                                           std::complex<float>* dst1,
+                                           const std::complex<float>* src,
+                                           std::complex<float> alpha,
+                                           size_t count);
 
 void vector_mul_complex(std::complex<float>* dst,
                         const std::complex<float>* mul,

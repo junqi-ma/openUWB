@@ -322,8 +322,19 @@ PacketExecutionPlan plan_packet_execution(
 {
     PacketExecutionPlan plan;
     plan.effective_profile = profile;
-    if (profile.rx_softchip_on_demand || profile.rx_fused_payload_cmf ||
-        profile.rx_fused_phr_cmf) {
+    const bool cfg_supports_on_demand =
+        profile.cir_rake_top_k == 0 &&
+        profile.cir_soft_chip_mode != CirSoftChipMode::Rake &&
+        profile.cir_soft_chip_mode != CirSoftChipMode::Bypass;
+    if (!cfg_supports_on_demand) {
+        plan.effective_profile.rx_softchip_on_demand = false;
+        plan.effective_profile.rx_fused_payload_cmf = false;
+        plan.effective_profile.rx_fused_phr_cmf = false;
+        plan.effective_profile.rx_fused_sfo_track = false;
+    }
+    if (plan.effective_profile.rx_softchip_on_demand ||
+        plan.effective_profile.rx_fused_payload_cmf ||
+        plan.effective_profile.rx_fused_phr_cmf) {
         const double spc_hat = (timing.measured_period > 0.0)
             ? timing.measured_period / static_cast<double>(kQm35ChipsPerSymbol)
             : 0.0;
@@ -462,25 +473,39 @@ bool estimate_cir(const std::complex<float>* rx,
             const std::complex<float> alpha(
                 static_cast<float>(std::cos(phase)),
                 static_cast<float>(std::sin(phase)));
-            rxopt::vector_accumulate_scaled_complex(
-                scratch.corr.data(), rx + static_cast<size_t>(lo), alpha,
-                wlen);
             // Same window, same per-SYNC scalar, same ascending SYNC order as
             // the standalone tail loop: the tail average is bit-identical.
             if (fused_tail && k >= tail_k0) {
+                rxopt::vector_accumulate_scaled_complex_dual(
+                    scratch.corr.data(), scratch.cir_avg_tail.data(),
+                    rx + static_cast<size_t>(lo), alpha, tail_span);
+                if (wlen > tail_span) {
+                    rxopt::vector_accumulate_scaled_complex(
+                        scratch.corr.data() + tail_span,
+                        rx + static_cast<size_t>(lo) + tail_span, alpha,
+                        wlen - tail_span);
+                }
+            } else {
                 rxopt::vector_accumulate_scaled_complex(
-                    scratch.cir_avg_tail.data(), rx + static_cast<size_t>(lo),
-                    alpha, tail_span);
+                    scratch.corr.data(), rx + static_cast<size_t>(lo), alpha,
+                    wlen);
             }
         } else {
-            rxopt::vector_accumulate_complex(
-                scratch.corr.data(),
-                rx + static_cast<size_t>(lo),
-                wlen);
             if (fused_tail && k >= tail_k0) {
+                rxopt::vector_accumulate_complex_dual(
+                    scratch.corr.data(), scratch.cir_avg_tail.data(),
+                    rx + static_cast<size_t>(lo), tail_span);
+                if (wlen > tail_span) {
+                    rxopt::vector_accumulate_complex(
+                        scratch.corr.data() + tail_span,
+                        rx + static_cast<size_t>(lo) + tail_span,
+                        wlen - tail_span);
+                }
+            } else {
                 rxopt::vector_accumulate_complex(
-                    scratch.cir_avg_tail.data(), rx + static_cast<size_t>(lo),
-                    tail_span);
+                    scratch.corr.data(),
+                    rx + static_cast<size_t>(lo),
+                    wlen);
             }
         }
         ++valid;
@@ -2875,6 +2900,20 @@ bool correlate_payload_known_hop_fused_cfo(
     const double dphi = -w * static_cast<double>(stride_i);
     const std::complex<double> ramp_step(std::cos(dphi), std::sin(dphi));
     std::complex<double> ramp(1.0, 0.0);
+    // Step/half-phase LUTs for `sfo_path` recurrence (re-anchored every
+    // kFusedPhaseAnchor symbols so trig runs ~16x less often).
+    std::complex<double> sfo_step_lut[3] = {};
+    std::complex<double> sfo_half_lut[3] = {};
+    if (sfo_path && has_cfo) {
+        for (int idx = 0; idx < 3; ++idx) {
+            const double ds =
+                -w * static_cast<double>(stride_i + idx - 1);
+            sfo_step_lut[idx] = std::complex<double>(std::cos(ds), std::sin(ds));
+            const double dh = -w * static_cast<double>(63 + idx);
+            sfo_half_lut[idx] = std::complex<double>(std::cos(dh), std::sin(dh));
+        }
+    }
+    int64_t prev_sfo_int0 = 0;
 
     out.reset(symbols, write_complex);
 
@@ -2938,14 +2977,34 @@ bool correlate_payload_known_hop_fused_cfo(
             bin = bin0;
             (void)bin1;
             if (has_cfo) {
-                const double ang0 = -w * static_cast<double>(int0);
-                const double ang1 = -w * static_cast<double>(int1);
-                phase0 = std::complex<float>(
-                    static_cast<float>(std::cos(ang0)),
-                    static_cast<float>(std::sin(ang0)));
-                phase1 = std::complex<float>(
-                    static_cast<float>(std::cos(ang1)),
-                    static_cast<float>(std::sin(ang1)));
+                if ((s % kFusedPhaseAnchor) == 0) {
+                    const double ang0 = -w * static_cast<double>(int0);
+                    ramp = std::complex<double>(std::cos(ang0), std::sin(ang0));
+                } else {
+                    const int64_t d0 = int0 - prev_sfo_int0;
+                    if (d0 >= stride_i - 1 && d0 <= stride_i + 1) {
+                        ramp *= sfo_step_lut[d0 - (stride_i - 1)];
+                    } else {
+                        const double ang0 = -w * static_cast<double>(int0);
+                        ramp = std::complex<double>(std::cos(ang0),
+                                                    std::sin(ang0));
+                    }
+                }
+                prev_sfo_int0 = int0;
+                phase0 = std::complex<float>(static_cast<float>(ramp.real()),
+                                             static_cast<float>(ramp.imag()));
+                const int64_t d1 = int1 - int0;
+                if (d1 >= 63 && d1 <= 65) {
+                    const std::complex<double> p1 =
+                        ramp * sfo_half_lut[d1 - 63];
+                    phase1 = std::complex<float>(static_cast<float>(p1.real()),
+                                                 static_cast<float>(p1.imag()));
+                } else {
+                    const double ang1 = -w * static_cast<double>(int1);
+                    phase1 = std::complex<float>(
+                        static_cast<float>(std::cos(ang1)),
+                        static_cast<float>(std::sin(ang1)));
+                }
             }
         }
 
@@ -3149,8 +3208,10 @@ bool correlate_phr_known_hop(const std::complex<float>* rx,
         // Raw complex correlation on the Metrics::complex_value phase basis:
         // no rot, no polarity.  Wave 2 consumes these 21 pilot values
         // directly, so they are always written.
-        const std::complex<float> z0 = dot_generic(rx + win0, tpl, len);
-        const std::complex<float> z1 = dot_generic(rx + win1, tpl, len);
+        std::complex<float> z[2];
+        rxfusion::dot2_shared_generic(rx + win0, rx + win1, tpl, len, z);
+        const std::complex<float> z0 = z[0];
+        const std::complex<float> z1 = z[1];
         out.z0[s] = z0;
         out.z1[s] = z1;
         const float re0 = rot.real() * z0.real() -

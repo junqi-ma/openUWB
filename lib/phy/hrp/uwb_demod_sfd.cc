@@ -736,7 +736,7 @@ bool stage_sfd(const std::complex<float>* rx,
         // lies earlier than expected, between timing.preamble_start_sample and
         // expected - 37 * period.  Only reached on a discrete-grid miss.
         if (!sfd_passed &&
-            profile.sync_strategy != SyncStrategy::LockedBounded &&
+            profile.sync_strategy != SyncStrategy::Locked &&
             profile.preamble_repetitions > static_cast<size_t>(kGridHalf + 1)) {
             const int64_t k_lo =
                 -static_cast<int64_t>(profile.preamble_repetitions) + 1;

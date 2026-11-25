@@ -260,7 +260,7 @@ struct Workers {
             acq.timing_max_backtrack_symbols = 128;
             // Locked profile: same PHY, bounded first-SYNC ROI.
             demod::Qm35825Profile locked = acq;
-            locked.sync_strategy = demod::SyncStrategy::LockedBounded;
+            locked.sync_strategy = demod::SyncStrategy::Locked;
             locked.locked_roi_samples = o.locked_roi;
             locked.locked_allow_backtrack = false;
             locked.locked_grid_timing = (o.locked_timing == "grid");

@@ -69,7 +69,7 @@ try {
         p.rx_sfd_par_only = par == "sfd" || par == "both" || p.rx_par_confirm;
         sfd_probe = strategy == "sfd-probe";
         if (strategy == "locked") {
-            p.sync_strategy = demod::SyncStrategy::LockedBounded;
+            p.sync_strategy = demod::SyncStrategy::Locked;
             p.timing_search_margin = 0;
             p.timing_max_backtrack_symbols = 0;
         } else {

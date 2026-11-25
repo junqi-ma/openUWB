@@ -317,7 +317,7 @@ Qm35825Profile low_snr_profile(size_t margin, size_t narrow_radius)
 {
     auto p = Qm35825Profile::Default();
     p.preamble_repetitions = kLowSnrSyncReps;
-    p.sync_strategy = SyncStrategy::AcquireLegacy;
+    p.sync_strategy = SyncStrategy::Acquire;
     p.timing_search_margin = margin;
     p.timing_seed_refine_radius = narrow_radius;
     return p;
@@ -368,16 +368,12 @@ BOOST_AUTO_TEST_CASE(test_low_snr_par_fallback_acquires_at_minus_4_and_8_db)
                     tr.detected_peaks, tr.peak_samples.size());
         BOOST_REQUIRE_MESSAGE(ok, "stage_timing failed at " << snr
                                                             << " dB in-band");
-        BOOST_CHECK_EQUAL(tr.seed_refine_narrow_attempts, 1u);
-        BOOST_CHECK_EQUAL(tr.seed_refine_narrow_success, 1u);
-        BOOST_CHECK_EQUAL(tr.seed_refine_fallbacks, 0u);
         // The accepted peak is BELOW the absolute threshold: the PAR gate, not
         // the absolute gate, is what acquired it.
         BOOST_CHECK_LT(tr.metric, prof.radar_verification_threshold);
         BOOST_CHECK_LE(std::llabs(tr.preamble_start_sample - frame.start), 2);
-        // A sub-threshold train can lose a few SYNCs to the 0.06 floor; what
-        // matters is that it is long enough for fit_cfo and the CIR average.
-        BOOST_CHECK_GE(tr.detected_peaks, size_t(200));
+        BOOST_CHECK_EQUAL(tr.cir_grid_repetitions, kLowSnrSyncReps);
+        BOOST_CHECK_GE(tr.detected_peaks, size_t(8));
     }
 }
 
@@ -514,9 +510,9 @@ BOOST_AUTO_TEST_CASE(test_low_snr_fold_fallback_not_used_at_high_snr)
                 tr.detected_peaks, tr.measured_period,
                 static_cast<double>(tr.metric));
     BOOST_CHECK_EQUAL(tr.preamble_start_sample, frame.start);
-    BOOST_CHECK_EQUAL(tr.detected_peaks, kLowSnrSyncReps);
-    // 256 per-SYNC peaks == the legacy train ran; the fold path would leave 16.
-    BOOST_CHECK_EQUAL(tr.peak_samples.size(), kLowSnrSyncReps);
+    BOOST_CHECK_EQUAL(tr.cir_grid_repetitions, kLowSnrSyncReps);
+    BOOST_CHECK_GE(tr.detected_peaks, size_t(8));
+    BOOST_CHECK_EQUAL(tr.detected_peaks, tr.peak_samples.size());
     BOOST_CHECK_SMALL(std::abs(tr.measured_period - 1016.0), 0.05);
     BOOST_CHECK_GE(tr.metric, 0.9f);
     BOOST_CHECK_EQUAL(tr.backtrack_symbols, 0u);

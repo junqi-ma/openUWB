@@ -405,9 +405,7 @@ bool fold_anchor_fit(const std::complex<float>* rx,
                      double phase_per_symbol = 0.0,
                      const rxopt::SparseCirTemplate* sparse_tmpl = nullptr,
                      std::vector<std::complex<float>>* sup_buf = nullptr,
-                     const rxopt::ShapedSparseTemplate* shaped_tmpl = nullptr,
-                     std::vector<int64_t>* cfo_peak_samples = nullptr,
-                     std::vector<std::complex<float>>* cfo_peak_corr = nullptr);
+                     const rxopt::ShapedSparseTemplate* shaped_tmpl = nullptr);
 
 } // namespace detail
 

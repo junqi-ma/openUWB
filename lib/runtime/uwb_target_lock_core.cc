@@ -356,10 +356,19 @@ bool TargetLockCore::apply_observation(const TargetObservation& obs)
     if (state_ == TargetLockState::Verify) {
         // Reject off-grid observations (such as in-flight acquisition windows
         // from a faster emitter) before they occupy a slot and bias the fit.
+        // If Verify was seeded by a bogus offset, consecutive real packets
+        // will all look like outliers; exit to Reacquire instead of deadlocking
+        // in Verify forever.
         if (std::abs(resid) > cfg_.residual_limit_samples) {
             ++stats_.residual_outliers;
+            ++consecutive_residual_outliers_;
+            if (consecutive_residual_outliers_ >=
+                cfg_.residual_outlier_count) {
+                enter_reacquire();
+            }
             return false;
         }
+        consecutive_residual_outliers_ = 0;
     } else if (state_ == TargetLockState::Locked ||
                state_ == TargetLockState::Holdover) {
         if (std::abs(resid) > cfg_.residual_limit_samples) {

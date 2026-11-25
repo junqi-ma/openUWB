@@ -168,7 +168,7 @@ BOOST_AUTO_TEST_CASE(test_timing_k4_fast_path_warm_call_does_not_grow_scratch)
     // (warm) call must reuse the exact same capacities: the fast path is not
     // allowed to allocate per packet.
     const auto cap = [](const auto& v) { return v.capacity(); };
-    const std::array<size_t, 16> before = {
+    const std::array<size_t, 14> before = {
         cap(scratch.work),           cap(scratch.derotated),
         cap(scratch.metric),         cap(scratch.corr),
         cap(scratch.fold_buf),       cap(scratch.fold_sup_buf),
@@ -179,13 +179,11 @@ BOOST_AUTO_TEST_CASE(test_timing_k4_fast_path_warm_call_does_not_grow_scratch)
         cap(scratch.cir_template.entries),
         cap(scratch.shaped_sync_template.code.entries),
         cap(scratch.cfo_sym_z),
-        cap(scratch.timing_fold_cfo_samples),
-        cap(scratch.timing_fold_cfo_corr),
     };
     TimingResult tr2;
     BOOST_REQUIRE(stage_timing(frame.rx.data(), frame.rx.size(), prof, sync,
                                frame.start, tr2, scratch));
-    const std::array<size_t, 16> after = {
+    const std::array<size_t, 14> after = {
         cap(scratch.work),           cap(scratch.derotated),
         cap(scratch.metric),         cap(scratch.corr),
         cap(scratch.fold_buf),       cap(scratch.fold_sup_buf),
@@ -196,8 +194,6 @@ BOOST_AUTO_TEST_CASE(test_timing_k4_fast_path_warm_call_does_not_grow_scratch)
         cap(scratch.cir_template.entries),
         cap(scratch.shaped_sync_template.code.entries),
         cap(scratch.cfo_sym_z),
-        cap(scratch.timing_fold_cfo_samples),
-        cap(scratch.timing_fold_cfo_corr),
     };
     BOOST_CHECK(before == after);
 }

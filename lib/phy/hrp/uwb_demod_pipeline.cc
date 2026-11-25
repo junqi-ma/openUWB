@@ -268,24 +268,6 @@ bool run_initial_cfo_and_bootstrap_sfd(
             ml_begin, ml_end, /*has_cfo_hint=*/false, 0.0, res.timing,
             scratch, res.cfo);
     }
-    if (cfo_ok) {
-        // Cross-check the ML estimate against the legacy peak-phase fit.  The
-        // ML sampling grid is anchored on the Stage-1 preamble start; on a
-        // folded acquire window that anchor can be off by a few symbols, which
-        // biases the ML frequency enough to rotate the bootstrap SFD out of
-        // its ±64-sample window (measured on the try2 capture: the lock then
-        // never leaves Verify).  The legacy fit works from the measured peaks,
-        // so a strong disagreement means the ML window is misplaced: keep the
-        // proven estimate.  The check costs ~0.5 µs.
-        CfoResult legacy;
-        if (fit_cfo(rx, n, profile, res.timing, legacy, scratch)) {
-            const double tol = std::max(2000.0, 0.05 * std::abs(legacy.cfo_hz));
-            if (!std::isfinite(res.cfo.cfo_hz) ||
-                std::abs(res.cfo.cfo_hz - legacy.cfo_hz) > tol) {
-                res.cfo = legacy;
-            }
-        }
-    }
     if (!cfo_ok && !fit_cfo(rx, n, profile, res.timing, res.cfo, scratch)) {
         clock.lap(res.stage_cfo_us, res.stage_total_us);
         res.stage_cfo_fit_us += res.cfo.fit_us;

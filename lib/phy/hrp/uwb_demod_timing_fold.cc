@@ -327,17 +327,11 @@ bool fold_anchor_fit(const std::complex<float>* rx,
                      double phase_per_symbol,
                      const rxopt::SparseCirTemplate* sparse_tmpl,
                      std::vector<std::complex<float>>* sup_buf,
-                     const rxopt::ShapedSparseTemplate* shaped_tmpl,
-                     std::vector<int64_t>* cfo_peak_samples,
-                     std::vector<std::complex<float>>* cfo_peak_corr)
+                     const rxopt::ShapedSparseTemplate* shaped_tmpl)
 {
     peak_samples.clear();
     peak_metrics.clear();
     peak_corr.clear();
-    if (cfo_peak_samples)
-        cfo_peak_samples->clear();
-    if (cfo_peak_corr)
-        cfo_peak_corr->clear();
     const int64_t P = static_cast<int64_t>(kQm35SamplesPerSymbol);
     const int64_t Li = static_cast<int64_t>(L);
     const int64_t refine = kFoldAnchorRefine;
@@ -494,50 +488,17 @@ bool fold_anchor_fit(const std::complex<float>* rx,
         const float denom_e = std::sqrt(std::max(1e-12f, rx_energy * Et));
         return denom_e > 0.0f ? std::abs(corr) / denom_e : 0.0f;
     };
-    if (cfo_peak_samples && cfo_peak_corr) {
-        size_t sel_idx = 0;
-        for (size_t g = 0; g < groups; ++g) {
-            // g_sel is strictly increasing, so the next selected anchor is
-            // consumed as soon as this group reaches it -- whether or not the
-            // group is in bounds -- exactly matching the standalone sparse
-            // loop's `continue`-without-skipping behaviour.
-            bool selected = false;
-            if (sel_idx < n_sel && g == g_sel[sel_idx]) {
-                selected = true;
-                ++sel_idx;
-            }
-            int64_t fitted_end = 0;
-            std::complex<float> corr;
-            if (!refold_and_dot(g, fitted_end, corr))
-                continue;
-            cfo_peak_samples->push_back(fitted_end);
-            cfo_peak_corr->push_back(corr);
-            if (selected) {
-                peak_samples.push_back(fitted_end);
-                peak_metrics.push_back(corr_metric(corr));
-                peak_corr.push_back(corr);
-            }
-        }
-    } else {
-        for (size_t i = 0; i < n_sel; ++i) {
-            int64_t fitted_end = 0;
-            std::complex<float> corr;
-            if (!refold_and_dot(g_sel[i], fitted_end, corr))
-                continue;
-            peak_samples.push_back(fitted_end);
-            peak_metrics.push_back(corr_metric(corr));
-            peak_corr.push_back(corr);
-        }
+    for (size_t i = 0; i < n_sel; ++i) {
+        int64_t fitted_end = 0;
+        std::complex<float> corr;
+        if (!refold_and_dot(g_sel[i], fitted_end, corr))
+            continue;
+        peak_samples.push_back(fitted_end);
+        peak_metrics.push_back(corr_metric(corr));
+        peak_corr.push_back(corr);
     }
-    if (peak_samples.size() < 2) {
-        // A failed fit must not leave a partially filled shadow grid for
-        // fit_cfo(): keep this symmetric with the entry clear.
-        if (cfo_peak_samples)
-            cfo_peak_samples->clear();
-        if (cfo_peak_corr)
-            cfo_peak_corr->clear();
+    if (peak_samples.size() < 2)
         return false;
-    }
     *period_out = p;
     *preamble_start_out = std::max<int64_t>(
         0, static_cast<int64_t>(std::llround(intercept_end)) - (Li - 1));

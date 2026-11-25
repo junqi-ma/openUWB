@@ -784,3 +784,44 @@ BOOST_AUTO_TEST_CASE(verify_rejects_off_grid_acquire_observation)
     BOOST_CHECK_EQUAL(lock.stats().duplicate_observations, 0u);
     BOOST_CHECK_EQUAL(lock.stats().reacquire_entries, 0u);
 }
+
+// ===========================================================================
+// 20. Poisoned VERIFY seed must exit to REACQUIRE and recover cleanly
+// ===========================================================================
+BOOST_AUTO_TEST_CASE(verify_poisoned_seed_recovers_via_reacquire)
+{
+    TargetLockCore lock(make_config());
+    // Seed Verify with a false-SFD offset (+19400 samples > residual_limit_samples).
+    auto poisoned = good_obs(lock, 0, true_origin(0) + 19400);
+    poisoned.slot_index = std::numeric_limits<uint64_t>::max();
+    poisoned.from_target_window = false;
+    feed(lock, poisoned);
+    BOOST_REQUIRE_EQUAL(static_cast<int>(lock.state()),
+                        static_cast<int>(TargetLockState::Verify));
+
+    // Three consecutive real periodic packets look like outliers against the
+    // poisoned seed and must force REACQUIRE instead of deadlocking in VERIFY.
+    for (uint64_t k = 1; k <= 3; ++k) {
+        auto obs = good_obs(lock, k, true_origin(k));
+        obs.slot_index = std::numeric_limits<uint64_t>::max();
+        obs.from_target_window = false;
+        feed(lock, obs);
+    }
+    BOOST_REQUIRE_EQUAL(static_cast<int>(lock.state()),
+                        static_cast<int>(TargetLockState::Reacquire));
+    BOOST_CHECK_EQUAL(lock.stats().reacquire_entries, 1u);
+    BOOST_CHECK_EQUAL(lock.stats().residual_outliers, 3u);
+
+    // Subsequent real packets re-seed and reach LOCKED cleanly.
+    for (uint64_t k = 4; k <= 6; ++k) {
+        auto obs = good_obs(lock, k, true_origin(k));
+        obs.slot_index = std::numeric_limits<uint64_t>::max();
+        obs.from_target_window = false;
+        feed(lock, obs);
+    }
+    BOOST_REQUIRE_EQUAL(static_cast<int>(lock.state()),
+                        static_cast<int>(TargetLockState::Locked));
+    // After re-seeding at true_origin(4) (slot 0 of the new generation),
+    // true_origin(10) corresponds to slot 6.
+    BOOST_CHECK_LE(std::abs(lock.predicted(6) - true_origin(10)), 2);
+}

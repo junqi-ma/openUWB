@@ -261,9 +261,6 @@ bool try_fold_acquire(TimingEnv& env,
     const auto* sparse_tmpl = pf.sparse;
     const auto* shaped_tmpl = pf.shaped;
     const auto& real_tmpl = *pf.real;
-    // A previous packet's shadow CFO grid must never survive into this call.
-    scratch.timing_fold_cfo_samples.clear();
-    scratch.timing_fold_cfo_corr.clear();
     auto acquire_fold = [&](size_t max_syms, double phase) {
         return detail::fold_acquire(
             env.rx, env.n, centre, centre - radius, centre + radius,
@@ -358,9 +355,7 @@ bool try_fold_acquire(TimingEnv& env,
             real_tmpl, groups, &period_fit,
             &origin_fit, out.peak_samples, out.peak_metrics,
             out.peak_corr, fold_phase,
-            sparse_tmpl, &scratch.fold_sup_buf, shaped_tmpl,
-            &scratch.timing_fold_cfo_samples,
-            &scratch.timing_fold_cfo_corr);
+            sparse_tmpl, &scratch.fold_sup_buf, shaped_tmpl);
         if (!anchor_fit_ok) {
             out.peak_samples.clear();
             out.peak_metrics.clear();
@@ -377,8 +372,6 @@ bool try_fold_acquire(TimingEnv& env,
             out.peak_samples.clear();
             out.peak_metrics.clear();
             out.peak_corr.clear();
-            scratch.timing_fold_cfo_samples.clear();
-            scratch.timing_fold_cfo_corr.clear();
             return false;
         }
         const size_t n_peaks = out.peak_metrics.size();
@@ -392,8 +385,6 @@ bool try_fold_acquire(TimingEnv& env,
             out.peak_samples.clear();
             out.peak_metrics.clear();
             out.peak_corr.clear();
-            scratch.timing_fold_cfo_samples.clear();
-            scratch.timing_fold_cfo_corr.clear();
             return false;
         }
     } else if (out.peak_samples.empty()) {

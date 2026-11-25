@@ -41,7 +41,8 @@ namespace {
 // ---------------------------------------------------------------------------
 bool check_sfd_polarity_soft(const std::complex<float>* sym_corr,
                              const std::vector<int8_t>& seq,
-                             size_t n_check)
+                             size_t n_check,
+                             std::complex<double>* ref_out = nullptr)
 {
     if (sym_corr == nullptr || n_check == 0)
         return false;
@@ -50,6 +51,8 @@ bool check_sfd_polarity_soft(const std::complex<float>* sym_corr,
         ref += static_cast<double>(seq[i]) * std::complex<double>(sym_corr[i]);
     if (!(std::norm(ref) > 1e-24))
         return false;
+    if (ref_out)
+        *ref_out = ref;
     size_t n_nz = 0, pos_cnt = 0;
     double signed_sum = 0.0, abs_sum = 0.0;
     for (size_t i = 0; i < n_check; ++i) {
@@ -237,6 +240,59 @@ bool stage_sfd(const std::complex<float>* rx,
 
     const rxopt::SyncMatchedFilter sync_filter(
         template_wf.data(), sym, real_taps, sparse_tmpl, /*volk_complex=*/false);
+    double sync_energy = 0.0;
+    if (sparse_tmpl) {
+        sync_energy = static_cast<double>(sparse_tmpl->code_energy);
+    } else if (use_real_sfd_fast) {
+        sync_energy = static_cast<double>(scratch.real_sync_template.energy);
+    } else {
+        for (size_t i = 0; i < sym; ++i)
+            sync_energy += static_cast<double>(std::norm(template_wf[i]));
+    }
+
+    // Physical consistency gate for low-floor / discrete-grid SFD hits:
+    // a genuine SFD at `pos` is immediately preceded by coherent SYNC symbols
+    // sharing the same carrier phase after CFO derotation.  A false SFD peak
+    // inside PHR/Payload (e.g. k > 0) is preceded by modulated data symbols
+    // whose 8-symbol SYNC sum cancels out and has random phase vs. `sfd_ref`.
+    auto sync_before_sfd_ok = [&](int64_t pos,
+                                  const std::complex<double>& sfd_ref) -> bool {
+        constexpr size_t kSyncCheckSyms = 8;
+        if (pos < 0 || !(sync_energy > 0.0))
+            return false;
+        const size_t n_sync = std::min(
+            kSyncCheckSyms, static_cast<size_t>(pos) / sym);
+        if (n_sync < 4)
+            return true;
+        if (ensure_derotated) {
+            const size_t clo = static_cast<size_t>(
+                pos - static_cast<int64_t>(n_sync * sym));
+            ensure_derotated(clo, static_cast<size_t>(pos));
+        }
+        std::complex<double> sync_sum(0.0, 0.0);
+        double sync_pwr = 0.0;
+        for (size_t s = 1; s <= n_sync; ++s) {
+            const int64_t p = pos - static_cast<int64_t>(s * sym);
+            const auto d = sync_filter.dot(rx + p);
+            sync_sum += std::complex<double>(d.real(), d.imag());
+            sync_pwr += static_cast<double>(window_power_8acc(rx + p, sym));
+        }
+        const double sync_scale_sq =
+            1.0 / (static_cast<double>(n_sync) * sync_energy);
+        const double sync_metric =
+            (std::norm(sync_sum) * sync_scale_sq) /
+            (sync_pwr + static_cast<double>(openuwb::core::kUwbEpsilon));
+        if (sync_metric < 0.5 * static_cast<double>(kSfdGridPeakFloor))
+            return false;
+        const double denom = std::sqrt(std::norm(sync_sum) * std::norm(sfd_ref));
+        if (!(denom > 1e-24))
+            return false;
+        const double cos_align =
+            (sync_sum.real() * sfd_ref.real() +
+             sync_sum.imag() * sfd_ref.imag()) /
+            denom;
+        return cos_align >= 0.35;
+    };
 
     // Coherent sign check over the first min(len,16) SFD symbols.  This is the
     // hard lock that keeps a low-floor / discrete-grid hit from being a
@@ -254,7 +310,10 @@ bool stage_sfd(const std::complex<float>* rx,
             const size_t p = static_cast<size_t>(pos) + si * sym;
             sym_corr[si] = sync_filter.dot(rx + p);
         }
-        return check_sfd_polarity_soft(sym_corr, sfd_sequence, n_check);
+        std::complex<double> sfd_ref(0.0, 0.0);
+        if (!check_sfd_polarity_soft(sym_corr, sfd_sequence, n_check, &sfd_ref))
+            return false;
+        return sync_before_sfd_ok(pos, sfd_ref);
     };
 
     auto scan_window = [&](int64_t center, int64_t half_width,
@@ -586,14 +645,19 @@ bool stage_sfd(const std::complex<float>* rx,
                         return false;
                 return true;
             };
-            auto polarity_ok_cached = [&](int d, int64_t k) -> bool {
+            auto polarity_ok_cached = [&](int d, int64_t k,
+                                          int64_t pos) -> bool {
                 const size_t n_check = std::min<size_t>(len, 16);
                 const size_t base = static_cast<size_t>(k - k_lo);
                 const size_t d_base = static_cast<size_t>(d) * n_sym_slots;
                 std::complex<float> local[16];
                 for (size_t si = 0; si < n_check; ++si)
                     local[si] = grid_corr[d_base + base + si];
-                return check_sfd_polarity_soft(local, sfd_sequence, n_check);
+                std::complex<double> sfd_ref(0.0, 0.0);
+                if (!check_sfd_polarity_soft(local, sfd_sequence, n_check,
+                                             &sfd_ref))
+                    return false;
+                return sync_before_sfd_ok(pos, sfd_ref);
             };
             if (nc >= 8) {
                 ++out.search_windows;
@@ -655,7 +719,7 @@ bool stage_sfd(const std::complex<float>* rx,
                         const bool reuse = best_pos == gpos && g_delta >= 0 &&
                                            cache_complete_for(g_delta, g_k);
                         const bool pol_ok = reuse
-                            ? polarity_ok_cached(g_delta, g_k)
+                            ? polarity_ok_cached(g_delta, g_k, best_pos)
                             : polarity_ok(best_pos);
                         if (pol_ok) {
                             best = best_metric;

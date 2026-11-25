@@ -25,21 +25,8 @@ bool fit_cfo(const std::complex<float>* rx,
              DemodScratch& scratch)
 {
     out = CfoResult{};
-    // The fold path publishes a dense 4-SYMBOL-group CFO grid in scratch
-    // (up to 64 phases, alias-free to +/-122.8 kHz, 24-symbol skip -> 40
-    // points).  It restores the information the old 64-anchor train gave the
-    // legacy Stage-2 cross-check while TimingResult keeps its sparse <= 16
-    // detected_peaks contract.  Non-fold / synthetic sparse trains fall back
-    // to timing.peak_samples.
-    const bool use_fold_cfo =
-        timing.sync_peaks_folded &&
-        scratch.timing_fold_cfo_samples.size() >= 4 &&
-        scratch.timing_fold_cfo_corr.size() ==
-            scratch.timing_fold_cfo_samples.size();
-    const std::vector<int64_t>& ps =
-        use_fold_cfo ? scratch.timing_fold_cfo_samples : timing.peak_samples;
-    const std::vector<std::complex<float>>& pc =
-        use_fold_cfo ? scratch.timing_fold_cfo_corr : timing.peak_corr;
+    const std::vector<int64_t>& ps = timing.peak_samples;
+    const std::vector<std::complex<float>>& pc = timing.peak_corr;
     const size_t np = ps.size();
     if (np < 4)
         return false;

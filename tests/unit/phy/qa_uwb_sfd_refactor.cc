@@ -153,8 +153,6 @@ CapSnapshot capacities(const core::DemodScratch& s)
     add(s.timing_fold_cand_metrics.capacity());
     add(s.timing_fold_lag_metrics.capacity());
     add(s.timing_peak_indices.capacity());
-    add(s.timing_fold_cfo_samples.capacity());
-    add(s.timing_fold_cfo_corr.capacity());
     add(s.cir_avg_tail.capacity());
     add(s.cir_phase_rot.capacity());
     add(s.cfo_sym_z.capacity());
@@ -397,4 +395,52 @@ BOOST_AUTO_TEST_CASE(test_sfd_discrete_grid_warm_call_zero_allocation)
 
     const CapSnapshot after = capacities(scratch);
     BOOST_CHECK(before == after);
+}
+
+// ---------------------------------------------------------------------------
+// Regression for try2 false-SFD bug: a low-SNR discrete-grid candidate
+// inside PHR/Payload (preceded by modulated data rather than coherent SYNC)
+// must be rejected by the SYNC-before-SFD physical consistency gate.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(test_sfd_discrete_grid_rejects_payload_false_peak_without_sync)
+{
+    const SfdFixture fix("4z2", 64);
+    const Qm35825Profile prof = make_profile(fix, "4z2");
+    const auto sfd_seq = fix.sfd_seq;
+
+    // Build a frame with SYNC preamble, NO true SFD at true_sfd, randomized
+    // +/-1 SYNC-like symbols (simulating modulated PHR/Payload) after
+    // true_sfd, and a spurious 4z2 pattern planted at +20 symbols into payload.
+    const size_t total_n = static_cast<size_t>(fix.true_sfd) +
+                           (20 + fix.sfd_seq.size() + 4) * kSym + 4096;
+    std::vector<gr_complex> rx(total_n, gr_complex(0.0f, 0.0f));
+    for (size_t i = 0; i < fix.reps; ++i)
+        std::copy(fix.sync.begin(), fix.sync.end(),
+                  rx.begin() + fix.true_start + static_cast<int64_t>(i * kSym));
+
+    std::mt19937 rng(4242u);
+    for (size_t s = 0; s < 20; ++s) {
+        const float sign = (rng() & 1u) ? 1.0f : -1.0f;
+        const int64_t off = fix.true_sfd + static_cast<int64_t>(s * kSym);
+        for (size_t k = 0; k < kSym; ++k)
+            rx[static_cast<size_t>(off) + k] = sign * fix.sync[k];
+    }
+    const int64_t fake_sfd = fix.true_sfd + static_cast<int64_t>(20 * kSym);
+    std::copy(fix.sfd_wf.begin(), fix.sfd_wf.end(), rx.begin() + fake_sfd);
+
+    // Add -12 dB in-band AWGN so the fake SFD sits in the low-SNR discrete-grid
+    // regime (< 0.3 threshold) rather than the >= 0.3 high-SNR regime.
+    const double snr_lin = std::pow(10.0, -12.0 / 10.0);
+    const double p_noise = fix.p_sig * (kWorkBandHz / kInBandHz) / snr_lin;
+    const float sigma = static_cast<float>(std::sqrt(p_noise / 2.0));
+    std::normal_distribution<float> g(0.0f, 1.0f);
+    for (auto& v : rx)
+        v += gr_complex(sigma * g(rng), sigma * g(rng));
+
+    core::DemodScratch scratch;
+    scratch.reserve(rx.size());
+    SfdResult sr;
+    BOOST_CHECK(!core::stage_sfd(rx.data(), rx.size(), prof,
+                                 fix.make_tr(fix.true_start), sfd_seq,
+                                 fix.sync, sr, scratch));
 }

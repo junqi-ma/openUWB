@@ -260,6 +260,67 @@ BOOST_AUTO_TEST_CASE(test_timing_k4_fast_path_pure_noise_no_false_alarm)
     BOOST_CHECK_EQUAL(false_alarms, 0);
 }
 
+BOOST_AUTO_TEST_CASE(test_locked_bounded_pure_noise_does_not_wide_tail_sweep)
+{
+    // A pure-noise locked window is a tracking failure.  The failure path may
+    // run the narrow (+/-32) tail probe and then the K=4/K=64 fold, but it
+    // must never escalate to the second wide (+/-roi) single-SYMBOL tail
+    // sweep: tail_probe_attempts must therefore stay at exactly one pass over
+    // the sparse tail grid.  The wide sweep repeats the same grid with a 513-
+    // lag ROI search, so on the old implementation this count doubles.
+    const auto sync = load_normalized_sync();
+    auto prof = low_snr_profile(/*margin=*/8192, /*sparse=*/true);
+    prof.sync_strategy = SyncStrategy::LockedBounded;
+    prof.locked_roi_samples = 256;
+    prof.locked_inner_symbols = 4;
+    prof.locked_tail_probe = true;
+    prof.locked_tail_probe_step = 8;
+    prof.locked_tail_probe_confirm = 2;
+    prof.locked_allow_backtrack = false;
+
+    constexpr int64_t kSeed = 9992;
+    std::vector<gr_complex> noise(300000);
+    std::mt19937 rng(20261125u);
+    std::normal_distribution<float> g(0.0f, 1.0f);
+    for (auto& v : noise)
+        v = gr_complex(g(rng), g(rng));
+
+    // The narrow sweep probes one SYNC per `locked_tail_probe_step`, starting
+    // after the inner symbols, as long as the template fits in the buffer.
+    size_t expected_narrow = 0;
+    for (size_t m = prof.locked_inner_symbols + 1; m < kReps;
+         m += prof.locked_tail_probe_step) {
+        const int64_t want =
+            kSeed + static_cast<int64_t>(m) * static_cast<int64_t>(kSym);
+        if (want + static_cast<int64_t>(kSym) >
+            static_cast<int64_t>(noise.size()))
+            break;
+        ++expected_narrow;
+    }
+    BOOST_REQUIRE_GT(expected_narrow, size_t(0));
+
+    DemodScratch scratch;
+    scratch.reserve(noise.size());
+    TimingResult tr;
+    const bool ok = stage_timing(noise.data(), noise.size(), prof, sync, kSeed,
+                                 tr, scratch);
+    std::printf("locked pure noise: ok=%d attempts=%u narrow=%zu failures=%u "
+                "hits=%u folding=%d\n",
+                int(ok), tr.tail_probe_attempts, expected_narrow,
+                tr.bounded_failures, tr.tail_probe_hits,
+                int(tr.sync_peaks_folded));
+    BOOST_CHECK(!ok);
+    BOOST_CHECK_EQUAL(tr.bounded_attempts, 1u);
+    BOOST_CHECK_EQUAL(tr.bounded_failures, 1u);
+    BOOST_CHECK_EQUAL(tr.tail_probe_hits, 0u);
+    // Exactly the narrow sweep.  On the old code the failed fold ran
+    // tail_sweep(roi), doubling the attempts.
+    BOOST_CHECK_EQUAL(tr.tail_probe_attempts,
+                      static_cast<uint32_t>(expected_narrow));
+    BOOST_CHECK_LT(tr.tail_probe_attempts,
+                   static_cast<uint32_t>(2 * expected_narrow));
+}
+
 BOOST_AUTO_TEST_CASE(test_timing_fallback_survives_cfo_and_sfo)
 {
     // A large CFO/SFO must not lose the packet: either K=4 still passes or the

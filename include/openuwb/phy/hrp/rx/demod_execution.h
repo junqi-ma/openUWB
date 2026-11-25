@@ -98,15 +98,6 @@ SampleRange compute_anchored_prefix_range(
     const TimingResult& cfo_timing,
     const SampleRange& final_sfd_range);
 
-SampleRange compute_fused_payload_rotation_range(
-    size_t n,
-    const Qm35825Profile& profile,
-    const TimingResult& timing,
-    size_t cir_tap_count,
-    const NsSfdResult& ns_sfd,
-    const PhrResult& phr,
-    size_t already_rotated_hi);
-
 SampleRange compute_ondemand_extension_rotation_range(
     size_t n,
     const Qm35825Profile& profile,

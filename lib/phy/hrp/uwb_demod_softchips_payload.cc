@@ -295,39 +295,6 @@ SampleRange compute_anchored_prefix_range(
     return SampleRange{0, n};
 }
 
-SampleRange compute_fused_payload_rotation_range(
-    size_t n,
-    const Qm35825Profile& profile,
-    const TimingResult& timing,
-    size_t cir_tap_count,
-    const NsSfdResult& ns_sfd,
-    const PhrResult& phr,
-    size_t already_rotated_hi)
-{
-    const size_t psdu_bits = static_cast<size_t>(phr.psdu_length) * 8;
-    const size_t num_blocks = (psdu_bits + 329) / 330;
-    const size_t nsym = psdu_bits + 48 * num_blocks;
-    const int64_t phr_start = ns_sfd.sfd_end_chip + 1;
-    const int64_t payload_start = phr_start + 21 * 512;
-    const int64_t chip_start = timing.preamble_start_sample +
-        static_cast<int64_t>(cir_tap_count) -
-        static_cast<int64_t>(profile.cir_pre_samples) - 1;
-    const int64_t base0 = chip_start + payload_start * 2 -
-        static_cast<int64_t>(cir_tap_count) + 1;
-    const int64_t last_chip = static_cast<int64_t>(nsym - 1) * 64 + 40;
-    const size_t len = cir_tap_count + 2 * (8 - 1);
-    const int64_t last_sample =
-        base0 + last_chip * 2 + static_cast<int64_t>(len);
-    const size_t pay_lo = std::min(
-        already_rotated_hi,
-        static_cast<size_t>(std::max<int64_t>(0, base0)));
-    const size_t pay_hi = static_cast<size_t>(
-        std::min<int64_t>(static_cast<int64_t>(n), last_sample + 64));
-    if (pay_hi <= pay_lo)
-        return SampleRange{};
-    return SampleRange{pay_lo, pay_hi};
-}
-
 SampleRange compute_ondemand_extension_rotation_range(
     size_t n,
     const Qm35825Profile& profile,
